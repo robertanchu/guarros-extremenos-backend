@@ -18,7 +18,28 @@ if (!STRIPE_SECRET_KEY) {
 
 const stripe = new Stripe(STRIPE_SECRET_KEY)
 
-app.use(cors({ origin: FRONTEND_URL }))
+const allowList = [
+  process.env.FRONTEND_URL,           // prod, p.ej. https://guarros-extremenos-front.vercel.app
+  process.env.FRONTEND_URL_2 || "",   // opcional, otro dominio
+].filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true); // permite llamadas servidor-servidor o curl
+    try {
+      const host = new URL(origin).host;
+      const isVercelPreview = /\.vercel\.app$/.test(host);
+      if (allowList.includes(origin) || isVercelPreview) {
+        return callback(null, true);
+      }
+    } catch (_) {}
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  optionsSuccessStatus: 200,
+}));
+
 app.use(express.json())
 
 // Health
