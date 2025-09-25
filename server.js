@@ -7,16 +7,13 @@ const app = express()
 const PORT = process.env.PORT || 4242
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY
-const ALLOWED_COUNTRIES = (process.env.ALLOWED_COUNTRIES || 'ES').split(',').map(s=>s.trim()).filter(Boolean)
-const SHIPPING_RATES = (process.env.SHIPPING_RATES || '').split(',').map(s=>s.trim()).filter(Boolean)
-const ENABLE_AUTOMATIC_TAX = (process.env.ENABLE_AUTOMATIC_TAX || 'true') === 'true'
 
 if (!STRIPE_SECRET_KEY) {
   console.error('❌ Missing STRIPE_SECRET_KEY in environment')
   process.exit(1)
 }
-
 const stripe = new Stripe(STRIPE_SECRET_KEY)
+
 
 const allowList = [
   process.env.FRONTEND_URL,           // prod, p.ej. https://guarros-extremenos-front.vercel.app
