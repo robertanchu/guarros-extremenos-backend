@@ -1,149 +1,88 @@
-// server.js
-import 'dotenv/config'
-import express from 'express'
-import cors from 'cors'
-import Stripe from 'stripe'
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+import bodyParser from 'body-parser';
+import Stripe from 'stripe';
 
-/* ========= Config básica ========= */
-const app = express()
-const PORT = process.env.PORT || 4242
+const app = express();
+const PORT = process.env.PORT || 3000;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY
-if (!STRIPE_SECRET_KEY) {
-  console.error('❌ Falta STRIPE_SECRET_KEY en el entorno')
-  process.exit(1)
-}
-const stripe = new Stripe(STRIPE_SECRET_KEY)
-
-/* ========= CORS (permitir tu front) =========
-   FRONTEND_URL debe incluir protocolo, p.ej. https://tuapp.vercel.app
-   FRONTEND_URL_2 opcional (otro dominio o preview)
-*/
-const ALLOW = [process.env.FRONTEND_URL, process.env.FRONTEND_URL_2].filter(Boolean)
+const allowList = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const corsOptions = {
-  origin(origin, cb) {
-    if (!origin) return cb(null, true) // permite curl/SSR
-    try {
-      // Acepta el dominio exacto en ALLOW y (opcional) previews *.vercel.app
-      if (ALLOW.includes(origin)) return cb(null, true)
-      const host = new URL(origin).host
-      if (/\.vercel\.app$/.test(host)) return cb(null, true) // quita esta línea si no quieres previews
-    } catch {}
-    return cb(new Error('Not allowed by CORS'))
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowList.length === 0 || allowList.includes(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS: ' + origin));
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Stripe-Signature'],
-  optionsSuccessStatus: 200,
-}
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  maxAge: 600
+};
 
-/* ========= WEBHOOK (ANTES del json parser) ========= */
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature']
-  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET
+app.use(morgan('tiny'));
 
-  let event
+app.post('/webhook', bodyParser.raw({ type: 'application/json' }), (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  let event;
   try {
-    event = endpointSecret
-      ? stripe.webhooks.constructEvent(req.body, sig, endpointSecret)
-      : JSON.parse(req.body) // solo sin verificación (no usar en producción)
+    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
   } catch (err) {
-    console.error('❌ Webhook signature failed:', err.message)
-    return res.status(400).send(`Webhook Error: ${err.message}`)
+    console.error('Webhook signature verification failed.', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-
-  try {
-    switch (event.type) {
-      case 'checkout.session.completed': {
-        const session = await stripe.checkout.sessions.retrieve(event.data.object.id, {
-          expand: ['line_items.data.price.product', 'customer', 'subscription'],
-        })
-        // Aquí puedes guardar el pedido en DB y mandar email
-        console.log('✅ Pedido completado:', {
-          id: session.id,
-          mode: session.mode,
-          amount_total: (session.amount_total ?? 0) / 100,
-          currency: session.currency,
-          customer: session.customer_details?.email,
-        })
-        break
-      }
-      case 'invoice.payment_succeeded': {
-        console.log('ℹ️ Renovación de suscripción cobrada:', event.data.object.id)
-        break
-      }
-      default:
-        console.log('ℹ️ Evento no manejado:', event.type)
-    }
-    res.json({ received: true })
-  } catch (err) {
-    console.error('❌ Error procesando webhook:', err)
-    res.status(500).json({ error: 'Webhook handler error' })
+  switch (event.type) {
+    case 'checkout.session.completed':
+      console.log('✅ checkout.session.completed', event.data.object.id);
+      break;
+    case 'invoice.payment_succeeded':
+      console.log('✅ invoice.payment_succeeded', event.data.object.id);
+      break;
+    case 'invoice.payment_failed':
+      console.warn('⚠️ invoice.payment_failed', event.data.object.id);
+      break;
+    default: break;
   }
-})
+  res.json({ received: true });
+});
 
-/* ========= Parsers y CORS para el resto de rutas ========= */
-app.use(cors(corsOptions))
-app.use(express.json())
+app.use(cors(corsOptions));
+app.use(express.json());
 
-/* ========= Health ========= */
-app.get('/health', (_, res) => res.json({ ok: true }))
+app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
-/* ========= Crear sesión de Checkout ========= */
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const {
-      items = [],            // [{ price:'price_...', quantity: 1 }]
-      mode = 'payment',      // 'payment' | 'subscription'
-      success_url,
-      cancel_url,
-      customer_email,
-      metadata = {},
-    } = req.body || {}
+    const { items = [], mode = 'payment', success_url, cancel_url } = req.body;
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Missing items' });
+    if (!success_url || !cancel_url) return res.status(400).json({ error: 'Missing success_url/cancel_url' });
 
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: 'No line items provided' })
-    }
-    for (const li of items) {
-      if (!li.price || typeof li.quantity !== 'number') {
-        return res.status(400).json({ error: 'Invalid line item: need price + quantity' })
-      }
-    }
+    const shippingRate = process.env.STRIPE_SHIPPING_RATE_ID;
+    const isSubscription = mode === 'subscription';
 
-    // Allowed countries (env: "ES,PT,FR")
-    const allowedCountries = (process.env.ALLOWED_COUNTRIES || 'ES')
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean)
-
-    // Shipping rates (env: "shr_...,shr_..."), filtramos basura
-    const shippingRateIds = (process.env.SHIPPING_RATES || '')
-      .split(',')
-      .map(s => s.trim())
-      .filter(id => /^shr_/.test(id))
-
-    const session = await stripe.checkout.sessions.create({
+    const sessionParams = {
       mode,
       line_items: items,
-      success_url: success_url || `${process.env.FRONTEND_URL}/success`,
-      cancel_url: cancel_url || `${process.env.FRONTEND_URL}/cancel`,
-      customer_email,
-      shipping_address_collection: { allowed_countries: allowedCountries },
-      shipping_options: shippingRateIds.length
-        ? shippingRateIds.map(id => ({ shipping_rate: id }))
-        : undefined,
-      automatic_tax: { enabled: (process.env.ENABLE_AUTOMATIC_TAX || 'true') === 'true' },
-      phone_number_collection: { enabled: true },
-      metadata,
-    })
+      success_url,
+      cancel_url,
+      allow_promotion_codes: true
+    };
 
-    res.json({ url: session.url, id: session.id })
-  } catch (e) {
-    console.error('❌ Error creando sesión:', e)
-    res.status(500).json({ error: e.message })
+    if (!isSubscription && shippingRate) {
+      sessionParams.shipping_address_collection = { allowed_countries: ['ES','PT'] };
+      sessionParams.shipping_options = [{ shipping_rate: shippingRate }];
+      sessionParams.invoice_creation = { enabled: true };
+      sessionParams.billing_address_collection = 'auto';
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionParams);
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('create-checkout-session error:', err);
+    res.status(500).json({ error: err.message });
   }
-})
+});
 
-/* ========= Arrancar ========= */
-app.listen(PORT, () => {
-  console.log(`✅ API on :${PORT}`)
-})
+app.listen(PORT, () => console.log(`API listening on :${PORT}`));

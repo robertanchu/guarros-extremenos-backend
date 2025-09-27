@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  api:
+    build: .
+    ports: ["3000:3000"]
+    environment:
+      NODE_ENV: "production"
+      PORT: "3000"
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      STRIPE_SHIPPING_RATE_ID: ${STRIPE_SHIPPING_RATE_ID}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+    command: node server.js
