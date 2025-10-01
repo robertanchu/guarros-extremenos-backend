@@ -6,11 +6,11 @@ import bodyParser from 'body-parser';
 import Stripe from 'stripe';
 
 // --- Notificaciones / Email ---
-import { Resend } from 'resend';          // npm i resend
-import nodemailer from 'nodemailer';      // npm i nodemailer
+import { Resend } from 'resend';          // opcional (si usas Resend)
+import nodemailer from 'nodemailer';      // SMTP (Gmail u otro)
 
 // --- Registro en DB (opcional) ---
-import pg from 'pg';                       // npm i pg
+import pg from 'pg';                       // Postgres (Supabase)
 const { Pool } = pg;
 
 const app = express();
@@ -44,86 +44,101 @@ app.use(morgan('tiny'));
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  let event;
 
+  let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
   } catch (err) {
-    console.error('Webhook signature verification failed.', err.message);
+    console.error('❌ Webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  try {
-    switch (event.type) {
-      case 'checkout.session.completed': {
-        const session = event.data.object;
+  // ✅ ACK rápido para que Stripe no marque fallo aunque fallen tareas internas
+  res.status(200).json({ received: true });
 
-        // Cargamos line items para el email/registro
-        const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
+  // 🔧 Trabajo en background, sin bloquear la respuesta
+  queueMicrotask(async () => {
+    try {
+      switch (event.type) {
+        case 'checkout.session.completed': {
+          const session = event.data.object;
 
-        const customerEmail = session.customer_details?.email || session.customer_email;
-        const name = session.customer_details?.name || session.metadata?.name;
-        const phone = session.customer_details?.phone || session.metadata?.phone;
-        const shipping = session.shipping_details?.address;
-        const metadata = session.metadata || {};
-        const amountTotal = (session.amount_total ?? 0) / 100;
-        const currency = (session.currency || 'eur').toUpperCase();
+          // Cargar line items (para email/registro)
+          let lineItems = [];
+          try {
+            const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
+            lineItems = li?.data || [];
+          } catch (e) {
+            console.warn('[webhook] no se pudieron leer lineItems:', e.message);
+          }
 
-        // 1) Email al corporativo
-        await sendAdminEmail({
-          session,
-          lineItems: lineItems?.data || [],
-          customerEmail,
-          name,
-          phone,
-          amountTotal,
-          currency,
-          metadata,
-          shipping,
-        });
+          const customerEmail = session.customer_details?.email || session.customer_email;
+          const name = session.customer_details?.name || session.metadata?.name;
+          const phone = session.customer_details?.phone || session.metadata?.phone;
+          const shipping = session.shipping_details?.address;
+          const metadata = session.metadata || {};
+          const amountTotal = (session.amount_total ?? 0) / 100;
+          const currency = (session.currency || 'eur').toUpperCase();
 
-        // 2) Registro en DB (si DATABASE_URL está configurado)
-        await logOrder({
-          sessionId: session.id,
-          amountTotal,
-          currency,
-          customerEmail,
-          name,
-          phone,
-          lineItems: lineItems?.data || [],
-          metadata,
-          shipping,
-          status: 'paid',
-          createdAt: new Date().toISOString(),
-        });
+          // Email (no bloqueante)
+          try {
+            await sendAdminEmail({
+              session, lineItems, customerEmail, name, phone,
+              amountTotal, currency, metadata, shipping,
+            });
+            console.log('📧 Email admin enviado OK');
+          } catch (e) {
+            console.error('📧 Email admin ERROR:', e);
+          }
 
-        console.log('✅ checkout.session.completed', session.id);
-        break;
+          // Registro en DB (no bloqueante)
+          try {
+            await logOrder({
+              sessionId: session.id,
+              amountTotal,
+              currency,
+              customerEmail,
+              name,
+              phone,
+              lineItems,
+              metadata,
+              shipping,
+              status: 'paid',
+              createdAt: new Date().toISOString(),
+            });
+
+            // (Opcional) Normalizar líneas en tabla aparte:
+            // await logOrderItems(session.id, lineItems, currency);
+
+            console.log('🗄️ Pedido registrado OK');
+          } catch (e) {
+            console.error('🗄️ Registro en DB ERROR:', e);
+          }
+
+          console.log('✅ Procesado checkout.session.completed', session.id);
+          break;
+        }
+
+        case 'invoice.payment_succeeded': {
+          const invoice = event.data.object;
+          console.log('✅ invoice.payment_succeeded', invoice.id);
+          break;
+        }
+
+        case 'invoice.payment_failed': {
+          const invoice = event.data.object;
+          console.warn('⚠️ invoice.payment_failed', invoice.id);
+          break;
+        }
+
+        default:
+          console.log('ℹ️ Evento ignorado:', event.type);
       }
-
-      case 'invoice.payment_succeeded': {
-        // Útil para renovaciones de suscripción
-        const invoice = event.data.object;
-        console.log('✅ invoice.payment_succeeded', invoice.id);
-        break;
-      }
-
-      case 'invoice.payment_failed': {
-        const invoice = event.data.object;
-        console.warn('⚠️ invoice.payment_failed', invoice.id);
-        break;
-      }
-
-      default:
-        // Otros eventos que no procesamos
-        break;
+    } catch (err) {
+      // Cualquier error aquí NO afecta al 200 ya enviado a Stripe
+      console.error('[webhook bg] error:', err);
     }
-
-    return res.json({ received: true });
-  } catch (err) {
-    console.error('[webhook] error procesando evento:', err);
-    return res.status(500).send('Error procesando el evento');
-  }
+  });
 });
 
 // Resto de middleware después del webhook
@@ -164,7 +179,6 @@ app.post('/create-checkout-session', async (req, res) => {
       cancel_url,
       allow_promotion_codes: true,
 
-      // Si el front envía email/teléfono/nombre como metadata o customer
       customer_email: customer?.email || undefined,
       customer_creation: 'if_required',
       metadata: {
@@ -194,14 +208,31 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+/* ----------------- ENDPOINT DE PRUEBA SMTP ----------------- */
+app.post('/test-email', async (req, res) => {
+  try {
+    const to = process.env.CORPORATE_EMAIL || (process.env.SMTP_USER || 'destino@tudominio.com');
+    const from = process.env.CORPORATE_FROM || process.env.SMTP_USER;
+
+    const subject = 'Prueba SMTP';
+    const text = `Hola, esto es un test SMTP desde backend. ${new Date().toISOString()}`;
+
+    const info = await sendViaGmailSMTP({ from, to, subject, text });
+    return res.json({ ok: true, messageId: info.messageId, accepted: info.accepted, rejected: info.rejected });
+  } catch (e) {
+    console.error('[/test-email] error:', e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`API listening on :${PORT}`));
 
 /* ----------------- Helpers ----------------- */
 
-// Email corporativo (elige Resend o SMTP abajo)
+// Email corporativo — intenta Resend; si no, SMTP (Gmail u otro)
 async function sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping }) {
   const to = process.env.CORPORATE_EMAIL || 'pedidos@tudominio.com';
-  const from = process.env.CORPORATE_FROM || 'no-reply@tu-dominio.com';
+  const from = process.env.CORPORATE_FROM || process.env.SMTP_USER || 'no-reply@tu-dominio.com';
 
   const itemsText = (lineItems || [])
     .map(li => `• ${li.description} x${li.quantity} — ${(li.amount_total / 100).toFixed(2)} ${currency}`)
@@ -242,28 +273,46 @@ ${JSON.stringify(metadata || {}, null, 2)}
 
   // --- Opción B: SMTP ---
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: false,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-    });
-
-    await transporter.sendMail({
-      from,
-      to,
-      subject: `Nuevo pedido — ${amountTotal.toFixed(2)} ${currency}`,
-      text: bodyText
-    });
+    await sendViaGmailSMTP({ from, to, subject: `Nuevo pedido — ${amountTotal.toFixed(2)} ${currency}`, text: bodyText });
     return;
   }
 
-  // Si no hay proveedor configurado, al menos deja constancia en logs
   console.warn('[email] No hay RESEND_API_KEY ni SMTP configurado. Email no enviado.');
 }
 
-// Registro en DB (Postgres en Render/Supabase). Si no hay DATABASE_URL, se omite.
-const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
+// Transporte SMTP con verificación y logs (Gmail App Password o cualquier SMTP)
+async function sendViaGmailSMTP({ from, to, subject, text }) {
+  const port = Number(process.env.SMTP_PORT || 465);
+  const secure = String(port) === '465'; // 465 = SSL; 587 = STARTTLS
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,              // smtp.gmail.com
+    port,
+    secure,
+    auth: {
+      user: process.env.SMTP_USER,            // tu_cuenta@gmail.com
+      pass: process.env.SMTP_PASS,            // App Password (16 chars)
+    },
+    logger: true,   // logs nodemailer
+    debug: true,    // debug SMTP
+  });
+
+  // Verificar conexión/credenciales
+  await transporter.verify();
+  console.log('[smtp] transporter.verify() OK');
+
+  const info = await transporter.sendMail({ from, to, subject, text });
+  console.log('[smtp] Message sent:', info.messageId, 'accepted:', info.accepted, 'rejected:', info.rejected);
+  return info;
+}
+
+// Registro en DB (Postgres en Render/Supabase).
+// Usa SSL por defecto (útil con Supabase). Alternativa: ?sslmode=require en DATABASE_URL.
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
 
 async function logOrder(order) {
   if (!pool) {
@@ -291,3 +340,26 @@ async function logOrder(order) {
   ];
   await pool.query(text, values);
 }
+
+/*
+// (Opcional) Si quieres tabla normalizada de líneas:
+async function logOrderItems(sessionId, lineItems, currency) {
+  if (!pool || !Array.isArray(lineItems)) return;
+  const text = `
+    insert into order_items (session_id, description, quantity, amount_total_cents, currency, raw)
+    values ($1,$2,$3,$4,$5,$6)
+    on conflict do nothing
+  `;
+  for (const li of lineItems) {
+    const vals = [
+      sessionId,
+      li.description || null,
+      li.quantity || 1,
+      li.amount_total ?? 0,
+      (li.currency || currency || 'eur').toUpperCase(),
+      JSON.stringify(li),
+    ];
+    await pool.query(text, vals);
+  }
+}
+*/
