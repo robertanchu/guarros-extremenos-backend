@@ -208,6 +208,73 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+
+/* ----------------- ENDPOINTS DE PRUEBA ----------------- */
+
+// 1) Ping a la base de datos (usa el Pool global "pool")
+app.get('/test-db-ping', async (req, res) => {
+  try {
+    if (!pool) throw new Error('DATABASE_URL no configurado');
+    const r = await pool.query('select now() as now');
+    res.json({ ok: true, now: r.rows[0].now });
+  } catch (e) {
+    console.error('[/test-db-ping] error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// 2) Inserción mínima en la tabla orders (útil para validar permisos)
+app.post('/test-db-insert', async (req, res) => {
+  try {
+    if (!pool) throw new Error('DATABASE_URL no configurado');
+    await pool.query(
+      `insert into orders (session_id, email, name, total, currency, items, metadata, shipping, status, created_at)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       on conflict (session_id) do nothing`,
+      [
+        'test_session_' + Date.now(),
+        'test@example.com',
+        'Pedido de prueba',
+        12.34,
+        'EUR',
+        JSON.stringify([]),
+        JSON.stringify({ test: true }),
+        JSON.stringify({}),
+        'paid',
+        new Date().toISOString()
+      ]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[/test-db-insert] error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// 3) Prueba de email (prioriza Resend si está configurado)
+app.post('/test-email', async (req, res) => {
+  try {
+    const to = process.env.CORPORATE_EMAIL || (process.env.SMTP_USER || 'destino@tudominio.com');
+    const from = process.env.CORPORATE_FROM || process.env.SMTP_USER || 'no-reply@example.com';
+    const subject = 'Prueba email backend';
+    const text = `Hola, prueba enviada a las ${new Date().toISOString()}`;
+
+    if (process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      const info = await resend.emails.send({ from, to, subject, text });
+      return res.json({ ok: true, provider: 'resend', id: info?.id || null });
+    }
+
+    // Fallback SMTP (ojo: Render suele bloquear SMTP)
+    const info = await sendViaGmailSMTP({ from, to, subject, text });
+    return res.json({ ok: true, provider: 'smtp', messageId: info.messageId });
+  } catch (e) {
+    console.error('[/test-email] error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 /* ----------------- ENDPOINT DE PRUEBA SMTP ----------------- */
 app.post('/test-email', async (req, res) => {
   try {
