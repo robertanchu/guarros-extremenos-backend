@@ -377,7 +377,10 @@ async function sendViaGmailSMTP({ from, to, subject, text }) {
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
+      ssl: {
+        require: true,            // fuerza SSL
+        rejectUnauthorized: false // no valida la cadena (evita "self-signed")
+      },
     })
   : null;
 
