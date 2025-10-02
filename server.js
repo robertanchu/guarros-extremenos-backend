@@ -78,7 +78,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           const amountTotal = (session.amount_total ?? 0) / 100;
           const currency = (session.currency || 'eur').toUpperCase();
 
-          // Email (no bloqueante)
+          // Email ADMIN (no bloqueante)
           try {
             await sendAdminEmail({
               session, lineItems, customerEmail, name, phone,
@@ -87,6 +87,23 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             console.log('📧 Email admin enviado OK');
           } catch (e) {
             console.error('📧 Email admin ERROR:', e);
+          }
+
+          // 🔹 NUEVO: Email CLIENTE (no bloqueante)
+          try {
+            await sendCustomerEmail({
+              to: customerEmail,
+              name,
+              amountTotal,
+              currency,
+              lineItems,
+              orderId: session.id,
+              supportEmail: process.env.SUPPORT_EMAIL,
+              brand: "Guarros Extremeños",
+            });
+            console.log('📧 Email cliente enviado OK');
+          } catch (e) {
+            console.error('📧 Email cliente ERROR:', e);
           }
 
           // Registro en DB (no bloqueante)
@@ -105,7 +122,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               createdAt: new Date().toISOString(),
             });
 
-            // 🔹 También guardamos líneas normalizadas
+            // También guardamos líneas normalizadas
             await logOrderItems(session.id, lineItems, currency);
 
             console.log('🗄️ Pedido registrado OK');
@@ -268,6 +285,29 @@ app.post('/test-email', async (req, res) => {
   }
 });
 
+// 4) 🔹 NUEVO: prueba de email al cliente
+app.post('/test-email-customer', async (req, res) => {
+  try {
+    const to = req.body?.to || req.query?.to || 'tu-correo-de-prueba@ejemplo.com';
+    await sendCustomerEmail({
+      to,
+      name: 'Cliente de prueba',
+      amountTotal: 123.45,
+      currency: 'EUR',
+      orderId: 'test_' + Date.now(),
+      lineItems: [
+        { description: 'Jamón Canalla', quantity: 1, amount_total: 9999, currency: 'eur' },
+        { description: 'Loncheado', quantity: 2, amount_total: 1599, currency: 'eur' },
+      ],
+      brand: "Guarros Extremeños",
+    });
+    res.json({ ok: true, to });
+  } catch (e) {
+    console.error('[/test-email-customer] error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 /* ----------------- MÉTRICAS (lee vistas en la DB) ----------------- */
 app.get('/metrics/overview', async (req, res) => {
   try {
@@ -300,9 +340,7 @@ async function sendAdminEmail({ session, lineItems, customerEmail, name, phone, 
   const to = process.env.CORPORATE_EMAIL || 'pedidos@tudominio.com';
   const from = process.env.CORPORATE_FROM || process.env.SMTP_USER || 'no-reply@tu-dominio.com';
 
-  const itemsText = (lineItems || [])
-    .map(li => `• ${li.description} x${li.quantity} — ${(li.amount_total / 100).toFixed(2)} ${currency}`)
-    .join('\n');
+  const itemsText = formatLineItemsPlain(lineItems, currency);
 
   const bodyText = `
 Nuevo pedido completado (Stripe)
@@ -342,6 +380,66 @@ ${JSON.stringify(metadata || {}, null, 2)}
   }
 
   console.warn('[email] No hay RESEND_API_KEY ni SMTP configurado. Email no enviado.');
+}
+
+// 🔹 NUEVO: Email al cliente
+async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand = "Guarros Extremeños" }) {
+  if (!to) return;
+  const C = (currency || 'EUR').toUpperCase();
+  const totalFmt = (Number(amountTotal || 0)).toFixed(2) + ' ' + C;
+  const itemsTxt = formatLineItemsPlain(lineItems, C);
+  const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
+  const replyTo = process.env.SUPPORT_EMAIL || supportEmail || 'soporte@guarrosextremenos.com';
+
+  const subject = `✅ Confirmación de pedido ${orderId ? `#${orderId}` : ''} — ${brand}`;
+  const text = `
+Hola${name ? ' ' + name : ''},
+
+¡Gracias por tu compra en ${brand}! Tu pago se ha recibido correctamente.
+
+Resumen del pedido:
+${itemsTxt}
+
+Total pagado: ${totalFmt}
+${orderId ? `ID de pedido (Stripe): ${orderId}\n` : ''}
+
+En breve recibirás otra comunicación si tu pedido requiere información adicional de envío o de suscripción.
+
+Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.
+
+Un saludo,
+Equipo ${brand}
+  `.trim();
+
+  if (process.env.RESEND_API_KEY) {
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({
+      from,
+      to,
+      reply_to: replyTo,
+      subject,
+      text,
+    });
+    return;
+  }
+
+  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    await sendViaGmailSMTP({ from, to, subject, text });
+    return;
+  }
+
+  console.warn('[email-customer] No hay RESEND_API_KEY ni SMTP configurado. Email cliente no enviado.');
+}
+
+// Formateo simple de líneas
+function formatLineItemsPlain(lineItems = [], currency = 'EUR') {
+  const C = String(currency || 'EUR').toUpperCase();
+  const lines = (lineItems || []).map(li => {
+    const total = ((li.amount_total ?? 0) / 100).toFixed(2);
+    return `• ${li.description} x${li.quantity} — ${total} ${C}`;
+    // Si quieres mostrar precio unitario, puedes leer li.price?.unit_amount
+  });
+  return lines.length ? lines.join('\n') : '—';
 }
 
 // Transporte SMTP con verificación y logs (Gmail App Password o cualquier SMTP)
