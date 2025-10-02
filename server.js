@@ -284,12 +284,12 @@ app.post('/create-checkout-session', async (req, res) => {
       billing_address_collection: 'auto'
     };
 
-    // Factura SIEMPRE en pagos únicos (cobrada automáticamente)
+    // Factura SIEMPRE en pagos únicos (Stripe Checkout genera la factura tras el cobro)
     if (!isSubscription) {
       sessionParams.invoice_creation = {
         enabled: true,
         invoice_data: {
-          collection_method: 'charge_automatically',
+          // (NO usar collection_method aquí; Stripe Checkout no lo admite)
           description: 'Pedido web Guarros Extremeños',
           footer: 'Gracias por su compra. Soporte: soporte@guarrosextremenos.com'
         }
@@ -464,17 +464,17 @@ function formatLineItemsHTML(lineItems = [], currency = 'EUR') {
 
 function emailShell({ title, headerLabel, bodyHTML, footerHTML }) {
   const logoBlock = BRAND_LOGO_URL
-    ? `<img src="${BRAND_LOGO_URL}" alt="${escapeHtml(BRAND)}" width="200" style="display:block; max-width:200px; width:100%; height:auto; margin:0 auto 8px;" />`
-    : `<div style="font-size:20px; font-weight:700; color:${BRAND_PRIMARY}; text-align:center; margin-bottom:8px;">${escapeHtml(BRAND)}</div>`;
+    ? `<img src="${BRAND_LOGO_URL}" alt="${BRAND}" width="200" style="display:block; max-width:200px; width:100%; height:auto; margin:0 auto 8px;" />`
+    : `<div style="font-size:20px; font-weight:700; color:${BRAND_PRIMARY}; text-align:center; margin-bottom:8px;">${BRAND}</div>`;
   return `<!doctype html>
-<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>${escapeHtml(title)}</title></head>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>${title}</title></head>
 <body style="margin:0; padding:0; background:#f3f4f6;">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6; padding:24px 0;">
     <tr><td>
       <table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" style="max-width:600px; width:100%; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
         <tr><td style="padding:24px; text-align:center; background:#ffffff;">
           ${logoBlock}
-          <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; font-size:22px; font-weight:800; color:${BRAND_PRIMARY}; letter-spacing:0.3px;">${escapeHtml(headerLabel)}</div>
+          <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; font-size:22px; font-weight:800; color:${BRAND_PRIMARY}; letter-spacing:0.3px;">${headerLabel}</div>
         </td></tr>
         ${bodyHTML}
         <tr><td style="padding:16px 24px 24px; background:#ffffff;">
@@ -495,7 +495,7 @@ async function createPaidReceiptPDF({
   lineItems = [],
   customer = {},
   paidAt = new Date(),
-  brand = BRAND,
+  brand = "Guarros Extremeños",
   logoUrl = BRAND_LOGO_URL,
 }) {
   const items = (lineItems || []).map(li => ({
@@ -831,7 +831,7 @@ async function sendCustomerOrderAndInvoiceEmail({
     const resp = await fetch(pdfUrl);
     if (resp.ok) {
       const stripeB64 = Buffer.from(await resp.arrayBuffer()).toString('base64');
-      attachments.push({ filename: `Factura-${invoiceNumber || 'pedido'}.pdf`, content: stripeB64 });
+      attachments.push({ filename: `Factura-${invoiceNumber || 'pedido'}.pdf', content: stripeB64 });
     } else {
       console.warn('[combined email] No se pudo descargar PDF de Stripe:', resp.status);
     }
