@@ -36,6 +36,9 @@ const corsOptions = {
 
 app.use(morgan('tiny'));
 
+// Helper wait (para retries de factura)
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ======================================================
 // ==========   WEBHOOK STRIPE (ACK RÁPIDO)    ==========
 // ======================================================
@@ -50,6 +53,14 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
     console.error('❌ Webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
+
+  // 👇 LOG de diagnóstico clave
+  console.log('[webhook] EVENT', {
+    id: event.id,
+    type: event.type,
+    livemode: !!event.livemode,
+    created: event.created
+  });
 
   // OK inmediato; procesado en background
   res.status(200).json({ received: true });
@@ -161,10 +172,24 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               invoice.customer_details?.name ||
               invoice.customer?.name ||
               '';
-            const pdfUrl = invoice.invoice_pdf; // URL pública temporal
+            let pdfUrl = invoice.invoice_pdf; // URL pública temporal
             const invoiceNumber = invoice.number || invoice.id;
             const currency = (invoice.currency || 'eur').toUpperCase();
             const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
+
+            // 👇 REINTENTOS si el PDF aún no está generado
+            if (!pdfUrl) {
+              for (let i = 0; i < 3 && !pdfUrl; i++) {
+                await wait(3000);
+                try {
+                  const inv2 = await stripe.invoices.retrieve(invoice.id);
+                  pdfUrl = inv2.invoice_pdf || null;
+                  console.log(`[invoice.retry] intento ${i + 1}: invoice_pdf ${pdfUrl ? 'OK' : 'aún no'}`);
+                } catch (e) {
+                  console.warn('[invoice.retry] retrieve error:', e?.message || e);
+                }
+              }
+            }
 
             if (to && pdfUrl) {
               await sendInvoiceEmail({
@@ -226,7 +251,6 @@ app.post('/create-checkout-session', async (req, res) => {
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Missing items' });
     if (!success_url || !cancel_url) return res.status(400).json({ error: 'Missing success_url/cancel_url' });
 
-    const shippingRate = process.env.STRIPE_SHIPPING_RATE_ID;
     const isSubscription = mode === 'subscription';
 
     const sessionParams = {
@@ -250,10 +274,15 @@ app.post('/create-checkout-session', async (req, res) => {
       billing_address_collection: 'auto'
     };
 
-    if (!isSubscription && shippingRate) {
-      sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
-      sessionParams.shipping_options = [{ shipping_rate: shippingRate }];
+    // 👇 habilita SIEMPRE factura en pagos únicos
+    if (!isSubscription) {
       sessionParams.invoice_creation = { enabled: true };
+    }
+
+    // 👇 opcional: envío solo si usas shipping rates
+    if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
+      sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
+      sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
