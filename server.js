@@ -6,8 +6,8 @@ import bodyParser from 'body-parser';
 import Stripe from 'stripe';
 
 // --- Notificaciones / Email ---
-import { Resend } from 'resend';          // opcional (si usas Resend)
-import nodemailer from 'nodemailer';      // SMTP (Gmail u otro)
+import { Resend } from 'resend';          // API (recomendada en Render)
+import nodemailer from 'nodemailer';      // SMTP (fallback si tu plan lo permite)
 
 // --- Registro en DB (Supabase / Postgres) ---
 import pg from 'pg';
@@ -19,16 +19,10 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // CORS (para el front)
 const allowList = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 const corsOptions = {
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowList.length === 0 || allowList.includes(origin)) return callback(null, true);
-    return callback(new Error('Not allowed by CORS: ' + origin));
-  },
+  origin: (origin, cb) => (!origin || allowList.length === 0 || allowList.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS: ' + origin)),
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   maxAge: 600
@@ -36,10 +30,7 @@ const corsOptions = {
 
 app.use(morgan('tiny'));
 
-/**
- * WEBHOOK de Stripe
- * ⚠️ Debe ir ANTES de express.json() y usar body "raw" para verificar firma.
- */
+/* ========================= WEBHOOK (ACK RÁPIDO) ========================= */
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -52,7 +43,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // ✅ ACK rápido; lo pesado corre en background
+  // OK inmediato; lo pesado corre detrás
   res.status(200).json({ received: true });
 
   queueMicrotask(async () => {
@@ -61,10 +52,10 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
         case 'checkout.session.completed': {
           const session = event.data.object;
 
-          // Line items (para email/registro)
+          // Line items
           let lineItems = [];
           try {
-            const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
+            const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] });
             lineItems = li?.data || [];
           } catch (e) {
             console.warn('[webhook] no se pudieron leer lineItems:', e.message);
@@ -78,7 +69,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           const amountTotal = (session.amount_total ?? 0) / 100;
           const currency = (session.currency || 'eur').toUpperCase();
 
-          // Email ADMIN (no bloqueante)
+          // Admin
           try {
             await sendAdminEmail({
               session, lineItems, customerEmail, name, phone,
@@ -89,7 +80,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             console.error('📧 Email admin ERROR:', e);
           }
 
-          // 🔹 NUEVO: Email CLIENTE (no bloqueante)
+          // Cliente
           try {
             await sendCustomerEmail({
               to: customerEmail,
@@ -99,14 +90,14 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               lineItems,
               orderId: session.id,
               supportEmail: process.env.SUPPORT_EMAIL,
-              brand: "Guarros Extremeños",
+              brand: process.env.BRAND_NAME || "Guarros Extremeños",
             });
             console.log('📧 Email cliente enviado OK');
           } catch (e) {
             console.error('📧 Email cliente ERROR:', e);
           }
 
-          // Registro en DB (no bloqueante)
+          // DB
           try {
             await logOrder({
               sessionId: session.id,
@@ -121,10 +112,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               status: 'paid',
               createdAt: new Date().toISOString(),
             });
-
-            // También guardamos líneas normalizadas
             await logOrderItems(session.id, lineItems, currency);
-
             console.log('🗄️ Pedido registrado OK');
           } catch (e) {
             console.error('🗄️ Registro en DB ERROR:', e);
@@ -134,17 +122,13 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           break;
         }
 
-        case 'invoice.payment_succeeded': {
-          const invoice = event.data.object;
-          console.log('✅ invoice.payment_succeeded', invoice.id);
+        case 'invoice.payment_succeeded':
+          console.log('✅ invoice.payment_succeeded', event.data.object.id);
           break;
-        }
 
-        case 'invoice.payment_failed': {
-          const invoice = event.data.object;
-          console.warn('⚠️ invoice.payment_failed', invoice.id);
+        case 'invoice.payment_failed':
+          console.warn('⚠️ invoice.payment_failed', event.data.object.id);
           break;
-        }
 
         default:
           console.log('ℹ️ Evento ignorado:', event.type);
@@ -155,15 +139,13 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
   });
 });
 
-// Resto de middleware después del webhook
+/* ========================= API REST ========================= */
 app.use(cors(corsOptions));
 app.use(express.json());
 
 app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
-/**
- * Crear sesión de Checkout
- */
+// Crear sesión de Checkout
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const {
@@ -176,10 +158,8 @@ app.post('/create-checkout-session', async (req, res) => {
       metadata
     } = req.body;
 
-    if (!Array.isArray(items) || items.length === 0)
-      return res.status(400).json({ error: 'Missing items' });
-    if (!success_url || !cancel_url)
-      return res.status(400).json({ error: 'Missing success_url/cancel_url' });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Missing items' });
+    if (!success_url || !cancel_url) return res.status(400).json({ error: 'Missing success_url/cancel_url' });
 
     const shippingRate = process.env.STRIPE_SHIPPING_RATE_ID;
     const isSubscription = mode === 'subscription';
@@ -190,7 +170,6 @@ app.post('/create-checkout-session', async (req, res) => {
       success_url,
       cancel_url,
       allow_promotion_codes: true,
-
       customer_email: customer?.email || undefined,
       customer_creation: 'if_required',
       metadata: {
@@ -221,8 +200,6 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 /* ----------------- ENDPOINTS DE PRUEBA ----------------- */
-
-// 1) Ping a la base de datos
 app.get('/test-db-ping', async (req, res) => {
   try {
     if (!pool) throw new Error('DATABASE_URL no configurado');
@@ -234,7 +211,6 @@ app.get('/test-db-ping', async (req, res) => {
   }
 });
 
-// 2) Inserción mínima en la tabla orders
 app.post('/test-db-insert', async (req, res) => {
   try {
     if (!pool) throw new Error('DATABASE_URL no configurado');
@@ -262,7 +238,6 @@ app.post('/test-db-insert', async (req, res) => {
   }
 });
 
-// 3) Prueba de email (prioriza Resend si está configurado)
 app.post('/test-email', async (req, res) => {
   try {
     const to = process.env.CORPORATE_EMAIL || (process.env.SMTP_USER || 'destino@tudominio.com');
@@ -275,8 +250,6 @@ app.post('/test-email', async (req, res) => {
       const info = await resend.emails.send({ from, to, subject, text });
       return res.json({ ok: true, provider: 'resend', id: info?.id || null });
     }
-
-    // Fallback SMTP (Render suele bloquear SMTP; úsalo solo si tu plan lo permite)
     const info = await sendViaGmailSMTP({ from, to, subject, text });
     return res.json({ ok: true, provider: 'smtp', messageId: info.messageId });
   } catch (e) {
@@ -285,7 +258,6 @@ app.post('/test-email', async (req, res) => {
   }
 });
 
-// 4) 🔹 NUEVO: prueba de email al cliente
 app.post('/test-email-customer', async (req, res) => {
   try {
     const to = req.body?.to || req.query?.to || 'tu-correo-de-prueba@ejemplo.com';
@@ -299,7 +271,7 @@ app.post('/test-email-customer', async (req, res) => {
         { description: 'Jamón Canalla', quantity: 1, amount_total: 9999, currency: 'eur' },
         { description: 'Loncheado', quantity: 2, amount_total: 1599, currency: 'eur' },
       ],
-      brand: "Guarros Extremeños",
+      brand: process.env.BRAND_NAME || "Guarros Extremeños",
     });
     res.json({ ok: true, to });
   } catch (e) {
@@ -308,7 +280,7 @@ app.post('/test-email-customer', async (req, res) => {
   }
 });
 
-/* ----------------- MÉTRICAS (lee vistas en la DB) ----------------- */
+/* ----------------- MÉTRICAS ----------------- */
 app.get('/metrics/overview', async (req, res) => {
   try {
     if (!pool) throw new Error('DATABASE_URL no configurado');
@@ -318,13 +290,7 @@ app.get('/metrics/overview', async (req, res) => {
       pool.query('select * from v_mix_subscription_90d'),
       pool.query('select * from v_top_products_90d'),
     ]);
-    res.json({
-      ok: true,
-      daily: daily.rows,
-      monthly: monthly.rows,
-      mix: mix.rows,
-      top: top.rows,
-    });
+    res.json({ ok: true, daily: daily.rows, monthly: monthly.rows, mix: mix.rows, top: top.rows });
   } catch (e) {
     console.error('[/metrics/overview] error:', e);
     res.status(500).json({ ok: false, error: e.message });
@@ -333,22 +299,87 @@ app.get('/metrics/overview', async (req, res) => {
 
 app.listen(PORT, () => console.log(`API listening on :${PORT}`));
 
-/* ----------------- Helpers ----------------- */
+/* ========================= HELPERS EMAIL ========================= */
+// Branding
+const BRAND = process.env.BRAND_NAME || "Guarros Extremeños";
+const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
+const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 
-// Email corporativo — intenta Resend; si no, SMTP
+// Escapes HTML
+function escapeHtml(str) {
+  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+}
+
+function currencyFormat(amount = 0, currency = 'EUR') {
+  try { return new Intl.NumberFormat('es-ES', { style: 'currency', currency }).format(Number(amount)); }
+  catch { return `${Number(amount).toFixed(2)} ${(currency||'EUR').toUpperCase()}`; }
+}
+
+function formatLineItemsPlain(lineItems = [], currency = 'EUR') {
+  const lines = (lineItems || []).map(li => `• ${li.description} x${li.quantity} — ${currencyFormat((li.amount_total ?? 0)/100, currency)}`);
+  return lines.length ? lines.join('\n') : '—';
+}
+
+function formatLineItemsHTML(lineItems = [], currency = 'EUR') {
+  if (!Array.isArray(lineItems) || !lineItems.length)
+    return '<tr><td colspan="3" style="padding:8px 0;color:#6b7280">No hay productos.</td></tr>';
+  return lineItems.map(li => {
+    const total = currencyFormat((li.amount_total ?? 0)/100, currency);
+    const unit = li?.price?.unit_amount != null ? currencyFormat(li.price.unit_amount/100, currency) : null;
+    return `
+      <tr>
+        <td style="padding:10px 0; font-size:14px; color:#111827;">
+          ${escapeHtml(li.description || '')}
+          ${unit ? `<div style="font-size:12px;color:#6b7280;margin-top:2px;">Precio unidad: ${unit}</div>` : ``}
+        </td>
+        <td style="padding:10px 0; font-size:14px; color:#111827; text-align:center; white-space:nowrap;">x${li.quantity || 1}</td>
+        <td style="padding:10px 0; font-size:14px; color:#111827; text-align:right; white-space:nowrap;">${total}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function emailShell({ title, headerLabel, bodyHTML, footerHTML }) {
+  const logoBlock = BRAND_LOGO_URL
+    ? `<img src="${BRAND_LOGO_URL}" alt="${escapeHtml(BRAND)}" width="200" style="display:block; max-width:200px; width:100%; height:auto; margin:0 auto 8px;" />`
+    : `<div style="font-size:20px; font-weight:700; color:${BRAND_PRIMARY}; text-align:center; margin-bottom:8px;">${escapeHtml(BRAND)}</div>`;
+  return `<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>${escapeHtml(title)}</title></head>
+<body style="margin:0; padding:0; background:#f3f4f6;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6; padding:24px 0;">
+    <tr><td>
+      <table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" style="max-width:600px; width:100%; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+        <tr><td style="padding:24px; text-align:center; background:#ffffff;">
+          ${logoBlock}
+          <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; font-size:22px; font-weight:800; color:${BRAND_PRIMARY}; letter-spacing:0.3px;">${escapeHtml(headerLabel)}</div>
+        </td></tr>
+        ${bodyHTML}
+        <tr><td style="padding:16px 24px 24px; background:#ffffff;">
+          <div style="height:1px; background:#e5e7eb; margin-bottom:12px;"></div>
+          ${footerHTML}
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+}
+
+/* ---------- Email ADMIN (HTML + texto) ---------- */
 async function sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping }) {
   const to = process.env.CORPORATE_EMAIL || 'pedidos@tudominio.com';
   const from = process.env.CORPORATE_FROM || process.env.SMTP_USER || 'no-reply@tu-dominio.com';
 
-  const itemsText = formatLineItemsPlain(lineItems, currency);
+  const itemsPlain = formatLineItemsPlain(lineItems, currency);
+  const itemsHTML = formatLineItemsHTML(lineItems, currency);
+  const totalFmt = currencyFormat(amountTotal, currency);
 
-  const bodyText = `
+  const text = `
 Nuevo pedido completado (Stripe)
 
 Cliente: ${name || '(sin nombre)'} <${customerEmail || 'sin email'}>
 Teléfono: ${phone || '-'}
 
-Total: ${amountTotal.toFixed(2)} ${currency}
+Total: ${totalFmt}
 Session ID: ${session.id}
 
 Dirección:
@@ -357,135 +388,200 @@ ${shipping?.postal_code || ''} ${shipping?.city || ''}
 ${shipping?.country || ''}
 
 Productos:
-${itemsText}
+${itemsPlain}
 
 Metadata:
 ${JSON.stringify(metadata || {}, null, 2)}
-  `.trim();
+`.trim();
+
+  const bodyHTML = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; color:#374151;">
+    <strong>Cliente:</strong> ${escapeHtml(name || '(sin nombre)')} &lt;${escapeHtml(customerEmail || 'sin email')}&gt;<br/>
+    <strong>Teléfono:</strong> ${escapeHtml(phone || '-')}
+  </p>
+  <div style="height:1px; background:#e5e7eb;"></div>
+</td></tr>
+<tr><td style="padding:8px 24px 0; background:#ffffff;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif;">
+    <thead>
+      <tr>
+        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Producto</th>
+        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Cant.</th>
+        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Total</th>
+      </tr>
+    </thead>
+    <tbody>${itemsHTML}</tbody>
+    <tfoot>
+      <tr><td colspan="3"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+      <tr>
+        <td style="padding:12px 0; font-size:14px; color:#111827; font-weight:700;">Total</td>
+        <td></td>
+        <td style="padding:12px 0; font-size:16px; color:#111827; font-weight:800; text-align:right;">${escapeHtml(totalFmt)}</td>
+      </tr>
+    </tfoot>
+  </table>
+</td></tr>
+<tr><td style="padding:8px 24px 8px; background:#ffffff;">
+  <div style="font:12px system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; color:#6b7280;">
+    <strong>Session ID:</strong> ${escapeHtml(session.id)}<br/>
+    <strong>Dirección:</strong> ${escapeHtml([shipping?.line1, shipping?.line2].filter(Boolean).join(' ') || '')}<br/>
+    ${escapeHtml([shipping?.postal_code, shipping?.city, shipping?.country].filter(Boolean).join(' ') || '')}<br/>
+    <strong>Metadata:</strong><pre style="white-space:pre-wrap; font-size:12px; color:#374151; background:#f9fafb; border:1px solid #e5e7eb; padding:8px; border-radius:8px;">${escapeHtml(JSON.stringify(metadata || {}, null, 2))}</pre>
+  </div>
+</td></tr>`;
+
+  const html = emailShell({
+    title: `Nuevo pedido — ${totalFmt}`,
+    headerLabel: `Nuevo pedido — ${totalFmt}`,
+    bodyHTML,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>`
+  });
 
   if (process.env.RESEND_API_KEY) {
     const resend = new Resend(process.env.RESEND_API_KEY);
     await resend.emails.send({
       from,
       to,
-      subject: `Nuevo pedido — ${amountTotal.toFixed(2)} ${currency}`,
-      text: bodyText
+      subject: `🧾 Nuevo pedido — ${totalFmt}`,
+      text,
+      html
     });
     return;
   }
-
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    await sendViaGmailSMTP({ from, to, subject: `Nuevo pedido — ${amountTotal.toFixed(2)} ${currency}`, text: bodyText });
+    await sendViaGmailSMTP({ from, to, subject: `🧾 Nuevo pedido — ${totalFmt}`, text, html });
     return;
   }
-
-  console.warn('[email] No hay RESEND_API_KEY ni SMTP configurado. Email no enviado.');
+  console.warn('[email admin] No hay RESEND_API_KEY ni SMTP configurado. Email no enviado.');
 }
 
-// 🔹 NUEVO: Email al cliente
-async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand = "Guarros Extremeños" }) {
+/* ---------- Email CLIENTE (HTML + texto + BCC opcional) ---------- */
+async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand }) {
   if (!to) return;
-  const C = (currency || 'EUR').toUpperCase();
-  const totalFmt = (Number(amountTotal || 0)).toFixed(2) + ' ' + C;
-  const itemsTxt = formatLineItemsPlain(lineItems, C);
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const replyTo = process.env.SUPPORT_EMAIL || supportEmail || 'soporte@guarrosextremenos.com';
+  const totalFmt = currencyFormat(Number(amountTotal || 0), currency || 'EUR');
+  const itemsPlain = formatLineItemsPlain(lineItems, currency || 'EUR');
+  const itemsHTML = formatLineItemsHTML(lineItems, currency || 'EUR');
+  const bccList = [];
+  if (String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true' && process.env.CORPORATE_EMAIL) {
+    bccList.push(process.env.CORPORATE_EMAIL);
+  }
 
-  const subject = `✅ Confirmación de pedido ${orderId ? `#${orderId}` : ''} — ${brand}`;
-  const text = `
-Hola${name ? ' ' + name : ''},
+  const text = [
+    name ? `Hola ${name},` : 'Hola,',
+    '',
+    `¡Gracias por tu compra en ${brand || BRAND}! Tu pago se ha recibido correctamente.`,
+    '',
+    'Resumen del pedido:',
+    itemsPlain,
+    '',
+    `Total pagado: ${totalFmt}`,
+    orderId ? `ID de pedido (Stripe): ${orderId}` : '',
+    '',
+    `Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.`,
+    '',
+    `Un saludo,`,
+    `Equipo ${brand || BRAND}`
+  ].filter(Boolean).join('\n');
 
-¡Gracias por tu compra en ${brand}! Tu pago se ha recibido correctamente.
+  const bodyHTML = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:15px system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; color:#111827;">
+    ${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}
+  </p>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
+    ¡Gracias por tu compra en <strong>${escapeHtml(brand || BRAND)}</strong>! Tu pago se ha recibido correctamente.
+  </p>
+</td></tr>
+<tr><td style="padding:0 24px 8px; background:#ffffff;"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+<tr><td style="padding:8px 24px 0; background:#ffffff;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif;">
+    <thead>
+      <tr>
+        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Producto</th>
+        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Cant.</th>
+        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Total</th>
+      </tr>
+    </thead>
+    <tbody>${itemsHTML}</tbody>
+    <tfoot>
+      <tr><td colspan="3"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+      <tr>
+        <td style="padding:12px 0; font-size:14px; color:#111827; font-weight:700;">Total</td>
+        <td></td>
+        <td style="padding:12px 0; font-size:16px; color:#111827; font-weight:800; text-align:right;">${escapeHtml(totalFmt)}</td>
+      </tr>
+    </tfoot>
+  </table>
+</td></tr>
+${orderId ? `
+<tr><td style="padding:0 24px 12px; background:#ffffff;">
+  <div style="font:12px system-ui; color:#6b7280;">ID de pedido (Stripe): <span style="color:#374151;">${escapeHtml(orderId)}</span></div>
+</td></tr>` : ''}
+<tr><td style="padding:8px 24px 16px; background:#ffffff;">
+  <p style="margin:0; font:13px system-ui; color:#374151;">
+    Si tienes cualquier duda, responde a este correo o escríbenos a
+    <a href="mailto:${escapeHtml(replyTo)}" style="color:${BRAND_PRIMARY}; text-decoration:none;">${escapeHtml(replyTo)}</a>.
+  </p>
+</td></tr>`;
 
-Resumen del pedido:
-${itemsTxt}
+  const html = emailShell({
+    title: `Confirmación de pedido`,
+    headerLabel: `Confirmación de pedido`,
+    bodyHTML,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand || BRAND)}. Todos los derechos reservados.</p>`
+  });
 
-Total pagado: ${totalFmt}
-${orderId ? `ID de pedido (Stripe): ${orderId}\n` : ''}
-
-En breve recibirás otra comunicación si tu pedido requiere información adicional de envío o de suscripción.
-
-Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.
-
-Un saludo,
-Equipo ${brand}
-  `.trim();
+  const subject = `✅ Confirmación de pedido ${orderId ? `#${orderId}` : ''} — ${brand || BRAND}`;
 
   if (process.env.RESEND_API_KEY) {
     const resend = new Resend(process.env.RESEND_API_KEY);
     await resend.emails.send({
       from,
       to,
+      ...(bccList.length ? { bcc: bccList } : {}),
       reply_to: replyTo,
       subject,
       text,
+      html
     });
     return;
   }
-
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    await sendViaGmailSMTP({ from, to, subject, text });
+    await sendViaGmailSMTP({ from, to, subject, text, html });
     return;
   }
-
-  console.warn('[email-customer] No hay RESEND_API_KEY ni SMTP configurado. Email cliente no enviado.');
+  console.warn('[email cliente] No hay RESEND_API_KEY ni SMTP configurado. Email no enviado.');
 }
 
-// Formateo simple de líneas
-function formatLineItemsPlain(lineItems = [], currency = 'EUR') {
-  const C = String(currency || 'EUR').toUpperCase();
-  const lines = (lineItems || []).map(li => {
-    const total = ((li.amount_total ?? 0) / 100).toFixed(2);
-    return `• ${li.description} x${li.quantity} — ${total} ${C}`;
-    // Si quieres mostrar precio unitario, puedes leer li.price?.unit_amount
-  });
-  return lines.length ? lines.join('\n') : '—';
-}
-
-// Transporte SMTP con verificación y logs (Gmail App Password o cualquier SMTP)
-async function sendViaGmailSMTP({ from, to, subject, text }) {
+/* ---------- SMTP fallback (HTML soportado) ---------- */
+async function sendViaGmailSMTP({ from, to, subject, text, html }) {
   const port = Number(process.env.SMTP_PORT || 465);
-  const secure = String(port) === '465'; // 465 = SSL; 587 = STARTTLS
+  const secure = String(port) === '465';
   const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,              // smtp.gmail.com
+    host: process.env.SMTP_HOST,
     port,
     secure,
-    auth: {
-      user: process.env.SMTP_USER,            // tu_cuenta@gmail.com
-      pass: process.env.SMTP_PASS,            // App Password (16 chars)
-    },
-    logger: true,
-    debug: true,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    logger: true, debug: true,
   });
-
   await transporter.verify();
-  console.log('[smtp] transporter.verify() OK');
-
-  const info = await transporter.sendMail({ from, to, subject, text });
+  const info = await transporter.sendMail({ from, to, subject, text, html });
   console.log('[smtp] Message sent:', info.messageId, 'accepted:', info.accepted, 'rejected:', info.rejected);
   return info;
 }
 
-// Pool de Postgres (Supabase) con SSL tolerante
+/* ========================= DB (POOL) ========================= */
 const pool = process.env.DATABASE_URL
-  ? new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: {
-        require: true,
-        rejectUnauthorized: false
-      },
-    })
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { require: true, rejectUnauthorized: false } })
   : null;
 
-// Guarda el pedido (cabecera)
 async function logOrder(order) {
-  if (!pool) {
-    console.warn('[db] DATABASE_URL no configurado. No se guardará el pedido.');
-    return;
-  }
+  if (!pool) { console.warn('[db] DATABASE_URL no configurado. No se guardará el pedido.'); return; }
   const text = `
-    INSERT INTO orders
-      (session_id, email, name, phone, total, currency, items, metadata, shipping, status, created_at)
+    INSERT INTO orders (session_id, email, name, phone, total, currency, items, metadata, shipping, status, created_at)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     ON CONFLICT (session_id) DO NOTHING
   `;
@@ -505,7 +601,6 @@ async function logOrder(order) {
   await pool.query(text, values);
 }
 
-// Guarda líneas normalizadas
 async function logOrderItems(sessionId, lineItems, currency) {
   if (!pool || !Array.isArray(lineItems)) return;
   const text = `
