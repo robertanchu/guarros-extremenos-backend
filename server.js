@@ -9,8 +9,8 @@ import Stripe from 'stripe';
 import { Resend } from 'resend';          // opcional (si usas Resend)
 import nodemailer from 'nodemailer';      // SMTP (Gmail u otro)
 
-// --- Registro en DB (opcional) ---
-import pg from 'pg';                       // Postgres (Supabase)
+// --- Registro en DB (Supabase / Postgres) ---
+import pg from 'pg';
 const { Pool } = pg;
 
 const app = express();
@@ -38,8 +38,7 @@ app.use(morgan('tiny'));
 
 /**
  * WEBHOOK de Stripe
- * ⚠️ IMPORTANTE: debe ir ANTES de express.json()
- * y debe usar body "raw" para verificar firma.
+ * ⚠️ Debe ir ANTES de express.json() y usar body "raw" para verificar firma.
  */
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -53,17 +52,16 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // ✅ ACK rápido para que Stripe no marque fallo aunque fallen tareas internas
+  // ✅ ACK rápido; lo pesado corre en background
   res.status(200).json({ received: true });
 
-  // 🔧 Trabajo en background, sin bloquear la respuesta
   queueMicrotask(async () => {
     try {
       switch (event.type) {
         case 'checkout.session.completed': {
           const session = event.data.object;
 
-          // Cargar line items (para email/registro)
+          // Line items (para email/registro)
           let lineItems = [];
           try {
             const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
@@ -107,8 +105,8 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               createdAt: new Date().toISOString(),
             });
 
-            // (Opcional) Normalizar líneas en tabla aparte:
-            // await logOrderItems(session.id, lineItems, currency);
+            // 🔹 También guardamos líneas normalizadas
+            await logOrderItems(session.id, lineItems, currency);
 
             console.log('🗄️ Pedido registrado OK');
           } catch (e) {
@@ -135,7 +133,6 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           console.log('ℹ️ Evento ignorado:', event.type);
       }
     } catch (err) {
-      // Cualquier error aquí NO afecta al 200 ya enviado a Stripe
       console.error('[webhook bg] error:', err);
     }
   });
@@ -149,7 +146,6 @@ app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }
 
 /**
  * Crear sesión de Checkout
- * Reenvía a Stripe los items y, si llegan, customer_email / metadata
  */
 app.post('/create-checkout-session', async (req, res) => {
   try {
@@ -158,7 +154,6 @@ app.post('/create-checkout-session', async (req, res) => {
       mode = 'payment',
       success_url,
       cancel_url,
-      // Datos opcionales que puede mandarte el front (/checkout)
       customer,
       shipping_address,
       metadata
@@ -208,10 +203,9 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-
 /* ----------------- ENDPOINTS DE PRUEBA ----------------- */
 
-// 1) Ping a la base de datos (usa el Pool global "pool")
+// 1) Ping a la base de datos
 app.get('/test-db-ping', async (req, res) => {
   try {
     if (!pool) throw new Error('DATABASE_URL no configurado');
@@ -223,7 +217,7 @@ app.get('/test-db-ping', async (req, res) => {
   }
 });
 
-// 2) Inserción mínima en la tabla orders (útil para validar permisos)
+// 2) Inserción mínima en la tabla orders
 app.post('/test-db-insert', async (req, res) => {
   try {
     if (!pool) throw new Error('DATABASE_URL no configurado');
@@ -265,7 +259,7 @@ app.post('/test-email', async (req, res) => {
       return res.json({ ok: true, provider: 'resend', id: info?.id || null });
     }
 
-    // Fallback SMTP (ojo: Render suele bloquear SMTP)
+    // Fallback SMTP (Render suele bloquear SMTP; úsalo solo si tu plan lo permite)
     const info = await sendViaGmailSMTP({ from, to, subject, text });
     return res.json({ ok: true, provider: 'smtp', messageId: info.messageId });
   } catch (e) {
@@ -274,21 +268,26 @@ app.post('/test-email', async (req, res) => {
   }
 });
 
-
-/* ----------------- ENDPOINT DE PRUEBA SMTP ----------------- */
-app.post('/test-email', async (req, res) => {
+/* ----------------- MÉTRICAS (lee vistas en la DB) ----------------- */
+app.get('/metrics/overview', async (req, res) => {
   try {
-    const to = process.env.CORPORATE_EMAIL || (process.env.SMTP_USER || 'destino@tudominio.com');
-    const from = process.env.CORPORATE_FROM || process.env.SMTP_USER;
-
-    const subject = 'Prueba SMTP';
-    const text = `Hola, esto es un test SMTP desde backend. ${new Date().toISOString()}`;
-
-    const info = await sendViaGmailSMTP({ from, to, subject, text });
-    return res.json({ ok: true, messageId: info.messageId, accepted: info.accepted, rejected: info.rejected });
+    if (!pool) throw new Error('DATABASE_URL no configurado');
+    const [daily, monthly, mix, top] = await Promise.all([
+      pool.query('select * from v_revenue_daily_90d'),
+      pool.query('select * from v_revenue_monthly_12m'),
+      pool.query('select * from v_mix_subscription_90d'),
+      pool.query('select * from v_top_products_90d'),
+    ]);
+    res.json({
+      ok: true,
+      daily: daily.rows,
+      monthly: monthly.rows,
+      mix: mix.rows,
+      top: top.rows,
+    });
   } catch (e) {
-    console.error('[/test-email] error:', e);
-    return res.status(500).json({ ok: false, error: e.message });
+    console.error('[/metrics/overview] error:', e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -296,7 +295,7 @@ app.listen(PORT, () => console.log(`API listening on :${PORT}`));
 
 /* ----------------- Helpers ----------------- */
 
-// Email corporativo — intenta Resend; si no, SMTP (Gmail u otro)
+// Email corporativo — intenta Resend; si no, SMTP
 async function sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping }) {
   const to = process.env.CORPORATE_EMAIL || 'pedidos@tudominio.com';
   const from = process.env.CORPORATE_FROM || process.env.SMTP_USER || 'no-reply@tu-dominio.com';
@@ -326,7 +325,6 @@ Metadata:
 ${JSON.stringify(metadata || {}, null, 2)}
   `.trim();
 
-  // --- Opción A: Resend ---
   if (process.env.RESEND_API_KEY) {
     const resend = new Resend(process.env.RESEND_API_KEY);
     await resend.emails.send({
@@ -338,7 +336,6 @@ ${JSON.stringify(metadata || {}, null, 2)}
     return;
   }
 
-  // --- Opción B: SMTP ---
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
     await sendViaGmailSMTP({ from, to, subject: `Nuevo pedido — ${amountTotal.toFixed(2)} ${currency}`, text: bodyText });
     return;
@@ -359,11 +356,10 @@ async function sendViaGmailSMTP({ from, to, subject, text }) {
       user: process.env.SMTP_USER,            // tu_cuenta@gmail.com
       pass: process.env.SMTP_PASS,            // App Password (16 chars)
     },
-    logger: true,   // logs nodemailer
-    debug: true,    // debug SMTP
+    logger: true,
+    debug: true,
   });
 
-  // Verificar conexión/credenciales
   await transporter.verify();
   console.log('[smtp] transporter.verify() OK');
 
@@ -372,18 +368,18 @@ async function sendViaGmailSMTP({ from, to, subject, text }) {
   return info;
 }
 
-// Registro en DB (Postgres en Render/Supabase).
-// Usa SSL por defecto (útil con Supabase). Alternativa: ?sslmode=require en DATABASE_URL.
+// Pool de Postgres (Supabase) con SSL tolerante
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: {
-        require: true,            // fuerza SSL
-        rejectUnauthorized: false // no valida la cadena (evita "self-signed")
+        require: true,
+        rejectUnauthorized: false
       },
     })
   : null;
 
+// Guarda el pedido (cabecera)
 async function logOrder(order) {
   if (!pool) {
     console.warn('[db] DATABASE_URL no configurado. No se guardará el pedido.');
@@ -411,20 +407,23 @@ async function logOrder(order) {
   await pool.query(text, values);
 }
 
-/*
-// (Opcional) Si quieres tabla normalizada de líneas:
+// Guarda líneas normalizadas
 async function logOrderItems(sessionId, lineItems, currency) {
   if (!pool || !Array.isArray(lineItems)) return;
   const text = `
-    insert into order_items (session_id, description, quantity, amount_total_cents, currency, raw)
-    values ($1,$2,$3,$4,$5,$6)
+    insert into order_items
+      (session_id, description, product_id, price_id, quantity, unit_amount_cents, amount_total_cents, currency, raw)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
     on conflict do nothing
   `;
   for (const li of lineItems) {
     const vals = [
       sessionId,
       li.description || null,
+      li.price?.product || null,
+      li.price?.id || null,
       li.quantity || 1,
+      li.price?.unit_amount ?? null,
       li.amount_total ?? 0,
       (li.currency || currency || 'eur').toUpperCase(),
       JSON.stringify(li),
@@ -432,4 +431,3 @@ async function logOrderItems(sessionId, lineItems, currency) {
     await pool.query(text, vals);
   }
 }
-*/
