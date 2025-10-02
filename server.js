@@ -4,36 +4,27 @@ import cors from 'cors';
 import morgan from 'morgan';
 import bodyParser from 'body-parser';
 import Stripe from 'stripe';
-
-// Email providers
-import { Resend } from 'resend';          // Recomendado (HTTP)
-import nodemailer from 'nodemailer';      // Fallback SMTP (si tu plan lo permite)
-
-// DB (Supabase/Postgres)
+import { Resend } from 'resend';
+import nodemailer from 'nodemailer';
 import pg from 'pg';
-const { Pool } = pg;
+import PDFDocument from 'pdfkit';
 
+const { Pool } = pg;
 const app = express();
 const PORT = process.env.PORT || 3000;
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// ---------- CORS (dominios y orígenes) ----------
+// ---------- CORS ----------
 const exactOrigins = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-// Permite “dominios base” y subdominios: ej. guarrosextremenos.com, vercel.app
 const baseDomains = (process.env.ALLOWED_DOMAINS || '')
-  .split(',')
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 function isOriginAllowed(origin) {
-  if (!origin) return true; // allow server-to-server / curl sin Origin
+  if (!origin) return true;
   try {
-    if (exactOrigins.includes(origin)) return true; // match exacto con protocolo
-    // match por dominio base
+    if (exactOrigins.includes(origin)) return true;
     const u = new URL(origin);
     const host = (u.hostname || '').toLowerCase();
     return baseDomains.some(d => host === d || host.endsWith('.' + d));
@@ -43,10 +34,7 @@ function isOriginAllowed(origin) {
 }
 
 const corsOptions = {
-  origin: (origin, cb) => {
-    if (isOriginAllowed(origin)) return cb(null, true);
-    cb(new Error('Not allowed by CORS: ' + origin));
-  },
+  origin: (origin, cb) => isOriginAllowed(origin) ? cb(null, true) : cb(new Error('Not allowed by CORS: ' + origin)),
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   maxAge: 600
@@ -54,11 +42,11 @@ const corsOptions = {
 
 app.use(morgan('tiny'));
 
-// Helper wait (para retries de factura)
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+// Helper espera (reintentos)
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ======================================================
-/*                WEBHOOK STRIPE (ACK RÁPIDO)           */
+// ==========   WEBHOOK STRIPE (ACK RÁPIDO)    ==========
 // ======================================================
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -72,15 +60,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // LOG de diagnóstico clave
-  console.log('[webhook] EVENT', {
-    id: event.id,
-    type: event.type,
-    livemode: !!event.livemode,
-    created: event.created
-  });
-
-  // OK inmediato; procesado en background
+  console.log('[webhook] EVENT', { id: event.id, type: event.type, livemode: !!event.livemode, created: event.created });
   res.status(200).json({ received: true });
 
   queueMicrotask(async () => {
@@ -89,7 +69,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
         case 'checkout.session.completed': {
           const session = event.data.object;
 
-          // Obtener line items (con price.product expandido para tener recurring/product)
+          // Line items de la sesión
           let lineItems = [];
           try {
             const li = await stripe.checkout.sessions.listLineItems(session.id, {
@@ -98,7 +78,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             });
             lineItems = li?.data || [];
           } catch (e) {
-            console.warn('[webhook] no se pudieron leer lineItems:', e.message);
+            console.warn('[webhook] listLineItems error:', e.message);
           }
 
           const customerEmail = session.customer_details?.email || session.customer_email;
@@ -109,33 +89,25 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           const amountTotal = (session.amount_total ?? 0) / 100;
           const currency = (session.currency || 'eur').toUpperCase();
 
-          // ¿Suscripción?
           const isSubscription =
             session.mode === 'subscription' ||
             (Array.isArray(lineItems) && lineItems.some(li => li?.price?.recurring));
 
           // Email admin (siempre)
           try {
-            await sendAdminEmail({
-              session, lineItems, customerEmail, name, phone,
-              amountTotal, currency, metadata, shipping,
-            });
+            await sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping });
             console.log('📧 Email admin enviado OK');
           } catch (e) {
             console.error('📧 Email admin ERROR:', e);
           }
 
-          // Cliente: si COMBINE es true, no enviamos aquí; lo mandamos en invoice.payment_succeeded
+          // Cliente: saltar aquí si combinamos con factura
           const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
           if (!combine) {
             try {
               await sendCustomerEmail({
-                to: customerEmail,
-                name,
-                amountTotal,
-                currency,
-                lineItems,
-                orderId: session.id,
+                to: customerEmail, name, amountTotal, currency,
+                lineItems, orderId: session.id,
                 supportEmail: process.env.SUPPORT_EMAIL,
                 brand: process.env.BRAND_NAME || "Guarros Extremeños",
                 isSubscription,
@@ -175,32 +147,25 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
 
         case 'invoice.payment_succeeded': {
           const invoice = event.data.object;
-
           try {
-            // 1) Intenta email directo de la factura
+            // Email destino
             let to = invoice.customer_email || invoice.customer_details?.email || null;
-
-            // 2) Si no hay email, intenta recuperar el Customer
             if (!to && invoice.customer) {
               try {
                 const cust = await stripe.customers.retrieve(invoice.customer);
                 to = cust?.email || null;
               } catch (e) {
-                console.warn('[invoice.email] No se pudo recuperar customer:', e?.message || e);
+                console.warn('[invoice.email] retrieve customer error:', e?.message || e);
               }
             }
 
             const name =
               invoice.customer_name ||
               invoice.customer_details?.name ||
-              invoice.customer?.name ||
-              '';
-            let pdfUrl = invoice.invoice_pdf; // URL pública temporal
-            const invoiceNumber = invoice.number || invoice.id;
-            const currency = (invoice.currency || 'eur').toUpperCase();
-            const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
+              invoice.customer?.name || '';
 
-            // REINTENTOS si el PDF aún no está generado
+            // PDF de factura (con reintentos)
+            let pdfUrl = invoice.invoice_pdf;
             if (!pdfUrl) {
               for (let i = 0; i < 3 && !pdfUrl; i++) {
                 await wait(3000);
@@ -214,7 +179,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               }
             }
 
-            // Lee líneas de la factura para armar el resumen (mejor que la sesión)
+            // Líneas de la factura
             let invItems = [];
             try {
               const li = await stripe.invoices.listLineItems(invoice.id, {
@@ -223,50 +188,38 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               });
               invItems = li?.data || [];
             } catch (e) {
-              console.warn('[invoice.email] no se pudieron leer lineItems de la factura:', e?.message || e);
+              console.warn('[invoice.email] listLineItems error:', e?.message || e);
             }
 
-            // Detecta si es suscripción (por invoice.subscription o por líneas recurring)
             const isSubscription =
-              !!invoice.subscription ||
-              (Array.isArray(invItems) && invItems.some(it => it?.price?.recurring));
+              !!invoice.subscription || (Array.isArray(invItems) && invItems.some(it => it?.price?.recurring));
+            const currency = (invoice.currency || 'eur').toUpperCase();
+            const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
+            const invoiceNumber = invoice.number || invoice.id;
 
-            // Si combinamos: enviar un único correo (confirmación + factura)
             const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
-            if (combine && to && pdfUrl) {
+            if (combine && to) {
               await sendCustomerOrderAndInvoiceEmail({
-                to,
-                name,
-                invoiceNumber,
-                total,
-                currency,
-                pdfUrl,
-                lineItems: invItems,
+                to, name, invoiceNumber, total, currency,
+                pdfUrl, lineItems: invItems,
                 brand: process.env.BRAND_NAME || "Guarros Extremeños",
                 isSubscription,
                 alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true'
               });
-              console.log('📧 Email combinado (confirmación + factura) enviado OK →', to);
+              console.log('📧 Email combinado (confirmación + factura/recibo) enviado OK →', to);
             } else if (to && pdfUrl) {
-              // Modo no combinado: aún enviamos email de factura aparte
               await sendInvoiceEmail({
-                to,
-                name,
-                invoiceNumber,
-                total,
-                currency,
-                pdfUrl,
+                to, name, invoiceNumber, total, currency, pdfUrl,
                 brand: process.env.BRAND_NAME || "Guarros Extremeños",
                 alsoToCorporate: String(process.env.INVOICE_BCC_CORPORATE || '').toLowerCase() === 'true',
               });
               console.log('📧 Factura enviada al cliente OK →', to);
             } else {
-              console.warn('[invoice.email] Falta to o pdfUrl → no se envía email (combine=', combine, ')', { to, pdfUrl });
+              console.warn('[invoice.email] Falta to o pdfUrl → no se envía email', { to, pdfUrl });
             }
           } catch (e) {
-            console.error('📧 Envío de email en invoice.payment_succeeded ERROR:', e);
+            console.error('📧 invoice.payment_succeeded handler ERROR:', e);
           }
-
           console.log('✅ invoice.payment_succeeded', invoice.id);
           break;
         }
@@ -285,7 +238,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
 });
 
 // ==============================================
-// ==========     API REST / HEALTH     ==========
+// ==========     API REST / HEALTH     =========
 // ==============================================
 app.use(cors(corsOptions));
 app.use(express.json());
@@ -331,12 +284,19 @@ app.post('/create-checkout-session', async (req, res) => {
       billing_address_collection: 'auto'
     };
 
-    // habilita SIEMPRE factura en pagos únicos
+    // Factura SIEMPRE en pagos únicos (cobrada automáticamente)
     if (!isSubscription) {
-      sessionParams.invoice_creation = { enabled: true };
+      sessionParams.invoice_creation = {
+        enabled: true,
+        invoice_data: {
+          collection_method: 'charge_automatically',
+          description: 'Pedido web Guarros Extremeños',
+          footer: 'Gracias por su compra. Soporte: soporte@guarrosextremenos.com'
+        }
+      };
     }
 
-    // opcional: envío solo si usas shipping rates
+    // Envíos opcionales
     if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
       sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
       sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
@@ -353,7 +313,6 @@ app.post('/create-checkout-session', async (req, res) => {
 // ============================
 // ========== TESTS ===========
 // ============================
-
 app.get('/test-db-ping', async (req, res) => {
   try {
     if (!pool) throw new Error('DATABASE_URL no configurado');
@@ -392,7 +351,7 @@ app.post('/test-db-insert', async (req, res) => {
   }
 });
 
-// Test email admin (simple)
+// Test email admin
 app.post('/test-email', async (req, res) => {
   try {
     const to = process.env.CORPORATE_EMAIL || (process.env.SMTP_USER || 'destino@tudominio.com');
@@ -423,9 +382,7 @@ app.post('/test-email-customer', async (req, res) => {
       amountTotal: 123.45,
       currency: 'EUR',
       orderId: 'test_' + Date.now(),
-      lineItems: [
-        { description: 'Jamón Canalla', quantity: 1, amount_total: 9999, currency: 'eur' },
-      ],
+      lineItems: [{ description: 'Jamón Canalla', quantity: 1, amount_total: 9999, currency: 'eur' }],
       brand: process.env.BRAND_NAME || "Guarros Extremeños",
       isSubscription: false
     });
@@ -436,24 +393,21 @@ app.post('/test-email-customer', async (req, res) => {
   }
 });
 
-// Test email cliente (simula suscripción)
+// Test email cliente suscripción
 app.post('/test-email-customer-sub', async (req, res) => {
   try {
     const to = req.body?.to || req.query?.to || 'tu@correo.com';
-    const isSubscription = Boolean(req.body?.isSubscription ?? true);
     await sendCustomerEmail({
       to,
       name: 'Cliente Suscripción',
       amountTotal: 70.00,
       currency: 'EUR',
       orderId: 'test_sub_' + Date.now(),
-      lineItems: [
-        { description: 'Suscripción Jamón Canalla', quantity: 1, amount_total: 7000, currency: 'eur', price: { unit_amount: 7000, recurring: { interval: 'month' } } },
-      ],
+      lineItems: [{ description: 'Suscripción Jamón Canalla', quantity: 1, amount_total: 7000, currency: 'eur', price: { unit_amount: 7000, recurring: { interval: 'month' } } }],
       brand: process.env.BRAND_NAME || "Guarros Extremeños",
-      isSubscription
+      isSubscription: true
     });
-    res.json({ ok: true, to, isSubscription });
+    res.json({ ok: true, to, isSubscription: true });
   } catch (e) {
     console.error('[/test-email-customer-sub] error:', e);
     res.status(500).json({ ok: false, error: e.message });
@@ -469,12 +423,10 @@ app.listen(PORT, () => console.log(`API listening on :${PORT}`));
    ======================  HELPERS  ==========================
    =========================================================== */
 
-// Branding
 const BRAND = process.env.BRAND_NAME || "Guarros Extremeños";
 const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
 const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 
-// Escapes HTML
 function escapeHtml(str) {
   return String(str || '')
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -487,7 +439,7 @@ function currencyFormat(amount = 0, currency = 'EUR') {
 }
 
 function formatLineItemsPlain(lineItems = [], currency = 'EUR') {
-  const lines = (lineItems || []).map(li => `• ${li.description} x${li.quantity} — ${currencyFormat((li.amount_total ?? 0)/100, currency)}`);
+  const lines = (lineItems || []).map(li => `• ${li.description} x${li.quantity} — ${currencyFormat((li.amount_total ?? li.amount ?? 0)/100, currency)}`);
   return lines.length ? lines.join('\n') : '—';
 }
 
@@ -495,7 +447,7 @@ function formatLineItemsHTML(lineItems = [], currency = 'EUR') {
   if (!Array.isArray(lineItems) || !lineItems.length)
     return '<tr><td colspan="3" style="padding:8px 0;color:#6b7280">No hay productos.</td></tr>';
   return lineItems.map(li => {
-    const total = currencyFormat((li.amount_total ?? 0)/100, currency);
+    const total = currencyFormat((li.amount_total ?? li.amount ?? 0)/100, currency);
     const unit = li?.price?.unit_amount != null ? currencyFormat(li.price.unit_amount/100, currency) : null;
     return `
       <tr>
@@ -535,7 +487,155 @@ function emailShell({ title, headerLabel, bodyHTML, footerHTML }) {
 </body></html>`;
 }
 
-/* ---------- Email ADMIN (HTML + texto) ---------- */
+/* ---------- PDF Recibo (PAGADO) ---------- */
+async function createPaidReceiptPDF({
+  invoiceNumber,
+  total,
+  currency = 'EUR',
+  lineItems = [],
+  customer = {},
+  paidAt = new Date(),
+  brand = BRAND,
+  logoUrl = BRAND_LOGO_URL,
+}) {
+  const items = (lineItems || []).map(li => ({
+    description: li?.description || 'Producto',
+    quantity: li?.quantity || 1,
+    totalCents: typeof li?.amount_total === 'number' ? li.amount_total : (typeof li?.amount === 'number' ? li.amount : 0),
+    unitCents: (li?.price?.unit_amount ?? null),
+    currency: (li?.currency || currency || 'EUR').toUpperCase()
+  }));
+
+  const company = {
+    name: process.env.COMPANY_NAME || brand || 'Tu Empresa',
+    taxId: process.env.COMPANY_TAX_ID || '',
+    address: process.env.COMPANY_ADDRESS || '',
+    city: process.env.COMPANY_CITY || '',
+    postal: process.env.COMPANY_POSTAL || '',
+    country: process.env.COMPANY_COUNTRY || 'España',
+    serie: process.env.RECEIPT_SERIE || 'WEB',
+  };
+
+  const doc = new PDFDocument({ size: 'A4', margins: { top: 56, bottom: 56, left: 56, right: 56 } });
+  const chunks = [];
+  const done = new Promise((resolve, reject) => {
+    doc.on('data', chunks.push.bind(chunks));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+
+  // Header: logo o marca
+  try {
+    if (logoUrl) {
+      const resp = await fetch(logoUrl);
+      if (resp.ok) {
+        const buf = Buffer.from(await resp.arrayBuffer());
+        doc.image(buf, { fit: [140, 60], align: 'left' });
+      } else {
+        doc.font('Helvetica-Bold').fontSize(20).fillColor('#000').text(brand, { align: 'left' });
+      }
+    } else {
+      doc.font('Helvetica-Bold').fontSize(20).fillColor('#000').text(brand, { align: 'left' });
+    }
+  } catch {
+    doc.font('Helvetica-Bold').fontSize(20).fillColor('#000').text(brand, { align: 'left' });
+  }
+
+  doc.moveDown(0.5);
+  doc.font('Helvetica-Bold').fontSize(18).fillColor('#D62828').text('RECIBO DE PAGO', { align: 'right' });
+
+  // Datos emisor / recibo
+  doc.moveDown(0.5);
+  doc.font('Helvetica').fontSize(10).fillColor('#111');
+  const leftX = doc.x, topY = doc.y;
+
+  const emisor = [
+    company.name,
+    company.taxId ? `NIF: ${company.taxId}` : null,
+    company.address,
+    [company.postal, company.city].filter(Boolean).join(' '),
+    company.country
+  ].filter(Boolean).join('\n');
+
+  doc.text(emisor, leftX, topY, { width: 260 });
+
+  const rightX = 300;
+  const paidFmt = new Intl.DateTimeFormat('es-ES', { dateStyle: 'medium', timeStyle: 'short' }).format(paidAt);
+  const invText = [
+    `Nº Recibo: ${company.serie}-${invoiceNumber || 's/n'}`,
+    `Fecha de pago: ${paidFmt}`,
+    `Estado: PAGADO`,
+  ].join('\n');
+  doc.text(invText, rightX, topY, { align: 'left' });
+
+  doc.moveDown(1);
+
+  // Cliente
+  if (customer && (customer.name || customer.email || customer.address)) {
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111').text('Cliente');
+    doc.moveDown(0.2);
+    doc.font('Helvetica').fontSize(10);
+    const custLines = [
+      customer.name,
+      customer.email,
+      customer.address,
+      [customer.postal, customer.city].filter(Boolean).join(' '),
+      customer.country
+    ].filter(Boolean).join('\n');
+    doc.text(custLines || '-', { width: 500 });
+  }
+  doc.moveDown(0.8);
+
+  // Cabeceras tabla
+  doc.font('Helvetica-Bold').fontSize(10);
+  doc.text('Concepto', 56, doc.y, { width: 280 });
+  doc.text('Cant.', 336, doc.y, { width: 60, align: 'right' });
+  doc.text('Total', 396, doc.y, { width: 140, align: 'right' });
+  doc.moveDown(0.3);
+  doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
+  doc.moveDown(0.5);
+
+  // Filas
+  doc.font('Helvetica').fontSize(10);
+  let sumCents = 0;
+  items.forEach(it => {
+    const totalCents = Number(it.totalCents || 0);
+    sumCents += totalCents;
+    const totalFmt = currencyFormat(totalCents / 100, it.currency);
+    doc.text(it.description, 56, doc.y, { width: 280 });
+    doc.text(`x${it.quantity}`, 336, doc.y, { width: 60, align: 'right' });
+    doc.text(totalFmt, 396, doc.y, { width: 140, align: 'right' });
+    doc.moveDown(0.4);
+  });
+
+  doc.moveDown(0.5);
+  doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
+  doc.moveDown(0.6);
+
+  // Total
+  doc.font('Helvetica-Bold').fontSize(11);
+  const sumFmt = currencyFormat(sumCents / 100, (currency || 'EUR'));
+  doc.text('Total pagado', 56, doc.y, { width: 340, align: 'left' });
+  doc.text(sumFmt, 396, doc.y, { width: 140, align: 'right' });
+  doc.moveDown(0.8);
+
+  // Sello PAGADO
+  doc.save();
+  doc.rotate(-10, { origin: [400, doc.y] });
+  doc.font('Helvetica-Bold').fontSize(28).fillColor('#16a34a');
+  doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
+  doc.restore();
+
+  // Pie
+  doc.moveDown(1.6);
+  doc.font('Helvetica').fontSize(9).fillColor('#444');
+  doc.text(`Este documento sirve como justificación de pago. Para información fiscal detallada, también se adjunta la factura oficial.`, { width: 480 });
+
+  doc.end();
+  return await done;
+}
+
+/* ---------- Email ADMIN ---------- */
 async function sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping }) {
   const to = process.env.CORPORATE_EMAIL || 'pedidos@tudominio.com';
   const from = process.env.CORPORATE_FROM || process.env.SMTP_USER || 'no-reply@tu-dominio.com';
@@ -618,14 +718,12 @@ ${JSON.stringify(metadata || {}, null, 2)}
     await sendViaGmailSMTP({ from, to, subject: `🧾 Nuevo pedido — ${totalFmt}`, text, html });
     return;
   }
-  console.warn('[email admin] No hay RESEND_API_KEY ni SMTP configurado. Email no enviado.');
+  console.warn('[email admin] Sin proveedor email configurado');
 }
 
-/* ---------- Email CLIENTE (HTML + texto + BCC opcional + SUSCRIPCIÓN)
-   *Este se usa solo si COMBINE_CONFIRMATION_AND_INVOICE=false* ---------- */
+/* ---------- Email cliente (solo si COMBINE=false) ---------- */
 async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand, isSubscription }) {
   if (!to) { console.warn('[email cliente] Falta "to"'); return; }
-
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const replyTo = process.env.SUPPORT_EMAIL || supportEmail || 'soporte@guarrosextremenos.com';
   const totalFmt = currencyFormat(Number(amountTotal || 0), currency || 'EUR');
@@ -679,16 +777,6 @@ async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, o
       </tr>
     </tfoot>
   </table>
-</td></tr>
-${orderId ? `
-<tr><td style="padding:0 24px 12px; background:#ffffff;">
-  <div style="font:12px system-ui; color:#6b7280;">ID de ${isSubscription ? 'suscripción/pedido' : 'pedido'} (Stripe): <span style="color:#374151;">${escapeHtml(orderId)}</span></div>
-</td></tr>` : ''}
-<tr><td style="padding:8px 24px 16px; background:#ffffff;">
-  <p style="margin:0; font:13px system-ui; color:#374151;">
-    Si tienes cualquier duda, responde a este correo o escríbenos a
-    <a href="mailto:${escapeHtml(replyTo)}" style="color:${BRAND_PRIMARY}; text-decoration:none;">${escapeHtml(replyTo)}</a>.
-  </p>
 </td></tr>`;
 
   const html = emailShell({
@@ -698,41 +786,24 @@ ${orderId ? `
     footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand || BRAND)}. Todos los derechos reservados.</p>`
   });
 
-  console.log('[email cliente] Enviando…', { to, from, subject, bcc: bccList });
-
-  try {
-    if (process.env.RESEND_API_KEY) {
-      const resend = new Resend(process.env.RESEND_API_KEY);
-      const resp = await resend.emails.send({
-        from, to,
-        ...(bccList.length ? { bcc: bccList } : {}),
-        reply_to: replyTo, subject, text, html
-      });
-      console.log('[email cliente] Resend OK:', resp?.id || resp);
-      return;
-    }
-    if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-      const info = await sendViaGmailSMTP({ from, to, subject, text, html });
-      console.log('[email cliente] SMTP OK:', info?.messageId);
-      return;
-    }
-    console.warn('[email cliente] Sin RESEND_API_KEY ni SMTP: no se envía.');
-  } catch (e) {
-    console.error('[email cliente] ERROR:', e?.message || e);
-    if (e?.response?.json) {
-      try { console.error('[email cliente] Resend response:', await e.response.json()); } catch {}
-    }
-    throw e;
+  if (process.env.RESEND_API_KEY) {
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({ from, to, ...(bccList.length ? { bcc: bccList } : {}), reply_to: replyTo, subject, text, html });
+    return;
   }
+  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    await sendViaGmailSMTP({ from, to, subject, text, html });
+    return;
+  }
+  console.warn('[email cliente] Sin proveedor email configurado');
 }
 
-/* ---------- Email FACTURA + CONFIRMACIÓN COMBINADOS ---------- */
+/* ---------- Email combinado: Confirmación + Recibo + (Factura Stripe opcional) ---------- */
 async function sendCustomerOrderAndInvoiceEmail({
   to, name, invoiceNumber, total, currency, pdfUrl, lineItems,
   brand, isSubscription, alsoBccCorporate
 }) {
   if (!to)  { console.warn('[combined email] Falta "to"'); return; }
-  if (!pdfUrl) { console.warn('[combined email] Falta "pdfUrl"'); return; }
 
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const replyTo = process.env.SUPPORT_EMAIL || 'soporte@guarrosextremenos.com';
@@ -740,17 +811,37 @@ async function sendCustomerOrderAndInvoiceEmail({
     ? `✅ Suscripción activada — Factura ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand || BRAND}`
     : `✅ Confirmación de pedido — Factura ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand || BRAND}`;
 
-  // Descarga y prepara adjunto PDF
-  const resp = await fetch(pdfUrl);
-  if (!resp.ok) throw new Error(`No se pudo descargar la factura PDF (${resp.status})`);
-  const b64 = Buffer.from(await resp.arrayBuffer()).toString('base64');
-  const attachments = [{ filename: `Factura-${invoiceNumber || 'pedido'}.pdf`, content: b64 }];
+  // Recibo propio (siempre)
+  const receiptBuf = await createPaidReceiptPDF({
+    invoiceNumber, total, currency, lineItems,
+    brand, logoUrl: BRAND_LOGO_URL,
+    customer: { name, email: to },
+    paidAt: new Date()
+  });
+  const receiptB64 = receiptBuf.toString('base64');
 
-  // Normaliza line items de invoice a estructura usada por helpers
+  const attachments = [{
+    filename: `Recibo-${invoiceNumber || 'pedido'}.pdf`,
+    content: receiptB64
+  }];
+
+  // Factura Stripe (opcional)
+  const attachStripe = String(process.env.ATTACH_STRIPE_INVOICE || 'true').toLowerCase() !== 'false';
+  if (attachStripe && pdfUrl) {
+    const resp = await fetch(pdfUrl);
+    if (resp.ok) {
+      const stripeB64 = Buffer.from(await resp.arrayBuffer()).toString('base64');
+      attachments.push({ filename: `Factura-${invoiceNumber || 'pedido'}.pdf`, content: stripeB64 });
+    } else {
+      console.warn('[combined email] No se pudo descargar PDF de Stripe:', resp.status);
+    }
+  }
+
+  // Normaliza items para helpers de HTML
   const mapped = (lineItems || []).map(li => ({
     description: li?.description,
     quantity: li?.quantity || 1,
-    amount_total: li?.amount || li?.amount_total || 0, // invoices.listLineItems usa 'amount'
+    amount_total: li?.amount ?? li?.amount_total ?? 0,
     currency: (li?.currency || currency || 'eur'),
     price: { unit_amount: li?.price?.unit_amount ?? null, recurring: li?.price?.recurring || null }
   }));
@@ -765,19 +856,13 @@ async function sendCustomerOrderAndInvoiceEmail({
 
   const text = [
     name ? `Hola ${name},` : 'Hola,', '',
-    intro, '',
-    'Resumen:',
-    itemsPlain, '',
+    intro, '', 'Resumen:', itemsPlain, '',
     `Total: ${totalFmt}`,
     invoiceNumber ? `Factura: ${invoiceNumber}` : '',
-    '',
-    'Adjuntamos tu factura en PDF.',
-    '',
-    `Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.`,
-    '',
-    `Un saludo,`,
-    `Equipo ${brand || BRAND}`
-  ].filter(Boolean).join('\n');
+    '', 'Adjuntamos tu recibo en PDF' + (attachStripe ? ' y la factura oficial de Stripe.' : '.'),
+    '', `Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.`,
+    '', `Un saludo,`, `Equipo ${brand || BRAND}`
+  ].join('\n');
 
   const bodyHTML = `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
@@ -807,16 +892,17 @@ async function sendCustomerOrderAndInvoiceEmail({
 </td></tr>
 <tr><td style="padding:8px 24px 16px; background:#ffffff;">
   <p style="margin:0; font:13px system-ui; color:#374151;">
-    Adjuntamos tu factura en PDF.${invoiceNumber ? ` Número: <strong>${escapeHtml(invoiceNumber)}</strong>.` : ''}
+    Adjuntamos tu recibo en PDF${attachStripe ? ' y la factura oficial de Stripe' : ''}.
+    ${invoiceNumber ? `Número de factura: <strong>${escapeHtml(invoiceNumber)}</strong>.` : ''}
   </p>
   <p style="margin:8px 0 0; font:13px system-ui; color:#374151;">
-    Si tienes cualquier duda, responde a este correo o escríbenos a
+    Para cualquier duda, responde a este correo o escríbenos a
     <a href="mailto:${escapeHtml(replyTo)}" style="color:${BRAND_PRIMARY}; text-decoration:none;">${escapeHtml(replyTo)}</a>.
   </p>
 </td></tr>`;
 
   const html = emailShell({
-    title: 'Confirmación de pedido + Factura',
+    title: 'Confirmación de pedido y factura',
     headerLabel: 'Confirmación de pedido y factura',
     bodyHTML,
     footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand || BRAND)}. Todos los derechos reservados.</p>`
@@ -829,37 +915,27 @@ async function sendCustomerOrderAndInvoiceEmail({
     if (corp && corp !== dest) bccList.push(process.env.CORPORATE_EMAIL);
   }
 
-  // Envío por Resend o SMTP
   if (process.env.RESEND_API_KEY) {
     const resend = new Resend(process.env.RESEND_API_KEY);
-    const resp = await resend.emails.send({
-      from, to,
-      ...(bccList.length ? { bcc: bccList } : {}),
-      reply_to: replyTo, subject, text, html,
-      attachments
-    });
-    console.log('[combined email] Resend OK:', resp?.id || resp);
+    await resend.emails.send({ from, to, ...(bccList.length ? { bcc: bccList } : {}), reply_to: replyTo, subject, text, html, attachments });
     return;
   }
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    const info = await sendViaGmailSMTP({ from, to, subject, text, html, attachments });
-    console.log('[combined email] SMTP OK:', info?.messageId);
+    await sendViaGmailSMTP({ from, to, subject, text, html, attachments });
     return;
   }
-  console.warn('[combined email] Sin RESEND_API_KEY ni SMTP: no se envía.');
+  console.warn('[combined email] Sin proveedor email configurado');
 }
 
-/* ---------- SMTP fallback (HTML + adjuntos) ---------- */
+/* ---------- SMTP fallback ---------- */
 async function sendViaGmailSMTP({ from, to, subject, text, html, attachments }) {
   const port = Number(process.env.SMTP_PORT || 465);
-  const secure = String(port) === '465'; // 465 SSL; 587 STARTTLS
+  const secure = String(port) === '465';
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
-    port,
-    secure,
+    port, secure,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    logger: true,
-    debug: true,
+    logger: true, debug: true,
   });
   await transporter.verify();
   const info = await transporter.sendMail({ from, to, subject, text, html, attachments });
@@ -911,7 +987,7 @@ async function logOrderItems(sessionId, lineItems, currency) {
       li.price?.id || null,
       li.quantity || 1,
       li.price?.unit_amount ?? null,
-      li.amount_total ?? 0,
+      (li.amount_total ?? li.amount ?? 0),
       (li.currency || currency || 'eur').toUpperCase(),
       JSON.stringify(li),
     ];
