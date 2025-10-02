@@ -5,11 +5,11 @@ import morgan from 'morgan';
 import bodyParser from 'body-parser';
 import Stripe from 'stripe';
 
-// --- Notificaciones / Email ---
-import { Resend } from 'resend';          // API (recomendada en Render)
-import nodemailer from 'nodemailer';      // SMTP (fallback si tu plan lo permite)
+// Email providers
+import { Resend } from 'resend';          // Recomendado (HTTP)
+import nodemailer from 'nodemailer';      // Fallback SMTP (si tu plan lo permite)
 
-// --- Registro en DB (Supabase / Postgres) ---
+// DB (Supabase/Postgres)
 import pg from 'pg';
 const { Pool } = pg;
 
@@ -17,12 +17,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// CORS (para el front)
+// ---------- CORS ----------
 const allowList = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 const corsOptions = {
-  origin: (origin, cb) => (!origin || allowList.length === 0 || allowList.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS: ' + origin)),
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (allowList.length === 0 || allowList.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS: ' + origin));
+  },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   maxAge: 600
@@ -30,7 +36,9 @@ const corsOptions = {
 
 app.use(morgan('tiny'));
 
-/* ========================= WEBHOOK (ACK RÁPIDO) ========================= */
+// ======================================================
+// ==========   WEBHOOK STRIPE (ACK RÁPIDO)    ==========
+// ======================================================
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -43,7 +51,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // OK inmediato; lo pesado corre detrás
+  // OK inmediato; procesado en background
   res.status(200).json({ received: true });
 
   queueMicrotask(async () => {
@@ -52,10 +60,13 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
         case 'checkout.session.completed': {
           const session = event.data.object;
 
-          // Line items
+          // Obtener line items (con price.product expandido para tener recurring/product)
           let lineItems = [];
           try {
-            const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] });
+            const li = await stripe.checkout.sessions.listLineItems(session.id, {
+              limit: 100,
+              expand: ['data.price.product']
+            });
             lineItems = li?.data || [];
           } catch (e) {
             console.warn('[webhook] no se pudieron leer lineItems:', e.message);
@@ -69,12 +80,12 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           const amountTotal = (session.amount_total ?? 0) / 100;
           const currency = (session.currency || 'eur').toUpperCase();
 
-          // ⬇️ NUEVO: detectar si es suscripción (modo o alguna línea recurring)
+          // ¿Suscripción?
           const isSubscription =
             session.mode === 'subscription' ||
             (Array.isArray(lineItems) && lineItems.some(li => li?.price?.recurring));
 
-          // Admin
+          // Email admin
           try {
             await sendAdminEmail({
               session, lineItems, customerEmail, name, phone,
@@ -85,7 +96,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             console.error('📧 Email admin ERROR:', e);
           }
 
-          // Cliente (con copy distinto si es suscripción)
+          // Email cliente
           try {
             await sendCustomerEmail({
               to: customerEmail,
@@ -96,14 +107,14 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               orderId: session.id,
               supportEmail: process.env.SUPPORT_EMAIL,
               brand: process.env.BRAND_NAME || "Guarros Extremeños",
-              isSubscription, // ⬅️ pasa el flag
+              isSubscription,
             });
             console.log('📧 Email cliente enviado OK');
           } catch (e) {
             console.error('📧 Email cliente ERROR:', e);
           }
 
-          // DB
+          // Registro en DB
           try {
             await logOrder({
               sessionId: session.id,
@@ -128,13 +139,28 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           break;
         }
 
-        // ⬇️ NUEVO: cuando la factura está lista, enviamos PDF adjunto
         case 'invoice.payment_succeeded': {
           const invoice = event.data.object;
 
           try {
-            const to = invoice.customer_email;
-            const name = invoice.customer_name || invoice.customer_details?.name || '';
+            // 1) Intenta email directo de la factura
+            let to = invoice.customer_email || invoice.customer_details?.email || null;
+
+            // 2) Si no hay email, intenta recuperar el Customer
+            if (!to && invoice.customer) {
+              try {
+                const cust = await stripe.customers.retrieve(invoice.customer);
+                to = cust?.email || null;
+              } catch (e) {
+                console.warn('[invoice.email] No se pudo recuperar customer:', e?.message || e);
+              }
+            }
+
+            const name =
+              invoice.customer_name ||
+              invoice.customer_details?.name ||
+              invoice.customer?.name ||
+              '';
             const pdfUrl = invoice.invoice_pdf; // URL pública temporal
             const invoiceNumber = invoice.number || invoice.id;
             const currency = (invoice.currency || 'eur').toUpperCase();
@@ -151,9 +177,9 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
                 brand: process.env.BRAND_NAME || "Guarros Extremeños",
                 alsoToCorporate: String(process.env.INVOICE_BCC_CORPORATE || '').toLowerCase() === 'true',
               });
-              console.log('📧 Factura enviada al cliente OK');
+              console.log('📧 Factura enviada al cliente OK →', to);
             } else {
-              console.warn('[invoice.email] Falta to o pdfUrl → no se envía email de factura');
+              console.warn('[invoice.email] Falta to o pdfUrl → no se envía email de factura', { to, pdfUrl });
             }
           } catch (e) {
             console.error('📧 Envío de factura ERROR:', e);
@@ -176,7 +202,9 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
   });
 });
 
-/* ========================= API REST ========================= */
+// ==============================================
+// ==========     API REST / HEALTH     ==========
+// ==============================================
 app.use(cors(corsOptions));
 app.use(express.json());
 
@@ -236,7 +264,10 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-/* ----------------- ENDPOINTS DE PRUEBA ----------------- */
+// ============================
+// ========== TESTS ===========
+// ============================
+
 app.get('/test-db-ping', async (req, res) => {
   try {
     if (!pool) throw new Error('DATABASE_URL no configurado');
@@ -275,6 +306,7 @@ app.post('/test-db-insert', async (req, res) => {
   }
 });
 
+// Test email admin (simple)
 app.post('/test-email', async (req, res) => {
   try {
     const to = process.env.CORPORATE_EMAIL || (process.env.SMTP_USER || 'destino@tudominio.com');
@@ -295,21 +327,21 @@ app.post('/test-email', async (req, res) => {
   }
 });
 
+// Test email cliente (no suscripción)
 app.post('/test-email-customer', async (req, res) => {
   try {
-    const to = req.body?.to || req.query?.to || 'tu-correo-de-prueba@ejemplo.com';
+    const to = req.body?.to || req.query?.to || 'tu@correo.com';
     await sendCustomerEmail({
       to,
-      name: 'Cliente de prueba',
+      name: 'Cliente Test',
       amountTotal: 123.45,
       currency: 'EUR',
       orderId: 'test_' + Date.now(),
       lineItems: [
         { description: 'Jamón Canalla', quantity: 1, amount_total: 9999, currency: 'eur' },
-        { description: 'Loncheado', quantity: 2, amount_total: 1599, currency: 'eur' },
       ],
       brand: process.env.BRAND_NAME || "Guarros Extremeños",
-      isSubscription: false,
+      isSubscription: false
     });
     res.json({ ok: true, to });
   } catch (e) {
@@ -318,26 +350,39 @@ app.post('/test-email-customer', async (req, res) => {
   }
 });
 
-/* ----------------- MÉTRICAS ----------------- */
-app.get('/metrics/overview', async (req, res) => {
+// Test email cliente (simula suscripción)
+app.post('/test-email-customer-sub', async (req, res) => {
   try {
-    if (!pool) throw new Error('DATABASE_URL no configurado');
-    const [daily, monthly, mix, top] = await Promise.all([
-      pool.query('select * from v_revenue_daily_90d'),
-      pool.query('select * from v_revenue_monthly_12m'),
-      pool.query('select * from v_mix_subscription_90d'),
-      pool.query('select * from v_top_products_90d'),
-    ]);
-    res.json({ ok: true, daily: daily.rows, monthly: monthly.rows, mix: mix.rows, top: top.rows });
+    const to = req.body?.to || req.query?.to || 'tu@correo.com';
+    const isSubscription = Boolean(req.body?.isSubscription ?? true);
+    await sendCustomerEmail({
+      to,
+      name: 'Cliente Suscripción',
+      amountTotal: 70.00,
+      currency: 'EUR',
+      orderId: 'test_sub_' + Date.now(),
+      lineItems: [
+        { description: 'Suscripción Jamón Canalla', quantity: 1, amount_total: 7000, currency: 'eur', price: { unit_amount: 7000, recurring: { interval: 'month' } } },
+      ],
+      brand: process.env.BRAND_NAME || "Guarros Extremeños",
+      isSubscription
+    });
+    res.json({ ok: true, to, isSubscription });
   } catch (e) {
-    console.error('[/metrics/overview] error:', e);
+    console.error('[/test-email-customer-sub] error:', e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+// ================================
+// ==========    START    =========
+// ================================
 app.listen(PORT, () => console.log(`API listening on :${PORT}`));
 
-/* ========================= HELPERS EMAIL ========================= */
+/* ===========================================================
+   ======================  HELPERS  ==========================
+   =========================================================== */
+
 // Branding
 const BRAND = process.env.BRAND_NAME || "Guarros Extremeños";
 const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
@@ -345,7 +390,9 @@ const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 
 // Escapes HTML
 function escapeHtml(str) {
-  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+  return String(str || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
 }
 
 function currencyFormat(amount = 0, currency = 'EUR') {
@@ -434,19 +481,19 @@ ${JSON.stringify(metadata || {}, null, 2)}
 
   const bodyHTML = `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
-  <p style="margin:0 0 12px; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; color:#374151;">
+  <p style="margin:0 0 12px; font:14px/1.5 system-ui; color:#374151;">
     <strong>Cliente:</strong> ${escapeHtml(name || '(sin nombre)')} &lt;${escapeHtml(customerEmail || 'sin email')}&gt;<br/>
     <strong>Teléfono:</strong> ${escapeHtml(phone || '-')}
   </p>
   <div style="height:1px; background:#e5e7eb;"></div>
 </td></tr>
 <tr><td style="padding:8px 24px 0; background:#ffffff;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
     <thead>
       <tr>
-        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Producto</th>
-        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Cant.</th>
-        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Total</th>
+        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
+        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
+        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
       </tr>
     </thead>
     <tbody>${itemsHTML}</tbody>
@@ -461,7 +508,7 @@ ${JSON.stringify(metadata || {}, null, 2)}
   </table>
 </td></tr>
 <tr><td style="padding:8px 24px 8px; background:#ffffff;">
-  <div style="font:12px system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; color:#6b7280;">
+  <div style="font:12px system-ui; color:#6b7280;">
     <strong>Session ID:</strong> ${escapeHtml(session.id)}<br/>
     <strong>Dirección:</strong> ${escapeHtml([shipping?.line1, shipping?.line2].filter(Boolean).join(' ') || '')}<br/>
     ${escapeHtml([shipping?.postal_code, shipping?.city, shipping?.country].filter(Boolean).join(' ') || '')}<br/>
@@ -478,13 +525,7 @@ ${JSON.stringify(metadata || {}, null, 2)}
 
   if (process.env.RESEND_API_KEY) {
     const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({
-      from,
-      to,
-      subject: `🧾 Nuevo pedido — ${totalFmt}`,
-      text,
-      html
-    });
+    await resend.emails.send({ from, to, subject: `🧾 Nuevo pedido — ${totalFmt}`, text, html });
     return;
   }
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
@@ -496,21 +537,19 @@ ${JSON.stringify(metadata || {}, null, 2)}
 
 /* ---------- Email CLIENTE (HTML + texto + BCC opcional + SUSCRIPCIÓN) ---------- */
 async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand, isSubscription }) {
-  if (!to) return;
+  if (!to) { console.warn('[email cliente] Falta "to"'); return; }
+
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const replyTo = process.env.SUPPORT_EMAIL || supportEmail || 'soporte@guarrosextremenos.com';
   const totalFmt = currencyFormat(Number(amountTotal || 0), currency || 'EUR');
   const itemsPlain = formatLineItemsPlain(lineItems, currency || 'EUR');
   const itemsHTML = formatLineItemsHTML(lineItems, currency || 'EUR');
 
-  // evita duplicados si el destinatario es el corporativo
-  const bccList = [];
   const wantBcc = String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true';
   const corp = (process.env.CORPORATE_EMAIL || '').toLowerCase();
   const dest = String(to || '').toLowerCase();
-  if (wantBcc && corp && corp !== dest) bccList.push(process.env.CORPORATE_EMAIL);
+  const bccList = wantBcc && corp && corp !== dest ? [process.env.CORPORATE_EMAIL] : [];
 
-  // Copy distinto si es suscripción
   const subject = isSubscription
     ? `✅ Suscripción activada ${orderId ? `#${orderId}` : ''} — ${brand || BRAND}`
     : `✅ Confirmación de pedido ${orderId ? `#${orderId}` : ''} — ${brand || BRAND}`;
@@ -520,39 +559,27 @@ async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, o
     : `¡Gracias por tu compra en ${brand || BRAND}! Tu pago se ha recibido correctamente.`;
 
   const text = [
-    name ? `Hola ${name},` : 'Hola,',
-    '',
-    intro,
-    '',
-    'Resumen:',
-    itemsPlain,
-    '',
+    name ? `Hola ${name},` : 'Hola,', '',
+    intro, '', 'Resumen:', itemsPlain, '',
     `Total ${isSubscription ? 'del primer cargo' : 'pagado'}: ${totalFmt}`,
     orderId ? `ID de ${isSubscription ? 'suscripción/pedido' : 'pedido'} (Stripe): ${orderId}` : '',
-    '',
-    `Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.`,
-    '',
-    `Un saludo,`,
-    `Equipo ${brand || BRAND}`
+    '', `Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.`,
+    '', `Un saludo,`, `Equipo ${brand || BRAND}`
   ].filter(Boolean).join('\n');
 
   const bodyHTML = `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
-  <p style="margin:0 0 12px; font:15px system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; color:#111827;">
-    ${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}
-  </p>
-  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
-    ${escapeHtml(intro)}
-  </p>
+  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">${escapeHtml(intro)}</p>
 </td></tr>
 <tr><td style="padding:0 24px 8px; background:#ffffff;"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
 <tr><td style="padding:8px 24px 0; background:#ffffff;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
     <thead>
       <tr>
-        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Producto</th>
-        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Cant.</th>
-        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:0.5px;">Total</th>
+        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
+        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
+        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
       </tr>
     </thead>
     <tbody>${itemsHTML}</tbody>
@@ -584,24 +611,32 @@ ${orderId ? `
     footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand || BRAND)}. Todos los derechos reservados.</p>`
   });
 
-  if (process.env.RESEND_API_KEY) {
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({
-      from,
-      to,
-      ...(bccList.length ? { bcc: bccList } : {}),
-      reply_to: replyTo,
-      subject,
-      text,
-      html
-    });
-    return;
+  console.log('[email cliente] Enviando…', { to, from, subject, bcc: bccList });
+
+  try {
+    if (process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      const resp = await resend.emails.send({
+        from, to,
+        ...(bccList.length ? { bcc: bccList } : {}),
+        reply_to: replyTo, subject, text, html
+      });
+      console.log('[email cliente] Resend OK:', resp?.id || resp);
+      return;
+    }
+    if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      const info = await sendViaGmailSMTP({ from, to, subject, text, html });
+      console.log('[email cliente] SMTP OK:', info?.messageId);
+      return;
+    }
+    console.warn('[email cliente] Sin RESEND_API_KEY ni SMTP: no se envía.');
+  } catch (e) {
+    console.error('[email cliente] ERROR:', e?.message || e);
+    if (e?.response?.json) {
+      try { console.error('[email cliente] Resend response:', await e.response.json()); } catch {}
+    }
+    throw e;
   }
-  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    await sendViaGmailSMTP({ from, to, subject, text, html });
-    return;
-  }
-  console.warn('[email cliente] No hay RESEND_API_KEY ni SMTP configurado. Email no enviado.');
 }
 
 /* ---------- Email FACTURA (descarga PDF y adjunta) ---------- */
@@ -611,20 +646,20 @@ async function sendInvoiceEmail({ to, name, invoiceNumber, total, currency, pdfU
   const subject = `🧾 Factura ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand || BRAND}`;
   const totalFmt = currencyFormat(Number(total || 0), currency || 'EUR');
 
-  // descarga PDF (Node 18+ trae fetch nativo)
+  if (!to)  { console.warn('[invoice email] Falta "to"'); return; }
+  if (!pdfUrl) { console.warn('[invoice email] Falta "pdfUrl"'); return; }
+
+  console.log('[invoice email] Descargando PDF…', pdfUrl);
   const resp = await fetch(pdfUrl);
   if (!resp.ok) throw new Error(`No se pudo descargar la factura PDF (${resp.status})`);
   const buf = Buffer.from(await resp.arrayBuffer());
+  const b64 = buf.toString('base64');
 
   const text = [
-    name ? `Hola ${name},` : 'Hola,',
-    '',
+    name ? `Hola ${name},` : 'Hola,', '',
     `Adjuntamos tu factura ${invoiceNumber ? `#${invoiceNumber}` : ''} por un importe de ${totalFmt}.`,
-    '',
-    'Gracias por confiar en nosotros.',
-    '',
-    `Un saludo,`,
-    `Equipo ${brand || BRAND}`
+    '', 'Gracias por confiar en nosotros.', '',
+    `Un saludo,`, `Equipo ${brand || BRAND}`
   ].join('\n');
 
   const html = emailShell({
@@ -632,9 +667,7 @@ async function sendInvoiceEmail({ to, name, invoiceNumber, total, currency, pdfU
     headerLabel: `Factura ${invoiceNumber || ''}`,
     bodyHTML: `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
-  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">
-    ${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}
-  </p>
+  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
   <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
     Adjuntamos tu factura ${invoiceNumber ? `<strong>#${escapeHtml(invoiceNumber)}</strong>` : ''} por un importe de <strong>${escapeHtml(totalFmt)}</strong>.
   </p>
@@ -642,41 +675,51 @@ async function sendInvoiceEmail({ to, name, invoiceNumber, total, currency, pdfU
     footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand || BRAND)}. Todos los derechos reservados.</p>`
   });
 
-  const attachments = [{ filename: `Factura-${invoiceNumber || 'pedido'}.pdf`, content: buf.toString('base64') }];
+  const attachments = [{ filename: `Factura-${invoiceNumber || 'pedido'}.pdf`, content: b64 }];
 
   const bccList = [];
-  if (alsoToCorporate && process.env.CORPORATE_EMAIL) {
-    bccList.push(process.env.CORPORATE_EMAIL);
-  }
+  if (alsoToCorporate && process.env.CORPORATE_EMAIL) bccList.push(process.env.CORPORATE_EMAIL);
 
-  if (process.env.RESEND_API_KEY) {
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({
-      from, to,
-      ...(bccList.length ? { bcc: bccList } : {}),
-      reply_to: replyTo,
-      subject, text, html,
-      attachments
-    });
-    return;
+  console.log('[invoice email] Enviando…', { to, from, subject, bcc: bccList });
+
+  try {
+    if (process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      const resp = await resend.emails.send({
+        from, to,
+        ...(bccList.length ? { bcc: bccList } : {}),
+        reply_to: replyTo, subject, text, html,
+        attachments
+      });
+      console.log('[invoice email] Resend OK:', resp?.id || resp);
+      return;
+    }
+    if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      const info = await sendViaGmailSMTP({ from, to, subject, text, html, attachments });
+      console.log('[invoice email] SMTP OK:', info?.messageId);
+      return;
+    }
+    console.warn('[invoice email] Sin RESEND_API_KEY ni SMTP: no se envía.');
+  } catch (e) {
+    console.error('[invoice email] ERROR:', e?.message || e);
+    if (e?.response?.json) {
+      try { console.error('[invoice email] Resend response:', await e.response.json()); } catch {}
+    }
+    throw e;
   }
-  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    await sendViaGmailSMTP({ from, to, subject, text, html, attachments });
-    return;
-  }
-  console.warn('[invoice email] No hay RESEND_API_KEY ni SMTP configurado. Email no enviado.');
 }
 
-/* ---------- SMTP fallback (HTML soportado + adjuntos) ---------- */
+/* ---------- SMTP fallback (HTML + adjuntos) ---------- */
 async function sendViaGmailSMTP({ from, to, subject, text, html, attachments }) {
   const port = Number(process.env.SMTP_PORT || 465);
-  const secure = String(port) === '465';
+  const secure = String(port) === '465'; // 465 SSL; 587 STARTTLS
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port,
     secure,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    logger: true, debug: true,
+    logger: true,
+    debug: true,
   });
   await transporter.verify();
   const info = await transporter.sendMail({ from, to, subject, text, html, attachments });
