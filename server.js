@@ -626,10 +626,26 @@ async function createPaidReceiptPDF({
   doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
   doc.restore();
 
-  // Pie
-  doc.moveDown(1.6);
-  doc.font('Helvetica').fontSize(9).fillColor('#444');
-  doc.text(`Este documento sirve como justificación de pago. Para información fiscal detallada, también se adjunta la factura oficial.`, { width: 480 });
+// Pie (columna derecha para que no quede pegado a la izquierda)
+doc.moveDown(1.6);
+doc.font('Helvetica').fontSize(9).fillColor('#444');
+
+const pageWidth = doc.page.width;
+const { left, right } = doc.page.margins;
+
+// define un ancho cómodo para el pie (ajústalo si quieres)
+const colWidth = 300;
+
+// x será el inicio de la columna derecha
+const xRightCol = pageWidth - right - colWidth;
+
+doc.text(
+  'Este documento sirve como justificación de pago. Para información fiscal detallada, también se adjunta la factura oficial.',
+  xRightCol,
+  doc.y,
+  { width: colWidth, align: 'left' } // también puedes usar align: 'right'
+);
+
 
   doc.end();
   return await done;
