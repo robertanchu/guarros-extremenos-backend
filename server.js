@@ -159,80 +159,103 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           break;
         }
 
-        case 'invoice.payment_succeeded': {
-          const invoice = event.data.object;
-          try {
-            // Email destino
-            let to = invoice.customer_email || invoice.customer_details?.email || null;
-            if (!to && invoice.customer) {
-              try {
-                const cust = await stripe.customers.retrieve(invoice.customer);
-                to = cust?.email || null;
-              } catch (e) {
-                console.warn('[invoice.email] retrieve customer error:', e?.message || e);
-              }
-            }
+case 'invoice.payment_succeeded': {
+  const invoice = event.data.object;
+  try {
+    // Email destino
+    let to = invoice.customer_email || invoice.customer_details?.email || null;
+    if (!to && invoice.customer) {
+      try {
+        const cust = await stripe.customers.retrieve(invoice.customer);
+        to = cust?.email || null;
+      } catch (e) {
+        console.warn('[invoice.email] retrieve customer error:', e?.message || e);
+      }
+    }
 
-            const name =
-              invoice.customer_name ||
-              invoice.customer_details?.name ||
-              invoice.customer?.name || '';
+    const name =
+      invoice.customer_name ||
+      invoice.customer_details?.name ||
+      invoice.customer?.name || '';
 
-            // PDF de factura (con reintentos; sólo para attach opcional)
-            let pdfUrl = invoice.invoice_pdf;
-            if (!pdfUrl) {
-              for (let i = 0; i < 3 && !pdfUrl; i++) {
-                await wait(3000);
-                try {
-                  const inv2 = await stripe.invoices.retrieve(invoice.id);
-                  pdfUrl = inv2.invoice_pdf || null;
-                  console.log(`[invoice.retry] intento ${i + 1}: invoice_pdf ${pdfUrl ? 'OK' : 'aún no'}`);
-                } catch (e) {
-                  console.warn('[invoice.retry] retrieve error:', e?.message || e);
-                }
-              }
-            }
-
-            // Líneas de la factura (para recibo propio)
-            let invItems = [];
-            try {
-              const li = await stripe.invoices.listLineItems(invoice.id, {
-                limit: 100,
-                expand: ['data.price.product']
-              });
-              invItems = li?.data || [];
-            } catch (e) {
-              console.warn('[invoice.email] listLineItems error:', e?.message || e);
-            }
-
-            const isSubscription =
-              !!invoice.subscription || (Array.isArray(invItems) && invItems.some(it => it?.price?.recurring));
-            const currency = (invoice.currency || 'eur').toUpperCase();
-            const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
-            const invoiceNumber = invoice.number || invoice.id;
-
-            const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
-
-            if (combine && to) {
-              // COMBINE=true → Confirmación + Recibo propio + (opcional) Factura Stripe
-              await sendCustomerOrderAndInvoiceEmail({
-                to, name, invoiceNumber, total, currency,
-                pdfUrl, lineItems: invItems,
-                brand: process.env.BRAND_NAME || "Guarros Extremeños",
-                isSubscription,
-                alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true'
-              });
-              console.log('📧 Email combinado (confirmación + recibo [+ factura]) enviado OK →', to);
-            } else {
-              // COMBINE=false → no se envía correo al cliente aquí
-              console.log('[invoice.email] combine=false → no se envía correo al cliente en invoice.payment_succeeded');
-            }
-          } catch (e) {
-            console.error('📧 invoice.payment_succeeded handler ERROR:', e);
-          }
-          console.log('✅ invoice.payment_succeeded', invoice.id);
-          break;
+    // PDF de factura (con reintentos; sólo para attach opcional)
+    let pdfUrl = invoice.invoice_pdf;
+    if (!pdfUrl) {
+      for (let i = 0; i < 3 && !pdfUrl; i++) {
+        await wait(3000);
+        try {
+          const inv2 = await stripe.invoices.retrieve(invoice.id);
+          pdfUrl = inv2.invoice_pdf || null;
+          console.log(`[invoice.retry] intento ${i + 1}: invoice_pdf ${pdfUrl ? 'OK' : 'aún no'}`);
+        } catch (e) {
+          console.warn('[invoice.retry] retrieve error:', e?.message || e);
         }
+      }
+    }
+
+    // Líneas de la factura (para recibo propio)
+    let invItems = [];
+    try {
+      const li = await stripe.invoices.listLineItems(invoice.id, {
+        limit: 100,
+        expand: ['data.price.product']
+      });
+      invItems = li?.data || [];
+    } catch (e) {
+      console.warn('[invoice.email] listLineItems error:', e?.message || e);
+    }
+
+    const isSubscription =
+      !!invoice.subscription || (Array.isArray(invItems) && invItems.some(it => it?.price?.recurring));
+    const currency = (invoice.currency || 'eur').toUpperCase();
+    const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
+    const invoiceNumber = invoice.number || invoice.id;
+
+    // 👉 NUEVO: preparar address del cliente para el PDF
+    const invoiceAddress =
+      invoice.customer_details?.address ||
+      invoice.customer_address || // Stripe a veces lo trae aquí
+      null;
+
+    const fallbackMetaAddr = {
+      line1:  invoice.metadata?.address || '',
+      line2:  '',
+      city:   invoice.metadata?.city    || '',
+      state:  '',
+      postal_code: invoice.metadata?.postal  || '',
+      country:     invoice.metadata?.country || ''
+    };
+
+    const customerForPDF = {
+      name,
+      email: to,
+      address: invoiceAddress || fallbackMetaAddr
+    };
+
+    const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
+
+    if (combine && to) {
+      // COMBINE=true → Confirmación + Recibo propio + (opcional) Factura Stripe
+      await sendCustomerOrderAndInvoiceEmail({
+        to, name, invoiceNumber, total, currency,
+        pdfUrl, lineItems: invItems,
+        brand: process.env.BRAND_NAME || "Guarros Extremeños",
+        isSubscription,
+        alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true',
+        customer: customerForPDF // 👉 NUEVO
+      });
+      console.log('📧 Email combinado (confirmación + recibo [+ factura]) enviado OK →', to);
+    } else {
+      // COMBINE=false → no se envía correo al cliente aquí
+      console.log('[invoice.email] combine=false → no se envía correo al cliente en invoice.payment_succeeded');
+    }
+  } catch (e) {
+    console.error('📧 invoice.payment_succeeded handler ERROR:', e);
+  }
+  console.log('✅ invoice.payment_succeeded', invoice.id);
+  break;
+}
+
 
         case 'invoice.payment_failed':
           console.warn('⚠️ invoice.payment_failed', event.data.object.id);
@@ -743,7 +766,12 @@ ${JSON.stringify(metadata || {}, null, 2)}
 }
 
 /* ---------- Email cliente (solo confirmación; SIN adjuntos) ---------- */
-async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand, isSubscription }) {
+async function sendCustomerOrderAndInvoiceEmail({
+  to, name, invoiceNumber, total, currency, pdfUrl, lineItems,
+  brand, isSubscription, alsoBccCorporate,
+  customer // <-- NUEVO
+}) {
+
   if (!to) { console.warn('[email cliente] Falta "to"'); return; }
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const replyTo = process.env.SUPPORT_EMAIL || supportEmail || 'soporte@guarrosextremenos.com';
@@ -833,12 +861,14 @@ async function sendCustomerOrderAndInvoiceEmail({
     : `✅ Confirmación de pedido — Factura ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand || BRAND}`;
 
   // Recibo propio (siempre)
-  const receiptBuf = await createPaidReceiptPDF({
-    invoiceNumber, total, currency, lineItems,
-    brand, logoUrl: BRAND_LOGO_URL,
-    customer: { name, email: to },
-    paidAt: new Date()
-  });
+const receiptBuf = await createPaidReceiptPDF({
+  invoiceNumber, total, currency, lineItems,
+  brand, logoUrl: BRAND_LOGO_URL,
+  customer: customer || { name, email: to }, // 👉 pasa la dirección si la tenemos
+  paidAt: new Date()
+});
+
+
   const receiptB64 = receiptBuf.toString('base64');
 
   const attachments = [{
