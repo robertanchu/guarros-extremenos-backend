@@ -512,7 +512,7 @@ async function createPaidReceiptPDF({
 
   // Cliente
   if (customer && (customer.name || customer.email || customer.address)) {
-    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111').text('Cliente');
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111').text('Cliente',{ align: 'right' });
     doc.moveDown(0.2);
     doc.font('Helvetica').fontSize(10);
     const custLines = [
@@ -609,7 +609,7 @@ doc.moveDown(0.8);
 // Sello PAGADO (resto tal y como lo tienes)
 doc.save();
 doc.rotate(-10, { origin: [400, doc.y] });
-doc.font('Helvetica-Bold').fontSize(28).fillColor('#16a34a');
+doc.font('Helvetica-Bold').fontSize(28).fillColor('#D62828');
 doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
 doc.restore();
 
