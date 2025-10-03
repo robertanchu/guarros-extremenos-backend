@@ -1,3 +1,4 @@
+// server.js (ESM)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -211,7 +212,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
             const invoiceNumber = invoice.number || invoice.id;
 
-            // Dirección del cliente para el PDF (enriquecida)
+            // Dirección enriquecida (PI → Charge → Customer → Sessions → metadata)
             const resolvedAddress = await resolveCheckoutAddress(stripe, invoice);
 
             const customerForPDF = {
@@ -223,7 +224,6 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
 
             if (combine && to) {
-              // COMBINE=true → Confirmación + Recibo propio + (opcional) Factura Stripe
               await sendCustomerOrderAndInvoiceEmail({
                 to, name, invoiceNumber, total, currency,
                 pdfUrl, lineItems: invItems,
@@ -234,7 +234,6 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               });
               console.log('📧 Email combinado (confirmación + recibo [+ factura]) enviado OK →', to);
             } else {
-              // COMBINE=false → no se envía correo al cliente aquí
               console.log('[invoice.email] combine=false → no se envía correo al cliente en invoice.payment_succeeded');
             }
           } catch (e) {
@@ -283,61 +282,69 @@ app.post('/create-checkout-session', async (req, res) => {
 
     const isSubscription = mode === 'subscription';
 
-// Si el front te pasa un customer.id existente, úsalo:
-const customerId = customer?.id && String(customer.id).startsWith('cus_') ? customer.id : undefined;
+    // Si el front te pasa un ID de Customer existente:
+    const customerId = customer?.id && String(customer.id).startsWith('cus_') ? customer.id : undefined;
 
-const sessionParams = {
-  mode,
-  line_items: items,
-  success_url,
-  cancel_url,
-  allow_promotion_codes: true,
+    const sessionParams = {
+      mode,
+      line_items: items,
+      success_url,
+      cancel_url,
+      allow_promotion_codes: true,
 
-  // Si ya tienes un Customer, pásalo; si no, crea uno nuevo siempre
-  ...(customerId ? { customer: customerId } : {
-    customer_email: customer?.email || undefined,
-    customer_creation: 'always', // crea un Customer para guardar datos
-  }),
+      // Si ya tienes un Customer, úsalo; si no, crea uno siempre
+      ...(customerId ? { customer: customerId } : {
+        customer_email: customer?.email || undefined,
+        customer_creation: 'always', // <- crea Customer para guardar datos
+      }),
 
-  // Forzar recogida de direcciones
-  billing_address_collection: 'required',
-  shipping_address_collection: { allowed_countries: ['ES', 'PT'] },
+      // Forzar recogida de direcciones
+      billing_address_collection: 'required',
+      shipping_address_collection: { allowed_countries: ['ES', 'PT'] },
 
-  // Metadatos (fallback de dirección por si hiciera falta luego)
-  metadata: {
-    ...(metadata || {}),
-    name:  customer?.name  ?? metadata?.name,
-    phone: customer?.phone ?? metadata?.phone,
-    address: shipping_address?.address     ?? metadata?.address,
-    city:    shipping_address?.city        ?? metadata?.city,
-    postal:  shipping_address?.postal_code ?? metadata?.postal,
-    country: shipping_address?.country     ?? metadata?.country,
-    source: (metadata?.source || 'guarros-front'),
-  },
-  phone_number_collection: { enabled: true },
-};
+      // Metadatos (fallback de dirección por si hiciera falta luego)
+      metadata: {
+        ...(metadata || {}),
+        name:  customer?.name  ?? metadata?.name,
+        phone: customer?.phone ?? metadata?.phone,
+        address: shipping_address?.address     ?? metadata?.address,
+        city:    shipping_address?.city        ?? metadata?.city,
+        postal:  shipping_address?.postal_code ?? metadata?.postal,
+        country: shipping_address?.country     ?? metadata?.country,
+        source: (metadata?.source || 'guarros-front'),
+      },
 
-// ⚠️ Solo puedes usar customer_update si estás pasando customer (ID existente)
-if (customerId) {
-  sessionParams.customer_update = { address: 'auto', name: 'auto', shipping: 'auto' };
-}
+      phone_number_collection: { enabled: true },
+    };
 
-// Facturación automática (solo pagos one-time; en subs la genera el ciclo)
-if (!isSubscription) {
-  sessionParams.invoice_creation = {
-    enabled: true,
-    invoice_data: {
-      description: 'Pedido web Guarros Extremeños',
-      footer: 'Gracias por su compra. Soporte: soporte@guarrosextremenos.com'
+    // ⚠️ Solo puedes usar customer_update si pasas customer (ID existente)
+    if (customerId) {
+      sessionParams.customer_update = { address: 'auto', name: 'auto', shipping: 'auto' };
     }
-  };
-}
 
-// Opcional: tarifa de envío fija
-if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
-  sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
-}
+    // Factura en pagos one-time (Stripe la genera tras el cobro)
+    if (!isSubscription) {
+      sessionParams.invoice_creation = {
+        enabled: true,
+        invoice_data: {
+          description: 'Pedido web Guarros Extremeños',
+          footer: 'Gracias por su compra. Soporte: soporte@guarrosextremenos.com'
+        }
+      };
+    }
 
+    // Envíos opcionales (si tienes rate configurado)
+    if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
+      sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionParams);
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('create-checkout-session error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ============================
 // ========== TESTS ===========
