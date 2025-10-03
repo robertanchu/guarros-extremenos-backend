@@ -211,106 +211,14 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
             const invoiceNumber = invoice.number || invoice.id;
 
-            // Dirección del cliente para el PDF
-const resolvedAddress = await buildAddressForInvoice(invoice);
+            // Dirección del cliente para el PDF (enriquecida)
+            const resolvedAddress = await resolveCheckoutAddress(stripe, invoice);
 
-const customerForPDF = {
-  name,
-  email: to,
-  address: resolvedAddress // <- ahora viene enriquecida
-};
-
-
-            const fallbackMetaAddr = {
-              line1:  invoice.metadata?.address || '',
-              line2:  '',
-              city:   invoice.metadata?.city    || '',
-              state:  '',
-              postal_code: invoice.metadata?.postal  || '',
-              country:     invoice.metadata?.country || ''
+            const customerForPDF = {
+              name,
+              email: to,
+              address: resolvedAddress
             };
-
-// Dirección del cliente para el PDF — enriquecida con múltiples fuentes
-async function buildAddressForInvoice(invoice) {
-  // 1) La propia factura
-  let addr =
-    invoice.customer_details?.address ||
-    invoice.customer_address ||
-    null;
-
-  // Normalizador para meter strings/objetos a un mismo formato
-  const normalize = (a, meta = {}) => {
-    if (!a && !meta) return null;
-    const addrObj = (a && typeof a === 'object') ? a : {};
-    const line1 = addrObj.line1 || meta.address || '';
-    const line2 = addrObj.line2 || '';
-    const city  = addrObj.city  || meta.city    || '';
-    const state = addrObj.state || '';
-    const postal_code = addrObj.postal_code || meta.postal || meta.postal_code || '';
-    const country = addrObj.country || meta.country || '';
-    if (!line1 && !city && !postal_code && !country) return null;
-    return { line1, line2, city, state, postal_code, country };
-  };
-
-  // 2) Si falta calle, intenta con el Customer
-  if (!addr || !addr.line1) {
-    try {
-      if (invoice.customer) {
-        const cust = await stripe.customers.retrieve(invoice.customer);
-        const fromCustomer = cust?.shipping?.address || cust?.address || null;
-        const norm = normalize(fromCustomer);
-        if (norm) return norm;
-      }
-    } catch (e) {
-      console.warn('[addr] stripe.customers.retrieve error:', e?.message || e);
-    }
-  } else {
-    const norm = normalize(addr);
-    if (norm) return norm;
-  }
-
-  // 3) Última Checkout Session del cliente (suele tener shipping_details/address completo)
-  try {
-    if (invoice.customer) {
-      const sessions = await stripe.checkout.sessions.list({
-        customer: invoice.customer,
-        limit: 5
-      });
-      // busca la más reciente completada
-      const completed = (sessions?.data || []).find(s => s.status === 'complete') || sessions?.data?.[0];
-      if (completed) {
-        const fromShip = completed.shipping_details?.address || null;
-        const normShip = normalize(fromShip);
-        if (normShip) return normShip;
-
-        // intentamos con metadata del checkout
-        const meta = completed.metadata || {};
-        const normMeta = normalize(null, {
-          address: meta.address,
-          city: meta.city,
-          postal: meta.postal,
-          country: meta.country
-        });
-        if (normMeta) return normMeta;
-      }
-    }
-  } catch (e) {
-    console.warn('[addr] sessions.list error:', e?.message || e);
-  }
-
-  // 4) Último recurso: metadata de la propia invoice
-  const normInvMeta = normalize(null, {
-    address: invoice.metadata?.address,
-    city: invoice.metadata?.city,
-    postal: invoice.metadata?.postal,
-    country: invoice.metadata?.country
-  });
-  if (normInvMeta) return normInvMeta;
-
-  // Si nada, al menos devuelve país si lo hubiera
-  return invoice.customer_details?.address || { country: invoice.customer_details?.address?.country || '' };
-}
-
 
             const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
 
@@ -383,6 +291,13 @@ app.post('/create-checkout-session', async (req, res) => {
       allow_promotion_codes: true,
       customer_email: customer?.email || undefined,
       customer_creation: 'if_required',
+
+      // 🔴 Forzar captura de dirección y guardado en Customer
+      billing_address_collection: 'required',
+      customer_update: { address: 'auto', name: 'auto', shipping: 'auto' },
+      phone_number_collection: { enabled: true },
+
+      // Metadatos con duplicado de datos de envío (fallback)
       metadata: {
         ...(metadata || {}),
         name: customer?.name || metadata?.name,
@@ -392,25 +307,25 @@ app.post('/create-checkout-session', async (req, res) => {
         postal: shipping_address?.postal_code || metadata?.postal,
         country: shipping_address?.country || metadata?.country,
         source: (metadata?.source || 'guarros-front')
-      },
-      billing_address_collection: 'auto'
+      }
     };
 
-    // Factura SIEMPRE en pagos únicos (Stripe Checkout genera la factura tras el cobro)
+    // Recogida de dirección de envío (para ambos modos)
+    sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
+
+    // Factura en pagos únicos (Stripe genera factura tras el cobro)
     if (!isSubscription) {
       sessionParams.invoice_creation = {
         enabled: true,
         invoice_data: {
-          // (NO usar collection_method aquí; Stripe Checkout no lo admite)
           description: 'Pedido web Guarros Extremeños',
           footer: 'Gracias por su compra. Soporte: soporte@guarrosextremenos.com'
         }
       };
     }
 
-    // Envíos opcionales
+    // Envíos opcionales (si tienes rate configurado)
     if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
-      sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
       sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
     }
 
@@ -743,6 +658,85 @@ async function createPaidReceiptPDF({
 
   doc.end();
   return await done;
+}
+
+/* ---------- Resolver dirección real del checkout ---------- */
+// Saca address de: invoice.customer_details.address -> PaymentIntent.latest_charge.shipping/billing -> Customer.shipping/address -> Checkout Session metadata
+async function resolveCheckoutAddress(stripeClient, invoice) {
+  const normalize = (a, meta = {}) => {
+    if (!a && !meta) return null;
+    const o = (a && typeof a === 'object') ? a : {};
+    const line1 = o.line1 || meta.address || '';
+    const line2 = o.line2 || '';
+    const city  = o.city  || meta.city    || '';
+    const state = o.state || '';
+    const postal_code = o.postal_code || meta.postal || meta.postal_code || '';
+    const country = o.country || meta.country || '';
+    if (!line1 && !city && !postal_code && !country) return null;
+    return { line1, line2, city, state, postal_code, country };
+  };
+
+  // 1) La propia invoice
+  let addr = invoice.customer_details?.address || invoice.customer_address || null;
+  let norm = normalize(addr);
+  if (norm) return norm;
+
+  // 2) PaymentIntent -> Charge -> shipping/billing
+  if (invoice.payment_intent) {
+    try {
+      const pi = await stripeClient.paymentIntents.retrieve(invoice.payment_intent, { expand: ['latest_charge'] });
+      let charge = pi.latest_charge;
+      if (charge && typeof charge !== 'object') {
+        charge = await stripeClient.charges.retrieve(charge);
+      }
+      const ship = charge?.shipping?.address || null;
+      const bill = charge?.billing_details?.address || null;
+      norm = normalize(ship) || normalize(bill);
+      if (norm) return norm;
+    } catch (e) {
+      console.warn('[resolveCheckoutAddress] PI/Charge error:', e?.message || e);
+    }
+  }
+
+  // 3) Customer
+  if (invoice.customer) {
+    try {
+      const cust = await stripeClient.customers.retrieve(invoice.customer);
+      norm = normalize(cust?.shipping?.address) || normalize(cust?.address);
+      if (norm) return norm;
+    } catch (e) {
+      console.warn('[resolveCheckoutAddress] customer error:', e?.message || e);
+    }
+  }
+
+  // 4) Últimas Checkout Sessions
+  try {
+    if (invoice.customer) {
+      const sessions = await stripeClient.checkout.sessions.list({ customer: invoice.customer, limit: 5 });
+      const completed = (sessions?.data || []).find(s => s.status === 'complete') || sessions?.data?.[0];
+      if (completed) {
+        norm = normalize(completed.shipping_details?.address);
+        if (norm) return norm;
+        const meta = completed.metadata || {};
+        norm = normalize(null, { address: meta.address, city: meta.city, postal: meta.postal, country: meta.country });
+        if (norm) return norm;
+      }
+    }
+  } catch (e) {
+    console.warn('[resolveCheckoutAddress] sessions.list error:', e?.message || e);
+  }
+
+  // 5) Metadata de la invoice
+  norm = normalize(null, {
+    address: invoice.metadata?.address,
+    city:    invoice.metadata?.city,
+    postal:  invoice.metadata?.postal,
+    country: invoice.metadata?.country
+  });
+  if (norm) return norm;
+
+  // 6) Último recurso: país si existe
+  return invoice.customer_details?.address || { country: invoice.customer_details?.address?.country || '' };
 }
 
 /* ---------- Email ADMIN ---------- */
