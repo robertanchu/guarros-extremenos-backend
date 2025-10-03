@@ -214,6 +214,13 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             // Dirección del cliente para el PDF
 const resolvedAddress = await buildAddressForInvoice(invoice);
 
+const customerForPDF = {
+  name,
+  email: to,
+  address: resolvedAddress // <- ahora viene enriquecida
+};
+
+
             const fallbackMetaAddr = {
               line1:  invoice.metadata?.address || '',
               line2:  '',
