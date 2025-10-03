@@ -715,7 +715,7 @@ async function createPaidReceiptPDF({
   // Sello PAGADO
   doc.save();
   doc.rotate(-10, { origin: [400, doc.y] });
-  doc.font('Helvetica-Bold').fontSize(28).fillColor('#16a34a');
+  doc.font('Helvetica-Bold').fontSize(28).fillColor('#D62828');
   doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
   doc.restore();
 
