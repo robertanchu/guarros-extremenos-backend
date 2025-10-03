@@ -116,7 +116,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
 
           const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
 
-          // CUANDO combine=false → Solo CONFIRMACIÓN (sin adjuntos) en checkout
+          // COMBINE=false → Solo CONFIRMACIÓN (sin adjuntos) en checkout
           if (!combine) {
             try {
               await sendCustomerEmail({
@@ -159,103 +159,101 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           break;
         }
 
-case 'invoice.payment_succeeded': {
-  const invoice = event.data.object;
-  try {
-    // Email destino
-    let to = invoice.customer_email || invoice.customer_details?.email || null;
-    if (!to && invoice.customer) {
-      try {
-        const cust = await stripe.customers.retrieve(invoice.customer);
-        to = cust?.email || null;
-      } catch (e) {
-        console.warn('[invoice.email] retrieve customer error:', e?.message || e);
-      }
-    }
+        case 'invoice.payment_succeeded': {
+          const invoice = event.data.object;
+          try {
+            // Email destino
+            let to = invoice.customer_email || invoice.customer_details?.email || null;
+            if (!to && invoice.customer) {
+              try {
+                const cust = await stripe.customers.retrieve(invoice.customer);
+                to = cust?.email || null;
+              } catch (e) {
+                console.warn('[invoice.email] retrieve customer error:', e?.message || e);
+              }
+            }
 
-    const name =
-      invoice.customer_name ||
-      invoice.customer_details?.name ||
-      invoice.customer?.name || '';
+            const name =
+              invoice.customer_name ||
+              invoice.customer_details?.name ||
+              invoice.customer?.name || '';
 
-    // PDF de factura (con reintentos; sólo para attach opcional)
-    let pdfUrl = invoice.invoice_pdf;
-    if (!pdfUrl) {
-      for (let i = 0; i < 3 && !pdfUrl; i++) {
-        await wait(3000);
-        try {
-          const inv2 = await stripe.invoices.retrieve(invoice.id);
-          pdfUrl = inv2.invoice_pdf || null;
-          console.log(`[invoice.retry] intento ${i + 1}: invoice_pdf ${pdfUrl ? 'OK' : 'aún no'}`);
-        } catch (e) {
-          console.warn('[invoice.retry] retrieve error:', e?.message || e);
+            // PDF de factura (con reintentos; sólo para attach opcional)
+            let pdfUrl = invoice.invoice_pdf;
+            if (!pdfUrl) {
+              for (let i = 0; i < 3 && !pdfUrl; i++) {
+                await wait(3000);
+                try {
+                  const inv2 = await stripe.invoices.retrieve(invoice.id);
+                  pdfUrl = inv2.invoice_pdf || null;
+                  console.log(`[invoice.retry] intento ${i + 1}: invoice_pdf ${pdfUrl ? 'OK' : 'aún no'}`);
+                } catch (e) {
+                  console.warn('[invoice.retry] retrieve error:', e?.message || e);
+                }
+              }
+            }
+
+            // Líneas de la factura (para recibo propio)
+            let invItems = [];
+            try {
+              const li = await stripe.invoices.listLineItems(invoice.id, {
+                limit: 100,
+                expand: ['data.price.product']
+              });
+              invItems = li?.data || [];
+            } catch (e) {
+              console.warn('[invoice.email] listLineItems error:', e?.message || e);
+            }
+
+            const isSubscription =
+              !!invoice.subscription || (Array.isArray(invItems) && invItems.some(it => it?.price?.recurring));
+            const currency = (invoice.currency || 'eur').toUpperCase();
+            const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
+            const invoiceNumber = invoice.number || invoice.id;
+
+            // Dirección del cliente para el PDF
+            const invoiceAddress =
+              invoice.customer_details?.address ||
+              invoice.customer_address || null;
+
+            const fallbackMetaAddr = {
+              line1:  invoice.metadata?.address || '',
+              line2:  '',
+              city:   invoice.metadata?.city    || '',
+              state:  '',
+              postal_code: invoice.metadata?.postal  || '',
+              country:     invoice.metadata?.country || ''
+            };
+
+            const customerForPDF = {
+              name,
+              email: to,
+              address: invoiceAddress || fallbackMetaAddr
+            };
+
+            const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
+
+            if (combine && to) {
+              // COMBINE=true → Confirmación + Recibo propio + (opcional) Factura Stripe
+              await sendCustomerOrderAndInvoiceEmail({
+                to, name, invoiceNumber, total, currency,
+                pdfUrl, lineItems: invItems,
+                brand: process.env.BRAND_NAME || "Guarros Extremeños",
+                isSubscription,
+                alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true',
+                customer: customerForPDF
+              });
+              console.log('📧 Email combinado (confirmación + recibo [+ factura]) enviado OK →', to);
+            } else {
+              // COMBINE=false → no se envía correo al cliente aquí
+              console.log('[invoice.email] combine=false → no se envía correo al cliente en invoice.payment_succeeded');
+            }
+          } catch (e) {
+            console.error('📧 invoice.payment_succeeded handler ERROR:', e);
+          }
+          console.log('✅ invoice.payment_succeeded', invoice.id);
+          break;
         }
-      }
-    }
-
-    // Líneas de la factura (para recibo propio)
-    let invItems = [];
-    try {
-      const li = await stripe.invoices.listLineItems(invoice.id, {
-        limit: 100,
-        expand: ['data.price.product']
-      });
-      invItems = li?.data || [];
-    } catch (e) {
-      console.warn('[invoice.email] listLineItems error:', e?.message || e);
-    }
-
-    const isSubscription =
-      !!invoice.subscription || (Array.isArray(invItems) && invItems.some(it => it?.price?.recurring));
-    const currency = (invoice.currency || 'eur').toUpperCase();
-    const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
-    const invoiceNumber = invoice.number || invoice.id;
-
-    // 👉 NUEVO: preparar address del cliente para el PDF
-    const invoiceAddress =
-      invoice.customer_details?.address ||
-      invoice.customer_address || // Stripe a veces lo trae aquí
-      null;
-
-    const fallbackMetaAddr = {
-      line1:  invoice.metadata?.address || '',
-      line2:  '',
-      city:   invoice.metadata?.city    || '',
-      state:  '',
-      postal_code: invoice.metadata?.postal  || '',
-      country:     invoice.metadata?.country || ''
-    };
-
-    const customerForPDF = {
-      name,
-      email: to,
-      address: invoiceAddress || fallbackMetaAddr
-    };
-
-    const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
-
-    if (combine && to) {
-      // COMBINE=true → Confirmación + Recibo propio + (opcional) Factura Stripe
-      await sendCustomerOrderAndInvoiceEmail({
-        to, name, invoiceNumber, total, currency,
-        pdfUrl, lineItems: invItems,
-        brand: process.env.BRAND_NAME || "Guarros Extremeños",
-        isSubscription,
-        alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true',
-        customer: customerForPDF // 👉 NUEVO
-      });
-      console.log('📧 Email combinado (confirmación + recibo [+ factura]) enviado OK →', to);
-    } else {
-      // COMBINE=false → no se envía correo al cliente aquí
-      console.log('[invoice.email] combine=false → no se envía correo al cliente en invoice.payment_succeeded');
-    }
-  } catch (e) {
-    console.error('📧 invoice.payment_succeeded handler ERROR:', e);
-  }
-  console.log('✅ invoice.payment_succeeded', invoice.id);
-  break;
-}
-
 
         case 'invoice.payment_failed':
           console.warn('⚠️ invoice.payment_failed', event.data.object.id);
@@ -461,6 +459,17 @@ async function createPaidReceiptPDF({
   brand = BRAND,
   logoUrl = BRAND_LOGO_URL,
 }) {
+  // Normaliza address (string u objeto tipo Stripe)
+  const addrObj = (customer.address && typeof customer.address === 'object') ? customer.address : null;
+  const line1   = addrObj?.line1 || (typeof customer.address === 'string' ? customer.address : '') || customer.line1 || '';
+  const line2   = addrObj?.line2 || customer.line2 || '';
+  const city    = customer.city || addrObj?.city || '';
+  const state   = customer.state || addrObj?.state || '';
+  const postal  = customer.postal || customer.postal_code || addrObj?.postal_code || customer.zip || '';
+  const country = customer.country || addrObj?.country || '';
+  const cityLine   = [postal, city || state].filter(Boolean).join(' ');
+  const addressStr = [line1, line2, cityLine, country].filter(Boolean).join('\n');
+
   const items = (lineItems || []).map(li => ({
     description: li?.description || 'Producto',
     quantity: li?.quantity || 1,
@@ -529,135 +538,111 @@ async function createPaidReceiptPDF({
     `Fecha de pago: ${paidFmt}`,
     `Estado: PAGADO`,
   ].join('\n');
-  doc.text(invText, rightX, topY, { align: 'right' });
+  doc.text(invText, rightX, topY, { align: 'left' });
 
   doc.moveDown(1);
 
-// --- Cliente (columna derecha, alineado a la derecha) ---
-if (customer && (customer.name || customer.email || customer.address || customer.city || customer.postal || customer.country)) {
-  // define columna derecha
-  const pageWidth = doc.page.width;
-  const { right } = doc.page.margins;
-  const colWidth = 260;                 // ancho de la columna derecha (ajustable)
-  const xRight   = pageWidth - right - colWidth;
+  // --- Cliente (columna derecha, alineado a la derecha) ---
+  if (customer && (customer.name || customer.email || addressStr)) {
+    const pageWidth = doc.page.width;
+    const { right } = doc.page.margins;
+    const colWidth = 260;
+    const xRight   = pageWidth - right - colWidth;
 
-  // Normaliza dirección desde distintos formatos
-  const addrObj = (customer.address && typeof customer.address === 'object') ? customer.address : null;
-  const line1   = addrObj?.line1 || customer.address?.line1 || (typeof customer.address === 'string' ? customer.address : '');
-  const line2   = addrObj?.line2 || customer.address?.line2 || '';
-  const city    = customer.city || addrObj?.city || '';
-  const state   = customer.state || addrObj?.state || '';
-  const postal  = customer.postal || customer.postal_code || addrObj?.postal_code || customer.zip || '';
-  const country = customer.country || addrObj?.country || '';
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111')
+       .text('Cliente', xRight, doc.y, { width: colWidth, align: 'right' });
 
-  const cityLine   = [postal, city || state].filter(Boolean).join(' ');
-  const addressStr = [line1, line2, cityLine, country].filter(Boolean).join('\n');
+    doc.moveDown(0.2);
 
-  // Título "Cliente" y contenido, todo a la derecha
-  doc.font('Helvetica-Bold').fontSize(11).fillColor('#111')
-     .text('Cliente', xRight, doc.y, { width: colWidth, align: 'right' });
+    doc.font('Helvetica').fontSize(10).fillColor('#111');
+    const custLines = [
+      customer.name,
+      customer.email,
+      addressStr || null
+    ].filter(Boolean).join('\n');
 
-  doc.moveDown(0.2);
+    doc.text(custLines || '-', xRight, doc.y, { width: colWidth, align: 'right' });
+  }
 
-  doc.font('Helvetica').fontSize(10).fillColor('#111');
-  const custLines = [
-    customer.name,
-    customer.email,
-    addressStr || null
-  ].filter(Boolean).join('\n');
+  doc.moveDown(0.8);
 
-  doc.text(custLines || '-', xRight, doc.y, { width: colWidth, align: 'right' });
-}
+  // --- Tabla: Cabecera alineada ---
+  doc.font('Helvetica-Bold').fontSize(10);
 
-  doc.moveDown(1.5);
+  // Definición de columnas (coincide con filas)
+  const xDesc = 56,  wDesc = 280;
+  const xQty  = 336, wQty  = 60;
+  const xTot  = 396, wTot  = 140;
 
-// --- Definición de columnas (una sola vez, antes de cabecera+filas) ---
-const xDesc = 56,  wDesc = 280;
-const xQty  = 336, wQty  = 60;
-const xTot  = 396, wTot  = 140;
+  // helper para medir altura sin mover cursor
+  const hOf = (text, width, options = {}) =>
+    doc.heightOfString(String(text ?? ''), { width, ...options });
 
-// helper para medir altura sin mover el cursor
-const hOf = (text, width, options = {}) =>
-  doc.heightOfString(String(text ?? ''), { width, ...options });
+  const headerY = doc.y;
+  const h1 = hOf('Concepto', wDesc, { align: 'left'  });
+  const h2 = hOf('Cant.',    wQty,  { align: 'right' });
+  const h3 = hOf('Total',    wTot,  { align: 'right' });
+  const headerH = Math.max(h1, h2, h3);
 
-// --- Cabecera alineada ---
-doc.font('Helvetica-Bold').fontSize(10);
+  doc.text('Concepto', xDesc, headerY, { width: wDesc, align: 'left'  });
+  doc.text('Cant.',    xQty,  headerY, { width: wQty,  align: 'right' });
+  doc.text('Total',    xTot,  headerY, { width: wTot,  align: 'right' });
 
-const headerY = doc.y;
-const h1 = hOf('Concepto', wDesc, { align: 'left'  });
-const h2 = hOf('Cantidad',    wQty,  { align: 'right' });
-const h3 = hOf('Total',    wTot,  { align: 'right' });
-const headerH = Math.max(h1, h2, h3);
+  // línea separadora
+  const sepY = headerY + headerH + 4;
+  doc.save();
+  doc.lineWidth(0.7).strokeColor('#e5e7eb')
+     .moveTo(56, sepY).lineTo(56 + 480, sepY).stroke();
+  doc.restore();
 
-// Pintar las 3 celdas a la MISMA y
-doc.text('Concepto', xDesc, headerY, { width: wDesc, align: 'left'  });
-doc.text('Cantidad',    xQty,  headerY, { width: wQty,  align: 'right' });
-doc.text('Total',    xTot,  headerY, { width: wTot,  align: 'right' });
+  // --- Filas (alineadas por fila) ---
+  doc.font('Helvetica').fontSize(10);
 
-// Separador bajo cabecera
-const sepY = headerY + headerH + 4; // padding inferior
-doc.save();
-doc.lineWidth(0.7).strokeColor('#e5e7eb')
-   .moveTo(56, sepY).lineTo(56 + 480, sepY).stroke();
-doc.restore();
+  let y = sepY + 6; // punto de inicio para las filas
+  let sumCents = 0;
 
-// Punto inicial de filas
-let y = sepY + 6;
-doc.y = y;
+  items.forEach((it) => {
+    const desc = it.description || 'Producto';
+    const qty  = `x${it.quantity || 1}`;
+    const totalCents = Number(it.totalCents || 0);
+    sumCents += totalCents;
+    const totalFmt = currencyFormat(totalCents / 100, it.currency);
 
+    const hDesc = hOf(desc, wDesc, { align: 'left'  });
+    const hQty  = hOf(qty,  wQty,  { align: 'right' });
+    const hTot  = hOf(totalFmt, wTot, { align: 'right' });
 
- // Filas (alineadas por fila)
-doc.font('Helvetica').fontSize(10);
+    const rowHeight = Math.max(hDesc, hQty, hTot);
+    const padY = 2;
 
-let sumCents = 0;
+    doc.text(desc,      xDesc, y, { width: wDesc, align: 'left'  });
+    doc.text(qty,       xQty,  y, { width: wQty,  align: 'right' });
+    doc.text(totalFmt,  xTot,  y, { width: wTot,  align: 'right' });
 
-items.forEach((it) => {
-  const desc = it.description || 'Producto';
-  const qty  = `x${it.quantity || 1}`;
-  const totalFmt = currencyFormat((Number(it.totalCents || 0)) / 100, it.currency);
-  const totalCents = Number(it.totalCents || 0);
-  sumCents += totalCents;
+    y += rowHeight + padY;
+  });
 
-  // Calcula altura de cada celda con su ancho
-  const hDesc = hOf(desc, wDesc, { align: 'left' });
-  const hQty  = hOf(qty,  wQty,  { align: 'right' });
-  const hTot  = hOf(totalFmt, wTot, { align: 'right' });
+  // Sitúa el cursor al final de la tabla
+  doc.y = y;
 
-  // La altura de la fila es la mayor de las celdas + espaciado
-  const rowHeight = Math.max(hDesc, hQty, hTot);
-  const padY = 2; // pequeño padding vertical entre filas
+  // Separador bajo filas
+  doc.moveDown(0.5);
+  doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
+  doc.moveDown(0.6);
 
-  // Dibuja las tres celdas a la MISMA y
-  doc.text(desc,      xDesc, y, { width: wDesc, align: 'left'  });
-  doc.text(qty,       xQty,  y, { width: wQty,  align: 'right' });
-  doc.text(totalFmt,  xTot,  y, { width: wTot,  align: 'right' });
+  // Total
+  doc.font('Helvetica-Bold').fontSize(11);
+  const sumFmt = currencyFormat(sumCents / 100, (currency || 'EUR'));
+  doc.text('Total pagado', 56, doc.y, { width: 340, align: 'left' });
+  doc.text(sumFmt,        396, doc.y, { width: 140, align: 'right' });
+  doc.moveDown(0.8);
 
-  // Avanza y para la siguiente fila
-  y += rowHeight + padY;
-});
-
-// Sitúa el cursor al final de la tabla
-doc.y = y;
-
-// Separador bajo filas
-doc.moveDown(0.5);
-doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
-doc.moveDown(0.6);
-
-// Total
-doc.font('Helvetica-Bold').fontSize(11);
-const sumFmt = currencyFormat(sumCents / 100, (currency || 'EUR'));
-doc.text('Total pagado', 56, doc.y, { width: 340, align: 'left' });
-doc.text(sumFmt,        396, doc.y, { width: 140, align: 'right' });
-doc.moveDown(0.8);
-
-// Sello PAGADO (resto tal y como lo tienes)
-doc.save();
-doc.rotate(-10, { origin: [400, doc.y] });
-doc.font('Helvetica-Bold').fontSize(28).fillColor('#D62828');
-doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
-doc.restore();
-
+  // Sello PAGADO
+  doc.save();
+  doc.rotate(-10, { origin: [400, doc.y] });
+  doc.font('Helvetica-Bold').fontSize(28).fillColor('#16a34a');
+  doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
+  doc.restore();
 
   // Pie (columna derecha)
   doc.moveDown(1.6);
@@ -672,7 +657,7 @@ doc.restore();
     'Este documento sirve como justificación de pago. Para información fiscal detallada, también se adjunta la factura oficial.',
     xRightCol,
     doc.y,
-    { width: colWidth, align: 'right' }
+    { width: colWidth, align: 'left' }
   );
 
   doc.end();
@@ -766,13 +751,7 @@ ${JSON.stringify(metadata || {}, null, 2)}
 }
 
 /* ---------- Email cliente (solo confirmación; SIN adjuntos) ---------- */
-async function sendCustomerOrderAndInvoiceEmail({
-  to, name, invoiceNumber, total, currency,
-        pdfUrl, lineItems: invItems,
-        isSubscription,
-        customer: customerForPDF
-}) {
-
+async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand, isSubscription }) {
   if (!to) { console.warn('[email cliente] Falta "to"'); return; }
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const replyTo = process.env.SUPPORT_EMAIL || supportEmail || 'soporte@guarrosextremenos.com';
@@ -849,7 +828,11 @@ async function sendCustomerOrderAndInvoiceEmail({
 }
 
 /* ---------- Email combinado: Confirmación + Recibo + (Factura Stripe opcional) ---------- */
-{
+async function sendCustomerOrderAndInvoiceEmail({
+  to, name, invoiceNumber, total, currency, pdfUrl, lineItems,
+  brand, isSubscription, alsoBccCorporate,
+  customer
+}) {
   if (!to)  { console.warn('[combined email] Falta "to"'); return; }
 
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
@@ -859,14 +842,12 @@ async function sendCustomerOrderAndInvoiceEmail({
     : `✅ Confirmación de pedido — Factura ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand || BRAND}`;
 
   // Recibo propio (siempre)
-const receiptBuf = await createPaidReceiptPDF({
-  invoiceNumber, total, currency, lineItems,
-  brand, logoUrl: BRAND_LOGO_URL,
-  customer: customer || { name, email: to }, // 👉 pasa la dirección si la tenemos
-  paidAt: new Date()
-});
-
-
+  const receiptBuf = await createPaidReceiptPDF({
+    invoiceNumber, total, currency, lineItems,
+    brand, logoUrl: BRAND_LOGO_URL,
+    customer: customer || { name, email: to },
+    paidAt: new Date()
+  });
   const receiptB64 = receiptBuf.toString('base64');
 
   const attachments = [{
@@ -941,16 +922,6 @@ const receiptBuf = await createPaidReceiptPDF({
       </tr>
     </tfoot>
   </table>
-</td></tr>
-<tr><td style="padding:8px 24px 16px; background:#ffffff;">
-  <p style="margin:0; font:13px system-ui; color:#374151;">
-    Adjuntamos tu recibo en PDF${attachStripe ? ' y la factura oficial de Stripe' : ''}.
-    ${invoiceNumber ? `Número de factura: <strong>${escapeHtml(invoiceNumber)}</strong>.` : ''}
-  </p>
-  <p style="margin:8px 0 0; font:13px system-ui; color:#374151;">
-    Para cualquier duda, responde a este correo o escríbenos a
-    <a href="mailto:${escapeHtml(replyTo)}" style="color:${BRAND_PRIMARY}; text-decoration:none;">${escapeHtml(replyTo)}</a>.
-  </p>
 </td></tr>`;
 
   const html = emailShell({
