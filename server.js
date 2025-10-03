@@ -522,7 +522,7 @@ async function createPaidReceiptPDF({
       [customer.postal, customer.city].filter(Boolean).join(' '),
       customer.country
     ].filter(Boolean).join('\n');
-    doc.text(custLines || '-', { width: 500, align: 'right' });
+    doc.text(custLines || '-', { width: 500 });
   }
   doc.moveDown(1.5);
 
