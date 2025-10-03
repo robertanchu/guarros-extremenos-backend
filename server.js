@@ -564,13 +564,6 @@ doc.y = y;
  // Filas (alineadas por fila)
 doc.font('Helvetica').fontSize(10);
 
-let y = doc.y; // punto de inicio para las filas
-
-// helper para medir altura de un texto con el ancho dado sin mover el cursor
-const hOf = (text, width, options={}) => {
-  return doc.heightOfString(String(text ?? ''), { width, ...options });
-};
-
 let sumCents = 0;
 
 items.forEach((it) => {
