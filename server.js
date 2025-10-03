@@ -564,11 +564,6 @@ doc.y = y;
  // Filas (alineadas por fila)
 doc.font('Helvetica').fontSize(10);
 
-// Definición de columnas
-const xDesc = 56,   wDesc = 280;
-const xQty  = 336,  wQty  = 60;
-const xTot  = 396,  wTot  = 140;
-
 let y = doc.y; // punto de inicio para las filas
 
 // helper para medir altura de un texto con el ancho dado sin mover el cursor
