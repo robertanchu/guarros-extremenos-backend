@@ -416,6 +416,137 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+app.post('/contact', async (req, res) => {
+  try {
+    const { name, email, message, company, source } = req.body || {};
+
+    // Honeypot simple
+    if (company && company.trim() !== '') {
+      return res.json({ ok: true }); // silencioso: parece OK pero no hace nada
+    }
+
+    if (!name || !email || !message) {
+      return res.status(400).json({ ok: false, error: 'Faltan campos requeridos.' });
+    }
+
+    const brand = process.env.BRAND_NAME || 'Guarros Extremeños';
+    const fromUser = process.env.CUSTOMER_FROM || 'soporte@guarrosextremenos.com';
+    const toUser = String(email).trim().toLowerCase();
+
+    const corpTo = process.env.CORPORATE_EMAIL || 'pedidos@tudominio.com';
+    const corpFrom = process.env.CORPORATE_FROM || fromUser;
+
+    const subjectUser = `Hemos recibido tu mensaje — ${brand}`;
+    const subjectCorp = `📨 Nuevo contacto — ${brand}`;
+
+    const plainUser = [
+      `Hola ${name},`,
+      ``,
+      `¡Gracias por escribirnos! Hemos recibido tu mensaje y te responderemos lo antes posible.`,
+      ``,
+      `Tu mensaje:`,
+      message,
+      ``,
+      `Un saludo,`,
+      `Equipo ${brand}`,
+      `soporte@guarrosextremenos.com`,
+    ].join('\n');
+
+    const htmlUser = `
+      <p>Hola ${escapeHtml(name)},</p>
+      <p>¡Gracias por escribirnos! Hemos recibido tu mensaje y te responderemos lo antes posible.</p>
+      <p style="color:#374151; white-space:pre-wrap; border-left:3px solid #e5e7eb; padding-left:10px;">${escapeHtml(message)}</p>
+      <p>Un saludo,<br/>Equipo ${escapeHtml(brand)}</p>
+    `;
+
+    const plainCorp = [
+      `Nuevo contacto desde la web (${source || 'contact'}):`,
+      ``,
+      `Nombre: ${name}`,
+      `Email: ${email}`,
+      ``,
+      `Mensaje:`,
+      message,
+    ].join('\n');
+
+    const htmlCorp = `
+      <p><strong>Nuevo contacto</strong> desde la web (${escapeHtml(source || 'contact')}):</p>
+      <p><strong>Nombre:</strong> ${escapeHtml(name)}<br/>
+         <strong>Email:</strong> ${escapeHtml(email)}</p>
+      <p style="color:#374151; white-space:pre-wrap; border-left:3px solid #e5e7eb; padding-left:10px;">${escapeHtml(message)}</p>
+    `;
+
+    // Envío con Resend si existe, si no con SMTP (fallback)
+    if (process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+
+      // Usuario
+      await resend.emails.send({
+        from: fromUser,
+        to: toUser,
+        subject: subjectUser,
+        text: plainUser,
+        html: emailShell({
+          title: subjectUser,
+          headerLabel: 'Mensaje recibido',
+          bodyHTML: `<tr><td style="padding:0 24px 16px; background:#ffffff;">${htmlUser}</td></tr>`,
+          footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}</p>`
+        }),
+      });
+
+      // Corporativo
+      await resend.emails.send({
+        from: corpFrom,
+        to: corpTo,
+        subject: subjectCorp,
+        text: plainCorp,
+        html: emailShell({
+          title: subjectCorp,
+          headerLabel: 'Nuevo contacto web',
+          bodyHTML: `<tr><td style="padding:0 24px 16px; background:#ffffff;">${htmlCorp}</td></tr>`,
+          footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(brand)}</p>`
+        }),
+      });
+    } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      // Usuario
+      await sendViaGmailSMTP({
+        from: fromUser,
+        to: toUser,
+        subject: subjectUser,
+        text: plainUser,
+        html: emailShell({
+          title: subjectUser,
+          headerLabel: 'Mensaje recibido',
+          bodyHTML: `<tr><td style="padding:0 24px 16px; background:#ffffff;">${htmlUser}</td></tr>`,
+          footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}</p>`
+        }),
+      });
+
+      // Corporativo
+      await sendViaGmailSMTP({
+        from: corpFrom,
+        to: corpTo,
+        subject: subjectCorp,
+        text: plainCorp,
+        html: emailShell({
+          title: subjectCorp,
+          headerLabel: 'Nuevo contacto web',
+          bodyHTML: `<tr><td style="padding:0 24px 16px; background:#ffffff;">${htmlCorp}</td></tr>`,
+          footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(brand)}</p>`
+        }),
+      });
+    } else {
+      return res.status(500).json({ ok: false, error: 'No hay proveedor de email configurado.' });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[POST /contact] error:', e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 // ============================
 // ========== TESTS ===========
 // ============================
