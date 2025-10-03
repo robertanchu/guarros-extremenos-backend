@@ -535,36 +535,70 @@ async function createPaidReceiptPDF({
   doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
   doc.moveDown(0.5);
 
-  // Filas
-  doc.font('Helvetica').fontSize(10);
-  let sumCents = 0;
-  items.forEach(it => {
-    const totalCents = Number(it.totalCents || 0);
-    sumCents += totalCents;
-    const totalFmt = currencyFormat(totalCents / 100, it.currency);
-    doc.text(it.description, 56, doc.y, { width: 280 });
-    doc.text(`x${it.quantity}`, 336, doc.y, { width: 60, align: 'right' });
-    doc.text(totalFmt, 396, doc.y, { width: 140, align: 'right' });
-    doc.moveDown(0.4);
-  });
+ // Filas (alineadas por fila)
+doc.font('Helvetica').fontSize(10);
 
-  doc.moveDown(0.5);
-  doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
-  doc.moveDown(0.6);
+// Definición de columnas
+const xDesc = 56,   wDesc = 280;
+const xQty  = 336,  wQty  = 60;
+const xTot  = 396,  wTot  = 140;
 
-  // Total
-  doc.font('Helvetica-Bold').fontSize(11);
-  const sumFmt = currencyFormat(sumCents / 100, (currency || 'EUR'));
-  doc.text('Total pagado', 56, doc.y, { width: 340, align: 'left' });
-  doc.text(sumFmt, 396, doc.y, { width: 140, align: 'right' });
-  doc.moveDown(0.8);
+let y = doc.y; // punto de inicio para las filas
 
-  // Sello PAGADO
-  doc.save();
-  doc.rotate(-10, { origin: [400, doc.y] });
-  doc.font('Helvetica-Bold').fontSize(28).fillColor('#16a34a');
-  doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
-  doc.restore();
+// helper para medir altura de un texto con el ancho dado sin mover el cursor
+const hOf = (text, width, options={}) => {
+  return doc.heightOfString(String(text ?? ''), { width, ...options });
+};
+
+let sumCents = 0;
+
+items.forEach((it) => {
+  const desc = it.description || 'Producto';
+  const qty  = `x${it.quantity || 1}`;
+  const totalFmt = currencyFormat((Number(it.totalCents || 0)) / 100, it.currency);
+  const totalCents = Number(it.totalCents || 0);
+  sumCents += totalCents;
+
+  // Calcula altura de cada celda con su ancho
+  const hDesc = hOf(desc, wDesc, { align: 'left' });
+  const hQty  = hOf(qty,  wQty,  { align: 'right' });
+  const hTot  = hOf(totalFmt, wTot, { align: 'right' });
+
+  // La altura de la fila es la mayor de las celdas + espaciado
+  const rowHeight = Math.max(hDesc, hQty, hTot);
+  const padY = 2; // pequeño padding vertical entre filas
+
+  // Dibuja las tres celdas a la MISMA y
+  doc.text(desc,      xDesc, y, { width: wDesc, align: 'left'  });
+  doc.text(qty,       xQty,  y, { width: wQty,  align: 'right' });
+  doc.text(totalFmt,  xTot,  y, { width: wTot,  align: 'right' });
+
+  // Avanza y para la siguiente fila
+  y += rowHeight + padY;
+});
+
+// Sitúa el cursor al final de la tabla
+doc.y = y;
+
+// Separador bajo filas
+doc.moveDown(0.5);
+doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
+doc.moveDown(0.6);
+
+// Total
+doc.font('Helvetica-Bold').fontSize(11);
+const sumFmt = currencyFormat(sumCents / 100, (currency || 'EUR'));
+doc.text('Total pagado', 56, doc.y, { width: 340, align: 'left' });
+doc.text(sumFmt,        396, doc.y, { width: 140, align: 'right' });
+doc.moveDown(0.8);
+
+// Sello PAGADO (resto tal y como lo tienes)
+doc.save();
+doc.rotate(-10, { origin: [400, doc.y] });
+doc.font('Helvetica-Bold').fontSize(28).fillColor('#16a34a');
+doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
+doc.restore();
+
 
   // Pie (columna derecha)
   doc.moveDown(1.6);
