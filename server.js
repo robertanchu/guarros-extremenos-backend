@@ -524,7 +524,7 @@ async function createPaidReceiptPDF({
     ].filter(Boolean).join('\n');
     doc.text(custLines || '-', { width: 500 });
   }
-  doc.moveDown(0.8);
+  doc.moveDown(1.5);
 
 // --- Definición de columnas (una sola vez, antes de cabecera+filas) ---
 const xDesc = 56,  wDesc = 280;
@@ -540,7 +540,7 @@ doc.font('Helvetica-Bold').fontSize(10);
 
 const headerY = doc.y;
 const h1 = hOf('Concepto', wDesc, { align: 'left'  });
-const h2 = hOf('Cant.',    wQty,  { align: 'right' });
+const h2 = hOf('Cantidad',    wQty,  { align: 'right' });
 const h3 = hOf('Total',    wTot,  { align: 'right' });
 const headerH = Math.max(h1, h2, h3);
 
