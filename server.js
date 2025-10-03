@@ -510,20 +510,42 @@ async function createPaidReceiptPDF({
 
   doc.moveDown(1);
 
-  // Cliente
-  if (customer && (customer.name || customer.email || customer.address)) {
-    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111').text('Cliente',{ align: 'right' });
-    doc.moveDown(0.2);
-    doc.font('Helvetica').fontSize(10);
-    const custLines = [
-      customer.name,
-      customer.email,
-      customer.address,
-      [customer.postal, customer.city].filter(Boolean).join(' '),
-      customer.country
-    ].filter(Boolean).join('\n');
-    doc.text(custLines || '-', { width: 500 });
-  }
+// --- Cliente (columna derecha, alineado a la derecha) ---
+if (customer && (customer.name || customer.email || customer.address || customer.city || customer.postal || customer.country)) {
+  // define columna derecha
+  const pageWidth = doc.page.width;
+  const { right } = doc.page.margins;
+  const colWidth = 260;                 // ancho de la columna derecha (ajustable)
+  const xRight   = pageWidth - right - colWidth;
+
+  // Normaliza dirección desde distintos formatos
+  const addrObj = (customer.address && typeof customer.address === 'object') ? customer.address : null;
+  const line1   = addrObj?.line1 || customer.address?.line1 || (typeof customer.address === 'string' ? customer.address : '');
+  const line2   = addrObj?.line2 || customer.address?.line2 || '';
+  const city    = customer.city || addrObj?.city || '';
+  const state   = customer.state || addrObj?.state || '';
+  const postal  = customer.postal || customer.postal_code || addrObj?.postal_code || customer.zip || '';
+  const country = customer.country || addrObj?.country || '';
+
+  const cityLine   = [postal, city || state].filter(Boolean).join(' ');
+  const addressStr = [line1, line2, cityLine, country].filter(Boolean).join('\n');
+
+  // Título "Cliente" y contenido, todo a la derecha
+  doc.font('Helvetica-Bold').fontSize(11).fillColor('#111')
+     .text('Cliente', xRight, doc.y, { width: colWidth, align: 'right' });
+
+  doc.moveDown(0.2);
+
+  doc.font('Helvetica').fontSize(10).fillColor('#111');
+  const custLines = [
+    customer.name,
+    customer.email,
+    addressStr || null
+  ].filter(Boolean).join('\n');
+
+  doc.text(custLines || '-', xRight, doc.y, { width: colWidth, align: 'right' });
+}
+
   doc.moveDown(1.5);
 
 // --- Definición de columnas (una sola vez, antes de cabecera+filas) ---
