@@ -769,7 +769,6 @@ ${JSON.stringify(metadata || {}, null, 2)}
 async function sendCustomerOrderAndInvoiceEmail({
   to, name, invoiceNumber, total, currency,
         pdfUrl, lineItems: invItems,
-        brand: process.env.BRAND_NAME || "Guarros Extremeños",
         isSubscription,
         alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true',
         customer: customerForPDF
