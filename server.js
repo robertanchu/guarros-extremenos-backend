@@ -841,6 +841,92 @@ async function sendCustomerOrderAndInvoiceEmail({
     content: receiptB64
   }];
 
+/* ---------- Email SOLO factura (cuando COMBINE=false) ---------- */
+async function sendInvoiceEmail({
+  to, name, invoiceNumber, total, currency, pdfUrl,
+  brand = process.env.BRAND_NAME || "Guarros Extremeños",
+  alsoToCorporate = false
+}) {
+  if (!to) { console.warn('[sendInvoiceEmail] Falta "to"'); return; }
+
+  const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
+  const replyTo = process.env.SUPPORT_EMAIL || 'soporte@guarrosextremenos.com';
+
+  // descarga el PDF de Stripe y lo adjunta
+  let attachments = [];
+  if (pdfUrl) {
+    try {
+      const resp = await fetch(pdfUrl);
+      if (resp.ok) {
+        const b64 = Buffer.from(await resp.arrayBuffer()).toString('base64');
+        attachments.push({
+          filename: `Factura-${invoiceNumber || 'pedido'}.pdf`,
+          content: b64
+        });
+      } else {
+        console.warn('[sendInvoiceEmail] No se pudo descargar invoice_pdf:', resp.status);
+      }
+    } catch (e) {
+      console.warn('[sendInvoiceEmail] Error descargando invoice_pdf:', e?.message || e);
+    }
+  }
+
+  const totalFmt = currencyFormat(Number(total || 0), currency || 'EUR');
+  const subject = `🧾 Factura ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand}`;
+
+  const text = [
+    name ? `Hola ${name},` : 'Hola,', '',
+    `Adjuntamos tu factura en PDF.`,
+    `Importe: ${totalFmt}`,
+    invoiceNumber ? `Número de factura: ${invoiceNumber}` : '',
+    '', `Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.`,
+    '', `Un saludo,`, `Equipo ${brand}`
+  ].join('\n');
+
+  const bodyHTML = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">Adjuntamos tu factura en PDF.</p>
+  <p style="margin:0 0 6px; font:14px system-ui; color:#111827;"><strong>Importe:</strong> ${escapeHtml(totalFmt)}</p>
+  ${invoiceNumber ? `<p style="margin:0 0 6px; font:14px system-ui; color:#111827;"><strong>Nº factura:</strong> ${escapeHtml(invoiceNumber)}</p>` : ''}
+  <p style="margin:8px 0 0; font:13px system-ui; color:#374151;">
+    Para cualquier duda, responde a este correo o escríbenos a
+    <a href="mailto:${escapeHtml(replyTo)}" style="color:${BRAND_PRIMARY}; text-decoration:none;">${escapeHtml(replyTo)}</a>.
+  </p>
+</td></tr>`;
+
+  const html = emailShell({
+    title: 'Factura',
+    headerLabel: 'Factura',
+    bodyHTML,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}. Todos los derechos reservados.</p>`
+  });
+
+  // BCC corporativo opcional para archivo
+  const bccList = [];
+  if (alsoToCorporate && process.env.CORPORATE_EMAIL) {
+    const corp = (process.env.CORPORATE_EMAIL || '').toLowerCase();
+    const dest = String(to || '').toLowerCase();
+    if (corp && corp !== dest) bccList.push(process.env.CORPORATE_EMAIL);
+  }
+
+  // Enviar por Resend o SMTP
+  if (process.env.RESEND_API_KEY) {
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({
+      from, to, ...(bccList.length ? { bcc: bccList } : {}),
+      reply_to: replyTo, subject, text, html, attachments
+    });
+    return;
+  }
+  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    await sendViaGmailSMTP({ from, to, subject, text, html, attachments });
+    return;
+  }
+  console.warn('[sendInvoiceEmail] Sin proveedor email configurado');
+}
+
+
   // Factura Stripe (opcional)
   const attachStripe = String(process.env.ATTACH_STRIPE_INVOICE || 'true').toLowerCase() !== 'false';
   if (attachStripe && pdfUrl) {
