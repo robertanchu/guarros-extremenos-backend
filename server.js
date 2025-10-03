@@ -265,6 +265,60 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 // Crear sesión de Checkout
+// Helper: busca o crea Customer por email y lo rellena con dirección/envío
+async function upsertStripeCustomerFromFront(stripe, payload) {
+  const email = payload?.customer?.email;
+  if (!email) return null;
+
+  // Normaliza address desde body
+  const addr = {
+    line1:       payload?.shipping_address?.address     || payload?.metadata?.address || '',
+    line2:       payload?.shipping_address?.line2       || '',
+    city:        payload?.shipping_address?.city        || payload?.metadata?.city || '',
+    postal_code: payload?.shipping_address?.postal_code || payload?.metadata?.postal || '',
+    country:     payload?.shipping_address?.country     || payload?.metadata?.country || 'ES',
+    state:       payload?.shipping_address?.state       || '',
+  };
+  const hasLine1 = !!addr.line1;
+
+  // 1) Intenta encontrar Customer por email
+  let customer = null;
+  try {
+    const list = await stripe.customers.list({ email, limit: 1 });
+    customer = list.data[0] || null;
+  } catch (e) {
+    console.warn('[upsertCustomer] list error:', e?.message || e);
+  }
+
+  // 2) Crea o actualiza con name/phone/address/shipping
+  const base = {
+    email,
+    name:  payload?.customer?.name  || payload?.metadata?.name  || undefined,
+    phone: payload?.customer?.phone || payload?.metadata?.phone || undefined,
+  };
+
+  try {
+    if (!customer) {
+      customer = await stripe.customers.create({
+        ...base,
+        ...(hasLine1 ? { address: addr, shipping: { name: base.name || email, address: addr } } : {})
+      });
+    } else {
+      // Solo actualiza si tenemos dirección del front; si no, conserva lo que hubiera
+      const update = { ...base };
+      if (hasLine1) {
+        update.address  = addr;
+        update.shipping = { name: base.name || customer.name || email, address: addr };
+      }
+      customer = await stripe.customers.update(customer.id, update);
+    }
+  } catch (e) {
+    console.warn('[upsertCustomer] create/update error:', e?.message || e);
+  }
+
+  return customer;
+}
+
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const {
@@ -282,9 +336,27 @@ app.post('/create-checkout-session', async (req, res) => {
 
     const isSubscription = mode === 'subscription';
 
-    // Si el front te pasa un ID de Customer existente:
-    const customerId = customer?.id && String(customer.id).startsWith('cus_') ? customer.id : undefined;
+    // ¿Trae el front dirección completa? => intentamos pre-crear/actualizar Customer para no preguntar en Stripe
+    const hasFrontAddress =
+      !!(shipping_address?.address || metadata?.address) &&
+      !!(shipping_address?.city    || metadata?.city) &&
+      !!(shipping_address?.postal  || shipping_address?.postal_code || metadata?.postal);
 
+    let customerId;
+    if (customer?.id && String(customer.id).startsWith('cus_')) {
+      // Nos dieron un Customer ya existente
+      customerId = customer.id;
+    } else if (hasFrontAddress && (customer?.email || metadata?.email)) {
+      // “Upsert” por email con la dirección del front
+      const cust = await upsertStripeCustomerFromFront(stripe, {
+        customer: { email: customer?.email || metadata?.email, name: customer?.name, phone: customer?.phone },
+        shipping_address,
+        metadata
+      });
+      customerId = cust?.id;
+    }
+
+    // Construye params de sesión
     const sessionParams = {
       mode,
       line_items: items,
@@ -292,17 +364,13 @@ app.post('/create-checkout-session', async (req, res) => {
       cancel_url,
       allow_promotion_codes: true,
 
-      // Si ya tienes un Customer, úsalo; si no, crea uno siempre
-      ...(customerId ? { customer: customerId } : {
-        customer_email: customer?.email || undefined,
-        customer_creation: 'always', // <- crea Customer para guardar datos
-      }),
+      // Si tenemos customerId => no pedimos otra vez; si no, dejamos que Stripe lo pida
+      ...(customerId
+        ? { customer: customerId, billing_address_collection: 'auto' } // Stripe no vuelve a pedir si ya lo tiene
+        : { customer_email: customer?.email || metadata?.email, customer_creation: 'always', billing_address_collection: 'required' }
+      ),
 
-      // Forzar recogida de direcciones
-      billing_address_collection: 'required',
-      shipping_address_collection: { allowed_countries: ['ES', 'PT'] },
-
-      // Metadatos (fallback de dirección por si hiciera falta luego)
+      // Metadatos de respaldo (por si luego tenemos que reconstruir dirección en el webhook)
       metadata: {
         ...(metadata || {}),
         name:  customer?.name  ?? metadata?.name,
@@ -317,12 +385,14 @@ app.post('/create-checkout-session', async (req, res) => {
       phone_number_collection: { enabled: true },
     };
 
-    // ⚠️ Solo puedes usar customer_update si pasas customer (ID existente)
-    if (customerId) {
-      sessionParams.customer_update = { address: 'auto', name: 'auto', shipping: 'auto' };
+    // Solo pedimos shipping en Stripe si NO tenemos customer con shipping.
+    // Si ya pre-creamos el Customer con shipping, NO añadimos shipping_address_collection (evita el segundo formulario).
+    if (!customerId) {
+      // Caso en que Stripe debe pedir dirección de envío (y/o la factura)
+      sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
     }
 
-    // Factura en pagos one-time (Stripe la genera tras el cobro)
+    // Factura en pagos únicos
     if (!isSubscription) {
       sessionParams.invoice_creation = {
         enabled: true,
@@ -333,7 +403,7 @@ app.post('/create-checkout-session', async (req, res) => {
       };
     }
 
-    // Envíos opcionales (si tienes rate configurado)
+    // Envío opcional (tarifa fija). Esto no fuerza formulario si el Customer ya tiene shipping.
     if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
       sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
     }
