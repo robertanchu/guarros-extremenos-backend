@@ -831,7 +831,7 @@ async function sendCustomerOrderAndInvoiceEmail({
     const resp = await fetch(pdfUrl);
     if (resp.ok) {
       const stripeB64 = Buffer.from(await resp.arrayBuffer()).toString('base64');
-      attachments.push({ filename: `Factura-${invoiceNumber || 'pedido'}.pdf', content: stripeB64 });
+      attachments.push({ filename: `Factura-${invoiceNumber || 'pedido'}.pdf`, content: stripeB64 });
     } else {
       console.warn('[combined email] No se pudo descargar PDF de Stripe:', resp.status);
     }
