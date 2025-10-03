@@ -283,59 +283,61 @@ app.post('/create-checkout-session', async (req, res) => {
 
     const isSubscription = mode === 'subscription';
 
-    const sessionParams = {
-      mode,
-      line_items: items,
-      success_url,
-      cancel_url,
-      allow_promotion_codes: true,
-      customer_email: customer?.email || undefined,
-      customer_creation: 'if_required',
+// Si el front te pasa un customer.id existente, úsalo:
+const customerId = customer?.id && String(customer.id).startsWith('cus_') ? customer.id : undefined;
 
-      // 🔴 Forzar captura de dirección y guardado en Customer
-      billing_address_collection: 'required',
-      customer_update: { address: 'auto', name: 'auto', shipping: 'auto' },
-      phone_number_collection: { enabled: true },
+const sessionParams = {
+  mode,
+  line_items: items,
+  success_url,
+  cancel_url,
+  allow_promotion_codes: true,
 
-      // Metadatos con duplicado de datos de envío (fallback)
-      metadata: {
-        ...(metadata || {}),
-        name: customer?.name || metadata?.name,
-        phone: customer?.phone || metadata?.phone,
-        address: shipping_address?.address || metadata?.address,
-        city: shipping_address?.city || metadata?.city,
-        postal: shipping_address?.postal_code || metadata?.postal,
-        country: shipping_address?.country || metadata?.country,
-        source: (metadata?.source || 'guarros-front')
-      }
-    };
+  // Si ya tienes un Customer, pásalo; si no, crea uno nuevo siempre
+  ...(customerId ? { customer: customerId } : {
+    customer_email: customer?.email || undefined,
+    customer_creation: 'always', // crea un Customer para guardar datos
+  }),
 
-    // Recogida de dirección de envío (para ambos modos)
-    sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
+  // Forzar recogida de direcciones
+  billing_address_collection: 'required',
+  shipping_address_collection: { allowed_countries: ['ES', 'PT'] },
 
-    // Factura en pagos únicos (Stripe genera factura tras el cobro)
-    if (!isSubscription) {
-      sessionParams.invoice_creation = {
-        enabled: true,
-        invoice_data: {
-          description: 'Pedido web Guarros Extremeños',
-          footer: 'Gracias por su compra. Soporte: soporte@guarrosextremenos.com'
-        }
-      };
+  // Metadatos (fallback de dirección por si hiciera falta luego)
+  metadata: {
+    ...(metadata || {}),
+    name:  customer?.name  ?? metadata?.name,
+    phone: customer?.phone ?? metadata?.phone,
+    address: shipping_address?.address     ?? metadata?.address,
+    city:    shipping_address?.city        ?? metadata?.city,
+    postal:  shipping_address?.postal_code ?? metadata?.postal,
+    country: shipping_address?.country     ?? metadata?.country,
+    source: (metadata?.source || 'guarros-front'),
+  },
+  phone_number_collection: { enabled: true },
+};
+
+// ⚠️ Solo puedes usar customer_update si estás pasando customer (ID existente)
+if (customerId) {
+  sessionParams.customer_update = { address: 'auto', name: 'auto', shipping: 'auto' };
+}
+
+// Facturación automática (solo pagos one-time; en subs la genera el ciclo)
+if (!isSubscription) {
+  sessionParams.invoice_creation = {
+    enabled: true,
+    invoice_data: {
+      description: 'Pedido web Guarros Extremeños',
+      footer: 'Gracias por su compra. Soporte: soporte@guarrosextremenos.com'
     }
+  };
+}
 
-    // Envíos opcionales (si tienes rate configurado)
-    if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
-      sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
-    }
+// Opcional: tarifa de envío fija
+if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
+  sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
+}
 
-    const session = await stripe.checkout.sessions.create(sessionParams);
-    res.json({ url: session.url });
-  } catch (err) {
-    console.error('create-checkout-session error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // ============================
 // ========== TESTS ===========
