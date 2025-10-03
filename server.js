@@ -849,12 +849,7 @@ async function sendCustomerOrderAndInvoiceEmail({
 }
 
 /* ---------- Email combinado: Confirmación + Recibo + (Factura Stripe opcional) ---------- */
-async function sendCustomerOrderAndInvoiceEmail({
-to, name, invoiceNumber, total, currency,
-        pdfUrl, lineItems: invItems,
-        isSubscription,
-        customer: customerForPDF
-}) {
+{
   if (!to)  { console.warn('[combined email] Falta "to"'); return; }
 
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
