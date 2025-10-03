@@ -14,6 +14,19 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+/*
+ENV recomendadas:
+- STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
+- RESEND_API_KEY  (o SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS)
+- DATABASE_URL    (SSL on, rejectUnauthorized=false)
+- CORPORATE_EMAIL, CORPORATE_FROM, CUSTOMER_FROM, SUPPORT_EMAIL
+- BRAND_NAME, BRAND_PRIMARY (#D62828), BRAND_LOGO_URL
+- ALLOWED_ORIGINS (comma), ALLOWED_DOMAINS (comma)
+- COMBINE_CONFIRMATION_AND_INVOICE = true|false
+- ATTACH_STRIPE_INVOICE = true|false
+- COMPANY_NAME, COMPANY_TAX_ID, COMPANY_ADDRESS, COMPANY_CITY, COMPANY_POSTAL, COMPANY_COUNTRY, RECEIPT_SERIE
+*/
+
 // ---------- CORS ----------
 const exactOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -42,12 +55,12 @@ const corsOptions = {
 
 app.use(morgan('tiny'));
 
-// Helper espera (reintentos)
+// Helper espera
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ======================================================
-// ==========   WEBHOOK STRIPE (ACK RÁPIDO)    ==========
-// ======================================================
+/* ======================================================
+   ==========   WEBHOOK STRIPE (ACK RÁPIDO)    ==========
+   ====================================================== */
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -93,7 +106,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             session.mode === 'subscription' ||
             (Array.isArray(lineItems) && lineItems.some(li => li?.price?.recurring));
 
-          // Email admin (siempre)
+          // Email admin
           try {
             await sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping });
             console.log('📧 Email admin enviado OK');
@@ -101,8 +114,9 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             console.error('📧 Email admin ERROR:', e);
           }
 
-          // Cliente: saltar aquí si combinamos con factura
           const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
+
+          // CUANDO combine=false → Solo CONFIRMACIÓN (sin adjuntos) en checkout
           if (!combine) {
             try {
               await sendCustomerEmail({
@@ -112,12 +126,12 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
                 brand: process.env.BRAND_NAME || "Guarros Extremeños",
                 isSubscription,
               });
-              console.log('📧 Email cliente enviado OK (checkout.session.completed)');
+              console.log('📧 Email cliente enviado OK (solo confirmación)');
             } catch (e) {
-              console.error('📧 Email cliente ERROR:', e);
+              console.error('📧 Email cliente (confirmación) ERROR:', e);
             }
           } else {
-            console.log('📧 [combine=true] Saltamos email cliente en checkout; se enviará con la factura.');
+            console.log('📧 [combine=true] No enviamos correo al cliente en checkout; se enviará combinado en invoice.payment_succeeded');
           }
 
           // Registro en DB
@@ -164,7 +178,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               invoice.customer_details?.name ||
               invoice.customer?.name || '';
 
-            // PDF de factura (con reintentos)
+            // PDF de factura (con reintentos; sólo para attach opcional)
             let pdfUrl = invoice.invoice_pdf;
             if (!pdfUrl) {
               for (let i = 0; i < 3 && !pdfUrl; i++) {
@@ -179,7 +193,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               }
             }
 
-            // Líneas de la factura
+            // Líneas de la factura (para recibo propio)
             let invItems = [];
             try {
               const li = await stripe.invoices.listLineItems(invoice.id, {
@@ -198,7 +212,9 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             const invoiceNumber = invoice.number || invoice.id;
 
             const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
+
             if (combine && to) {
+              // COMBINE=true → Confirmación + Recibo propio + (opcional) Factura Stripe
               await sendCustomerOrderAndInvoiceEmail({
                 to, name, invoiceNumber, total, currency,
                 pdfUrl, lineItems: invItems,
@@ -206,16 +222,10 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
                 isSubscription,
                 alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true'
               });
-              console.log('📧 Email combinado (confirmación + factura/recibo) enviado OK →', to);
-            } else if (to && pdfUrl) {
-              await sendInvoiceEmail({
-                to, name, invoiceNumber, total, currency, pdfUrl,
-                brand: process.env.BRAND_NAME || "Guarros Extremeños",
-                alsoToCorporate: String(process.env.INVOICE_BCC_CORPORATE || '').toLowerCase() === 'true',
-              });
-              console.log('📧 Factura enviada al cliente OK →', to);
+              console.log('📧 Email combinado (confirmación + recibo [+ factura]) enviado OK →', to);
             } else {
-              console.warn('[invoice.email] Falta to o pdfUrl → no se envía email', { to, pdfUrl });
+              // COMBINE=false → no se envía correo al cliente aquí
+              console.log('[invoice.email] combine=false → no se envía correo al cliente en invoice.payment_succeeded');
             }
           } catch (e) {
             console.error('📧 invoice.payment_succeeded handler ERROR:', e);
@@ -313,45 +323,6 @@ app.post('/create-checkout-session', async (req, res) => {
 // ============================
 // ========== TESTS ===========
 // ============================
-app.get('/test-db-ping', async (req, res) => {
-  try {
-    if (!pool) throw new Error('DATABASE_URL no configurado');
-    const r = await pool.query('select now() as now');
-    res.json({ ok: true, now: r.rows[0].now });
-  } catch (e) {
-    console.error('[/test-db-ping] error:', e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.post('/test-db-insert', async (req, res) => {
-  try {
-    if (!pool) throw new Error('DATABASE_URL no configurado');
-    await pool.query(
-      `insert into orders (session_id, email, name, total, currency, items, metadata, shipping, status, created_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       on conflict (session_id) do nothing`,
-      [
-        'test_session_' + Date.now(),
-        'test@example.com',
-        'Pedido de prueba',
-        12.34,
-        'EUR',
-        JSON.stringify([]),
-        JSON.stringify({ test: true }),
-        JSON.stringify({}),
-        'paid',
-        new Date().toISOString()
-      ]
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[/test-db-insert] error:', e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Test email admin
 app.post('/test-email', async (req, res) => {
   try {
     const to = process.env.CORPORATE_EMAIL || (process.env.SMTP_USER || 'destino@tudominio.com');
@@ -372,44 +343,13 @@ app.post('/test-email', async (req, res) => {
   }
 });
 
-// Test email cliente (no suscripción)
-app.post('/test-email-customer', async (req, res) => {
+app.get('/health-db', async (req, res) => {
   try {
-    const to = req.body?.to || req.query?.to || 'tu@correo.com';
-    await sendCustomerEmail({
-      to,
-      name: 'Cliente Test',
-      amountTotal: 123.45,
-      currency: 'EUR',
-      orderId: 'test_' + Date.now(),
-      lineItems: [{ description: 'Jamón Canalla', quantity: 1, amount_total: 9999, currency: 'eur' }],
-      brand: process.env.BRAND_NAME || "Guarros Extremeños",
-      isSubscription: false
-    });
-    res.json({ ok: true, to });
+    if (!pool) throw new Error('DATABASE_URL no configurado');
+    const r = await pool.query('select now() as now');
+    res.json({ ok: true, now: r.rows[0].now });
   } catch (e) {
-    console.error('[/test-email-customer] error:', e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Test email cliente suscripción
-app.post('/test-email-customer-sub', async (req, res) => {
-  try {
-    const to = req.body?.to || req.query?.to || 'tu@correo.com';
-    await sendCustomerEmail({
-      to,
-      name: 'Cliente Suscripción',
-      amountTotal: 70.00,
-      currency: 'EUR',
-      orderId: 'test_sub_' + Date.now(),
-      lineItems: [{ description: 'Suscripción Jamón Canalla', quantity: 1, amount_total: 7000, currency: 'eur', price: { unit_amount: 7000, recurring: { interval: 'month' } } }],
-      brand: process.env.BRAND_NAME || "Guarros Extremeños",
-      isSubscription: true
-    });
-    res.json({ ok: true, to, isSubscription: true });
-  } catch (e) {
-    console.error('[/test-email-customer-sub] error:', e);
+    console.error('[/health-db] error:', e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -464,17 +404,17 @@ function formatLineItemsHTML(lineItems = [], currency = 'EUR') {
 
 function emailShell({ title, headerLabel, bodyHTML, footerHTML }) {
   const logoBlock = BRAND_LOGO_URL
-    ? `<img src="${BRAND_LOGO_URL}" alt="${BRAND}" width="200" style="display:block; max-width:200px; width:100%; height:auto; margin:0 auto 8px;" />`
-    : `<div style="font-size:20px; font-weight:700; color:${BRAND_PRIMARY}; text-align:center; margin-bottom:8px;">${BRAND}</div>`;
+    ? `<img src="${BRAND_LOGO_URL}" alt="${escapeHtml(BRAND)}" width="200" style="display:block; max-width:200px; width:100%; height:auto; margin:0 auto 8px;" />`
+    : `<div style="font-size:20px; font-weight:700; color:${BRAND_PRIMARY}; text-align:center; margin-bottom:8px;">${escapeHtml(BRAND)}</div>`;
   return `<!doctype html>
-<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>${title}</title></head>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>${escapeHtml(title)}</title></head>
 <body style="margin:0; padding:0; background:#f3f4f6;">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6; padding:24px 0;">
     <tr><td>
       <table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" style="max-width:600px; width:100%; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
         <tr><td style="padding:24px; text-align:center; background:#ffffff;">
           ${logoBlock}
-          <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; font-size:22px; font-weight:800; color:${BRAND_PRIMARY}; letter-spacing:0.3px;">${headerLabel}</div>
+          <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,'Noto Sans',sans-serif; font-size:22px; font-weight:800; color:${BRAND_PRIMARY}; letter-spacing:0.3px;">${escapeHtml(headerLabel)}</div>
         </td></tr>
         ${bodyHTML}
         <tr><td style="padding:16px 24px 24px; background:#ffffff;">
@@ -495,7 +435,7 @@ async function createPaidReceiptPDF({
   lineItems = [],
   customer = {},
   paidAt = new Date(),
-  brand = "Guarros Extremeños",
+  brand = BRAND,
   logoUrl = BRAND_LOGO_URL,
 }) {
   const items = (lineItems || []).map(li => ({
@@ -626,26 +566,21 @@ async function createPaidReceiptPDF({
   doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
   doc.restore();
 
-// Pie (columna derecha para que no quede pegado a la izquierda)
-doc.moveDown(1.6);
-doc.font('Helvetica').fontSize(9).fillColor('#444');
+  // Pie (columna derecha)
+  doc.moveDown(1.6);
+  doc.font('Helvetica').fontSize(9).fillColor('#444');
 
-const pageWidth = doc.page.width;
-const { left, right } = doc.page.margins;
+  const pageWidth = doc.page.width;
+  const { right } = doc.page.margins;
+  const colWidth = 300;
+  const xRightCol = pageWidth - right - colWidth;
 
-// define un ancho cómodo para el pie (ajústalo si quieres)
-const colWidth = 300;
-
-// x será el inicio de la columna derecha
-const xRightCol = pageWidth - right - colWidth;
-
-doc.text(
-  'Este documento sirve como justificación de pago. Para información fiscal detallada, también se adjunta la factura oficial.',
-  xRightCol,
-  doc.y,
-  { width: colWidth, align: 'left' } // también puedes usar align: 'right'
-);
-
+  doc.text(
+    'Este documento sirve como justificación de pago. Para información fiscal detallada, también se adjunta la factura oficial.',
+    xRightCol,
+    doc.y,
+    { width: colWidth, align: 'left' }
+  );
 
   doc.end();
   return await done;
@@ -737,7 +672,7 @@ ${JSON.stringify(metadata || {}, null, 2)}
   console.warn('[email admin] Sin proveedor email configurado');
 }
 
-/* ---------- Email cliente (solo si COMBINE=false) ---------- */
+/* ---------- Email cliente (solo confirmación; SIN adjuntos) ---------- */
 async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand, isSubscription }) {
   if (!to) { console.warn('[email cliente] Falta "to"'); return; }
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
@@ -841,99 +776,16 @@ async function sendCustomerOrderAndInvoiceEmail({
     content: receiptB64
   }];
 
-/* ---------- Email SOLO factura (cuando COMBINE=false) ---------- */
-async function sendInvoiceEmail({
-  to, name, invoiceNumber, total, currency, pdfUrl,
-  brand = process.env.BRAND_NAME || "Guarros Extremeños",
-  alsoToCorporate = false
-}) {
-  if (!to) { console.warn('[sendInvoiceEmail] Falta "to"'); return; }
-
-  const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
-  const replyTo = process.env.SUPPORT_EMAIL || 'soporte@guarrosextremenos.com';
-
-  // descarga el PDF de Stripe y lo adjunta
-  let attachments = [];
-  if (pdfUrl) {
-    try {
-      const resp = await fetch(pdfUrl);
-      if (resp.ok) {
-        const b64 = Buffer.from(await resp.arrayBuffer()).toString('base64');
-        attachments.push({
-          filename: `Factura-${invoiceNumber || 'pedido'}.pdf`,
-          content: b64
-        });
-      } else {
-        console.warn('[sendInvoiceEmail] No se pudo descargar invoice_pdf:', resp.status);
-      }
-    } catch (e) {
-      console.warn('[sendInvoiceEmail] Error descargando invoice_pdf:', e?.message || e);
-    }
-  }
-
-  const totalFmt = currencyFormat(Number(total || 0), currency || 'EUR');
-  const subject = `🧾 Factura ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand}`;
-
-  const text = [
-    name ? `Hola ${name},` : 'Hola,', '',
-    `Adjuntamos tu factura en PDF.`,
-    `Importe: ${totalFmt}`,
-    invoiceNumber ? `Número de factura: ${invoiceNumber}` : '',
-    '', `Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.`,
-    '', `Un saludo,`, `Equipo ${brand}`
-  ].join('\n');
-
-  const bodyHTML = `
-<tr><td style="padding:0 24px 8px; background:#ffffff;">
-  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
-  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">Adjuntamos tu factura en PDF.</p>
-  <p style="margin:0 0 6px; font:14px system-ui; color:#111827;"><strong>Importe:</strong> ${escapeHtml(totalFmt)}</p>
-  ${invoiceNumber ? `<p style="margin:0 0 6px; font:14px system-ui; color:#111827;"><strong>Nº factura:</strong> ${escapeHtml(invoiceNumber)}</p>` : ''}
-  <p style="margin:8px 0 0; font:13px system-ui; color:#374151;">
-    Para cualquier duda, responde a este correo o escríbenos a
-    <a href="mailto:${escapeHtml(replyTo)}" style="color:${BRAND_PRIMARY}; text-decoration:none;">${escapeHtml(replyTo)}</a>.
-  </p>
-</td></tr>`;
-
-  const html = emailShell({
-    title: 'Factura',
-    headerLabel: 'Factura',
-    bodyHTML,
-    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}. Todos los derechos reservados.</p>`
-  });
-
-  // BCC corporativo opcional para archivo
-  const bccList = [];
-  if (alsoToCorporate && process.env.CORPORATE_EMAIL) {
-    const corp = (process.env.CORPORATE_EMAIL || '').toLowerCase();
-    const dest = String(to || '').toLowerCase();
-    if (corp && corp !== dest) bccList.push(process.env.CORPORATE_EMAIL);
-  }
-
-  // Enviar por Resend o SMTP
-  if (process.env.RESEND_API_KEY) {
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({
-      from, to, ...(bccList.length ? { bcc: bccList } : {}),
-      reply_to: replyTo, subject, text, html, attachments
-    });
-    return;
-  }
-  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    await sendViaGmailSMTP({ from, to, subject, text, html, attachments });
-    return;
-  }
-  console.warn('[sendInvoiceEmail] Sin proveedor email configurado');
-}
-
-
-  // Factura Stripe (opcional)
+  // Factura Stripe (opcional por ENV)
   const attachStripe = String(process.env.ATTACH_STRIPE_INVOICE || 'true').toLowerCase() !== 'false';
   if (attachStripe && pdfUrl) {
     const resp = await fetch(pdfUrl);
     if (resp.ok) {
       const stripeB64 = Buffer.from(await resp.arrayBuffer()).toString('base64');
-      attachments.push({ filename: `Factura-${invoiceNumber || 'pedido'}.pdf`, content: stripeB64 });
+      attachments.push({
+        filename: `Factura-${invoiceNumber || 'pedido'}.pdf`,
+        content: stripeB64
+      });
     } else {
       console.warn('[combined email] No se pudo descargar PDF de Stripe:', resp.status);
     }
