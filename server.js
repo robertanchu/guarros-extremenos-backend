@@ -770,7 +770,6 @@ async function sendCustomerOrderAndInvoiceEmail({
   to, name, invoiceNumber, total, currency,
         pdfUrl, lineItems: invItems,
         isSubscription,
-        alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true',
         customer: customerForPDF
 }) {
 
