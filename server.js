@@ -767,9 +767,12 @@ ${JSON.stringify(metadata || {}, null, 2)}
 
 /* ---------- Email cliente (solo confirmación; SIN adjuntos) ---------- */
 async function sendCustomerOrderAndInvoiceEmail({
-  to, name, invoiceNumber, total, currency, pdfUrl, lineItems,
-  brand, isSubscription, alsoBccCorporate,
-  customer // <-- NUEVO
+  to, name, invoiceNumber, total, currency,
+        pdfUrl, lineItems: invItems,
+        brand: process.env.BRAND_NAME || "Guarros Extremeños",
+        isSubscription,
+        alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true',
+        customer: customerForPDF
 }) {
 
   if (!to) { console.warn('[email cliente] Falta "to"'); return; }
@@ -849,8 +852,12 @@ async function sendCustomerOrderAndInvoiceEmail({
 
 /* ---------- Email combinado: Confirmación + Recibo + (Factura Stripe opcional) ---------- */
 async function sendCustomerOrderAndInvoiceEmail({
-  to, name, invoiceNumber, total, currency, pdfUrl, lineItems,
-  brand, isSubscription, alsoBccCorporate
+to, name, invoiceNumber, total, currency,
+        pdfUrl, lineItems: invItems,
+        brand: process.env.BRAND_NAME || "Guarros Extremeños",
+        isSubscription,
+        alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true',
+        customer: customerForPDF
 }) {
   if (!to)  { console.warn('[combined email] Falta "to"'); return; }
 
