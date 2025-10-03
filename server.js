@@ -526,29 +526,45 @@ async function createPaidReceiptPDF({
   }
   doc.moveDown(0.8);
 
-  // Cabeceras tabla
-  doc.font('Helvetica-Bold').fontSize(10);
-  doc.text('Concepto', 56, doc.y, { width: 280 });
-  doc.text('Cant.', 336, doc.y, { width: 60, align: 'right' });
-  doc.text('Total', 396, doc.y, { width: 140, align: 'right' });
-  doc.moveDown(0.3);
-  doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
-  doc.moveDown(0.5);
+// --- Definición de columnas (una sola vez, antes de cabecera+filas) ---
+const xDesc = 56,  wDesc = 280;
+const xQty  = 336, wQty  = 60;
+const xTot  = 396, wTot  = 140;
+
+// helper para medir altura sin mover el cursor
+const hOf = (text, width, options = {}) =>
+  doc.heightOfString(String(text ?? ''), { width, ...options });
+
+// --- Cabecera alineada ---
+doc.font('Helvetica-Bold').fontSize(10);
+
+const headerY = doc.y;
+const h1 = hOf('Concepto', wDesc, { align: 'left'  });
+const h2 = hOf('Cant.',    wQty,  { align: 'right' });
+const h3 = hOf('Total',    wTot,  { align: 'right' });
+const headerH = Math.max(h1, h2, h3);
+
+// Pintar las 3 celdas a la MISMA y
+doc.text('Concepto', xDesc, headerY, { width: wDesc, align: 'left'  });
+doc.text('Cant.',    xQty,  headerY, { width: wQty,  align: 'right' });
+doc.text('Total',    xTot,  headerY, { width: wTot,  align: 'right' });
+
+// Separador bajo cabecera
+const sepY = headerY + headerH + 4; // padding inferior
+doc.save();
+doc.lineWidth(0.7).strokeColor('#e5e7eb')
+   .moveTo(56, sepY).lineTo(56 + 480, sepY).stroke();
+doc.restore();
+
+// Punto inicial de filas
+let y = sepY + 6;
+doc.y = y;
+
 
  // Filas (alineadas por fila)
 doc.font('Helvetica').fontSize(10);
 
-// Definición de columnas
-const xDesc = 56,   wDesc = 280;
-const xQty  = 336,  wQty  = 60;
-const xTot  = 396,  wTot  = 140;
-
 let y = doc.y; // punto de inicio para las filas
-
-// helper para medir altura de un texto con el ancho dado sin mover el cursor
-const hOf = (text, width, options={}) => {
-  return doc.heightOfString(String(text ?? ''), { width, ...options });
-};
 
 let sumCents = 0;
 
