@@ -506,7 +506,7 @@ async function createPaidReceiptPDF({
     `Fecha de pago: ${paidFmt}`,
     `Estado: PAGADO`,
   ].join('\n');
-  doc.text(invText, rightX, topY, { align: 'left' });
+  doc.text(invText, rightX, topY, { align: 'right' });
 
   doc.moveDown(1);
 
@@ -522,7 +522,7 @@ async function createPaidReceiptPDF({
       [customer.postal, customer.city].filter(Boolean).join(' '),
       customer.country
     ].filter(Boolean).join('\n');
-    doc.text(custLines || '-', { width: 500 });
+    doc.text(custLines || '-', { width: 500, align: 'right' });
   }
   doc.moveDown(1.5);
 
@@ -546,7 +546,7 @@ const headerH = Math.max(h1, h2, h3);
 
 // Pintar las 3 celdas a la MISMA y
 doc.text('Concepto', xDesc, headerY, { width: wDesc, align: 'left'  });
-doc.text('Cant.',    xQty,  headerY, { width: wQty,  align: 'right' });
+doc.text('Cantidad',    xQty,  headerY, { width: wQty,  align: 'right' });
 doc.text('Total',    xTot,  headerY, { width: wTot,  align: 'right' });
 
 // Separador bajo cabecera
@@ -627,7 +627,7 @@ doc.restore();
     'Este documento sirve como justificación de pago. Para información fiscal detallada, también se adjunta la factura oficial.',
     xRightCol,
     doc.y,
-    { width: colWidth, align: 'left' }
+    { width: colWidth, align: 'right' }
   );
 
   doc.end();
