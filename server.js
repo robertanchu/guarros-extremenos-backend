@@ -613,7 +613,7 @@ async function createPaidReceiptPDF({
     `Fecha de pago: ${paidFmt}`,
     `Estado: PAGADO`,
   ].join('\n');
-  doc.text(invText, rightX, topY, { align: 'left' });
+  doc.text(invText, rightX, topY, { align: 'right' });
 
   doc.moveDown(1);
 
