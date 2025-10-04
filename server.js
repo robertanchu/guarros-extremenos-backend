@@ -29,6 +29,7 @@ ENV recomendadas:
 - COMPANY_NAME, COMPANY_TAX_ID, COMPANY_ADDRESS, COMPANY_CITY, COMPANY_POSTAL, COMPANY_COUNTRY, RECEIPT_SERIE
 - STRIPE_SHIPPING_RATE_ID (opcional, para envíos en one-time)
 - CUSTOMER_PORTAL_RETURN_URL (URL de retorno del portal)
+- SUB_500_PRICE_ID, SUB_1000_PRICE_ID  (IDs reales de Stripe para alias)
 */
 
 // ---------- CORS ----------
@@ -427,36 +428,68 @@ function resolvePriceAlias(maybePrice) {
   return resolved || alias;
 }
 
+/* ****** NUEVO: normalizador robusto de line_items ****** */
+function sanitizeLineItems(rawItems = []) {
+  if (!Array.isArray(rawItems)) return [];
+  return rawItems.map((it) => {
+    const out = { quantity: Number(it?.quantity || 1) };
+
+    // prioriza price explícito -> si no, prueba priceId
+    const incoming = it?.price || it?.priceId;
+    if (incoming) {
+      out.price = resolvePriceAlias(incoming);
+    }
+
+    // Si el front manda price_data, lo dejamos pasar tal cual (caso avanzado)
+    if (!out.price && it?.price_data) {
+      return { ...it, quantity: out.quantity };
+    }
+
+    return out;
+  });
+}
+
+/* ****** create-checkout-session con price suelto + saneo ****** */
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const {
-      items = [],
+    let {
+      items,
       mode = 'payment',
       success_url,
       cancel_url,
       customer,
       shipping_address,
-      metadata
-    } = req.body;
+      metadata,
+      price,       // soporta price suelto
+      quantity,    // idem
+    } = req.body || {};
 
-    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Missing items' });
-    if (!success_url || !cancel_url) return res.status(400).json({ error: 'Missing success_url/cancel_url' });
+    if (!success_url || !cancel_url) {
+      return res.status(400).json({ error: 'Missing success_url/cancel_url' });
+    }
+
+    // Si no viene items pero sí viene price suelto → construimos items
+    if ((!items || !Array.isArray(items) || items.length === 0) && price) {
+      items = [{ price, quantity: Number(quantity || 1) }];
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Missing items or price' });
+    }
 
     const isSubscription = mode === 'subscription';
 
-    // Normaliza/valida precios (alias → price_)
-    const normalizedItems = items.map(it => {
-      if (it?.price) {
-        const rp = resolvePriceAlias(it.price);
-        return { ...it, price: rp };
-      }
-      return it;
-    });
+    // Normaliza SIEMPRE los items (alias → price_, soporta priceId)
+    const normalizedItems = sanitizeLineItems(items);
 
+    // Valida que todo lo que va por "price" sea realmente un price_ de Stripe
     const invalid = normalizedItems.find(it => it.price && !String(it.price).startsWith('price_'));
     if (invalid) {
       return res.status(400).json({ error: `Invalid price id: ${invalid.price}` });
     }
+
+    // Logs de depuración
+    console.log('[checkout] incoming items:', JSON.stringify(items));
+    console.log('[checkout] normalized items:', JSON.stringify(normalizedItems));
 
     // ¿Trae el front dirección completa?
     const hasFrontAddress =
@@ -514,17 +547,17 @@ app.post('/create-checkout-session', async (req, res) => {
           footer: 'Gracias por su compra. Soporte: soporte@guarrosextremenos.com'
         }
       };
-    }
-
-    if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
-      sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
+      if (process.env.STRIPE_SHIPPING_RATE_ID) {
+        sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
+      }
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
-    res.json({ url: session.url });
+    return res.json({ url: session.url });
+
   } catch (err) {
     console.error('create-checkout-session error:', err);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
