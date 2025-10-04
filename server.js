@@ -408,6 +408,25 @@ async function upsertStripeCustomerFromFront(stripeClient, payload) {
   return customer;
 }
 
+// ---------- alias → price_ real ----------
+function resolvePriceAlias(maybePrice) {
+  if (!maybePrice) return null;
+  const alias = String(maybePrice).trim();
+
+  const map = {
+    'price_sub_500': process.env.SUB_500_PRICE_ID,
+    'sub_500':       process.env.SUB_500_PRICE_ID,
+    'plan_500':      process.env.SUB_500_PRICE_ID,
+    'price_sub_1000':process.env.SUB_1000_PRICE_ID,
+    'sub_1000':      process.env.SUB_1000_PRICE_ID,
+    'plan_1000':     process.env.SUB_1000_PRICE_ID,
+  };
+
+  if (alias.startsWith('price_')) return alias;
+  const resolved = map[alias];
+  return resolved || alias;
+}
+
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const {
@@ -424,6 +443,20 @@ app.post('/create-checkout-session', async (req, res) => {
     if (!success_url || !cancel_url) return res.status(400).json({ error: 'Missing success_url/cancel_url' });
 
     const isSubscription = mode === 'subscription';
+
+    // Normaliza/valida precios (alias → price_)
+    const normalizedItems = items.map(it => {
+      if (it?.price) {
+        const rp = resolvePriceAlias(it.price);
+        return { ...it, price: rp };
+      }
+      return it;
+    });
+
+    const invalid = normalizedItems.find(it => it.price && !String(it.price).startsWith('price_'));
+    if (invalid) {
+      return res.status(400).json({ error: `Invalid price id: ${invalid.price}` });
+    }
 
     // ¿Trae el front dirección completa?
     const hasFrontAddress =
@@ -445,7 +478,7 @@ app.post('/create-checkout-session', async (req, res) => {
 
     const sessionParams = {
       mode,
-      line_items: items,
+      line_items: normalizedItems,
       success_url,
       cancel_url,
       allow_promotion_codes: true,
@@ -502,6 +535,12 @@ app.post('/create-subscription-session', async (req, res) => {
     if (!price) return res.status(400).json({ error: 'Missing price' });
     if (!success_url || !cancel_url) return res.status(400).json({ error: 'Missing URLs' });
 
+    // Resolver alias → price_ real
+    const realPrice = resolvePriceAlias(price);
+    if (!realPrice || !String(realPrice).startsWith('price_')) {
+      return res.status(400).json({ error: `Invalid price id: ${price}` });
+    }
+
     // Upsert de Customer por email (evita doble formulario)
     let customerId;
     if (customer?.email) {
@@ -529,7 +568,7 @@ app.post('/create-subscription-session', async (req, res) => {
       success_url,
       cancel_url,
       allow_promotion_codes: true,
-      line_items: [{ price, quantity }],
+      line_items: [{ price: realPrice, quantity }],
       billing_address_collection: 'auto',
       automatic_tax: { enabled: false }, // pon true si usas Stripe Tax
       metadata: { source: 'guarros-front-subscription' },
