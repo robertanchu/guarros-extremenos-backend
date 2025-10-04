@@ -25,7 +25,10 @@ ENV recomendadas:
 - ALLOWED_ORIGINS (comma), ALLOWED_DOMAINS (comma)
 - COMBINE_CONFIRMATION_AND_INVOICE = true|false
 - ATTACH_STRIPE_INVOICE = true|false
+- CUSTOMER_BCC_CORPORATE = true|false
 - COMPANY_NAME, COMPANY_TAX_ID, COMPANY_ADDRESS, COMPANY_CITY, COMPANY_POSTAL, COMPANY_COUNTRY, RECEIPT_SERIE
+- STRIPE_SHIPPING_RATE_ID (opcional, para envíos en one-time)
+- CUSTOMER_PORTAL_RETURN_URL (URL de retorno del portal)
 */
 
 // ---------- CORS ----------
@@ -80,6 +83,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
   queueMicrotask(async () => {
     try {
       switch (event.type) {
+
         case 'checkout.session.completed': {
           const session = event.data.object;
 
@@ -107,7 +111,43 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             session.mode === 'subscription' ||
             (Array.isArray(lineItems) && lineItems.some(li => li?.price?.recurring));
 
-          // Email admin
+          // Si es suscripción: sincroniza DB y manda bienvenida
+          if (isSubscription && session.subscription) {
+            try {
+              const sub = await stripe.subscriptions.retrieve(session.subscription);
+              const cust = await stripe.customers.retrieve(session.customer);
+
+              await upsertSubscriber({
+                customer_id: sub.customer,
+                subscription_id: sub.id,
+                email: cust?.email || session.customer_details?.email || session.customer_email || null,
+                name: cust?.name || session.customer_details?.name || null,
+                price_id: sub.items?.data?.[0]?.price?.id || null,
+                status: sub.status,
+                current_period_start: sub.current_period_start,
+                current_period_end: sub.current_period_end,
+                cancel_at: sub.cancel_at,
+                canceled_at: sub.canceled_at,
+                metadata: sub.metadata || {}
+              });
+
+              const unitAmount = sub.items?.data?.[0]?.price?.unit_amount ?? 0;
+              const curr = (sub.items?.data?.[0]?.price?.currency || 'eur').toUpperCase();
+              const to = cust?.email || session.customer_details?.email || session.customer_email || null;
+              await sendSubscriptionWelcomeEmail({
+                to,
+                name: cust?.name || session.customer_details?.name || '',
+                priceAmount: unitAmount,
+                currency: curr,
+                brand: process.env.BRAND_NAME || 'Guarros Extremeños'
+              });
+              console.log('📧 Bienvenida suscripción OK');
+            } catch (e) {
+              console.error('[webhook] suscripción (alta) ERROR:', e);
+            }
+          }
+
+          // Email admin (pedido)
           try {
             await sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping });
             console.log('📧 Email admin enviado OK');
@@ -135,7 +175,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
             console.log('📧 [combine=true] No enviamos correo al cliente en checkout; se enviará combinado en invoice.payment_succeeded');
           }
 
-          // Registro en DB
+          // Registro en DB (pedido one-time; para sub guardamos arriba)
           try {
             await logOrder({
               sessionId: session.id,
@@ -206,15 +246,19 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
               console.warn('[invoice.email] listLineItems error:', e?.message || e);
             }
 
+            // Log de invoice de suscripción
+            if (invoice.subscription) {
+              await logSubscriptionInvoice({ invoice, items: invItems });
+            }
+
             const isSubscription =
               !!invoice.subscription || (Array.isArray(invItems) && invItems.some(it => it?.price?.recurring));
             const currency = (invoice.currency || 'eur').toUpperCase();
             const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
             const invoiceNumber = invoice.number || invoice.id;
 
-            // Dirección enriquecida (PI → Charge → Customer → Sessions → metadata)
+            // Dirección enriquecida para el recibo
             const resolvedAddress = await resolveCheckoutAddress(stripe, invoice);
-
             const customerForPDF = {
               name,
               email: to,
@@ -243,6 +287,52 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
           break;
         }
 
+        case 'customer.subscription.updated': {
+          const sub = event.data.object;
+          try {
+            await upsertSubscriber({
+              customer_id: sub.customer,
+              subscription_id: sub.id,
+              email: null,
+              name: null,
+              price_id: sub.items?.data?.[0]?.price?.id || null,
+              status: sub.status,
+              current_period_start: sub.current_period_start,
+              current_period_end: sub.current_period_end,
+              cancel_at: sub.cancel_at,
+              canceled_at: sub.canceled_at,
+              metadata: sub.metadata || {}
+            });
+          } catch (e) {
+            console.error('[webhook] subscription.updated ERROR:', e);
+          }
+          break;
+        }
+
+        case 'customer.subscription.deleted': {
+          const sub = event.data.object;
+          try {
+            await markSubscriptionCanceled({ subscription_id: sub.id });
+
+            // Emails de baja (cliente + corporativo)
+            let to = null, name = '';
+            try {
+              const cust = await stripe.customers.retrieve(sub.customer);
+              to = cust?.email || null;
+              name = cust?.name || '';
+            } catch {}
+            await sendSubscriptionCanceledEmails({
+              to, name,
+              brand: process.env.BRAND_NAME || 'Guarros Extremeños',
+              subscription_id: sub.id
+            });
+            console.log('📧 Baja de suscripción OK');
+          } catch (e) {
+            console.error('[webhook] subscription.deleted ERROR:', e);
+          }
+          break;
+        }
+
         case 'invoice.payment_failed':
           console.warn('⚠️ invoice.payment_failed', event.data.object.id);
           break;
@@ -264,9 +354,9 @@ app.use(express.json());
 
 app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
-// Crear sesión de Checkout
+/* =================  CHECKOUT ONE-TIME  ================= */
 // Helper: busca o crea Customer por email y lo rellena con dirección/envío
-async function upsertStripeCustomerFromFront(stripe, payload) {
+async function upsertStripeCustomerFromFront(stripeClient, payload) {
   const email = payload?.customer?.email;
   if (!email) return null;
 
@@ -284,7 +374,7 @@ async function upsertStripeCustomerFromFront(stripe, payload) {
   // 1) Intenta encontrar Customer por email
   let customer = null;
   try {
-    const list = await stripe.customers.list({ email, limit: 1 });
+    const list = await stripeClient.customers.list({ email, limit: 1 });
     customer = list.data[0] || null;
   } catch (e) {
     console.warn('[upsertCustomer] list error:', e?.message || e);
@@ -299,18 +389,17 @@ async function upsertStripeCustomerFromFront(stripe, payload) {
 
   try {
     if (!customer) {
-      customer = await stripe.customers.create({
+      customer = await stripeClient.customers.create({
         ...base,
         ...(hasLine1 ? { address: addr, shipping: { name: base.name || email, address: addr } } : {})
       });
     } else {
-      // Solo actualiza si tenemos dirección del front; si no, conserva lo que hubiera
       const update = { ...base };
       if (hasLine1) {
         update.address  = addr;
         update.shipping = { name: base.name || customer.name || email, address: addr };
       }
-      customer = await stripe.customers.update(customer.id, update);
+      customer = await stripeClient.customers.update(customer.id, update);
     }
   } catch (e) {
     console.warn('[upsertCustomer] create/update error:', e?.message || e);
@@ -336,7 +425,7 @@ app.post('/create-checkout-session', async (req, res) => {
 
     const isSubscription = mode === 'subscription';
 
-    // ¿Trae el front dirección completa? => intentamos pre-crear/actualizar Customer para no preguntar en Stripe
+    // ¿Trae el front dirección completa?
     const hasFrontAddress =
       !!(shipping_address?.address || metadata?.address) &&
       !!(shipping_address?.city    || metadata?.city) &&
@@ -344,10 +433,8 @@ app.post('/create-checkout-session', async (req, res) => {
 
     let customerId;
     if (customer?.id && String(customer.id).startsWith('cus_')) {
-      // Nos dieron un Customer ya existente
       customerId = customer.id;
     } else if (hasFrontAddress && (customer?.email || metadata?.email)) {
-      // “Upsert” por email con la dirección del front
       const cust = await upsertStripeCustomerFromFront(stripe, {
         customer: { email: customer?.email || metadata?.email, name: customer?.name, phone: customer?.phone },
         shipping_address,
@@ -356,7 +443,6 @@ app.post('/create-checkout-session', async (req, res) => {
       customerId = cust?.id;
     }
 
-    // Construye params de sesión
     const sessionParams = {
       mode,
       line_items: items,
@@ -364,13 +450,11 @@ app.post('/create-checkout-session', async (req, res) => {
       cancel_url,
       allow_promotion_codes: true,
 
-      // Si tenemos customerId => no pedimos otra vez; si no, dejamos que Stripe lo pida
       ...(customerId
-        ? { customer: customerId, billing_address_collection: 'auto' } // Stripe no vuelve a pedir si ya lo tiene
+        ? { customer: customerId, billing_address_collection: 'auto' }
         : { customer_email: customer?.email || metadata?.email, customer_creation: 'always', billing_address_collection: 'required' }
       ),
 
-      // Metadatos de respaldo (por si luego tenemos que reconstruir dirección en el webhook)
       metadata: {
         ...(metadata || {}),
         name:  customer?.name  ?? metadata?.name,
@@ -385,14 +469,10 @@ app.post('/create-checkout-session', async (req, res) => {
       phone_number_collection: { enabled: true },
     };
 
-    // Solo pedimos shipping en Stripe si NO tenemos customer con shipping.
-    // Si ya pre-creamos el Customer con shipping, NO añadimos shipping_address_collection (evita el segundo formulario).
     if (!customerId) {
-      // Caso en que Stripe debe pedir dirección de envío (y/o la factura)
       sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
     }
 
-    // Factura en pagos únicos
     if (!isSubscription) {
       sessionParams.invoice_creation = {
         enabled: true,
@@ -403,7 +483,6 @@ app.post('/create-checkout-session', async (req, res) => {
       };
     }
 
-    // Envío opcional (tarifa fija). Esto no fuerza formulario si el Customer ya tiene shipping.
     if (!isSubscription && process.env.STRIPE_SHIPPING_RATE_ID) {
       sessionParams.shipping_options = [{ shipping_rate: process.env.STRIPE_SHIPPING_RATE_ID }];
     }
@@ -416,6 +495,72 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+/* =================  CHECKOUT SUSCRIPCIÓN  ================= */
+app.post('/create-subscription-session', async (req, res) => {
+  try {
+    const { price, quantity = 1, success_url, cancel_url, customer } = req.body || {};
+    if (!price) return res.status(400).json({ error: 'Missing price' });
+    if (!success_url || !cancel_url) return res.status(400).json({ error: 'Missing URLs' });
+
+    // Upsert de Customer por email (evita doble formulario)
+    let customerId;
+    if (customer?.email) {
+      const list = await stripe.customers.list({ email: customer.email, limit: 1 });
+      const exists = list.data[0];
+      if (exists) {
+        customerId = exists.id;
+        await stripe.customers.update(customerId, {
+          name: customer.name || undefined,
+          phone: customer.phone || undefined,
+        });
+      } else {
+        const created = await stripe.customers.create({
+          email: customer.email,
+          name: customer.name || undefined,
+          phone: customer.phone || undefined,
+        });
+        customerId = created.id;
+      }
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      ...(customerId ? { customer: customerId } : { customer_creation: 'always' }),
+      success_url,
+      cancel_url,
+      allow_promotion_codes: true,
+      line_items: [{ price, quantity }],
+      billing_address_collection: 'auto',
+      automatic_tax: { enabled: false }, // pon true si usas Stripe Tax
+      metadata: { source: 'guarros-front-subscription' },
+    });
+
+    return res.json({ url: session.url });
+  } catch (e) {
+    console.error('create-subscription-session error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+/* =====================  CUSTOMER PORTAL  ===================== */
+app.post('/billing-portal', async (req, res) => {
+  try {
+    const { customer_id, return_url } = req.body || {};
+    if (!customer_id) return res.status(400).json({ error: 'Missing customer_id' });
+
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: customer_id,
+      return_url: return_url || (process.env.CUSTOMER_PORTAL_RETURN_URL || 'https://guarrosextremenos.com/account')
+    });
+
+    return res.json({ url: portal.url });
+  } catch (e) {
+    console.error('billing-portal error:', e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+/* =====================  CONTACTO (form)  ===================== */
 app.post('/contact', async (req, res) => {
   try {
     const { name, email, message, company, source } = req.body || {};
@@ -775,12 +920,10 @@ async function createPaidReceiptPDF({
   // --- Tabla: Cabecera alineada ---
   doc.font('Helvetica-Bold').fontSize(10);
 
-  // Definición de columnas (coincide con filas)
   const xDesc = 56,  wDesc = 280;
   const xQty  = 336, wQty  = 60;
   const xTot  = 396, wTot  = 140;
 
-  // helper para medir altura sin mover cursor
   const hOf = (text, width, options = {}) =>
     doc.heightOfString(String(text ?? ''), { width, ...options });
 
@@ -794,17 +937,16 @@ async function createPaidReceiptPDF({
   doc.text('Cant.',    xQty,  headerY, { width: wQty,  align: 'right' });
   doc.text('Total',    xTot,  headerY, { width: wTot,  align: 'right' });
 
-  // línea separadora
   const sepY = headerY + headerH + 4;
   doc.save();
   doc.lineWidth(0.7).strokeColor('#e5e7eb')
      .moveTo(56, sepY).lineTo(56 + 480, sepY).stroke();
   doc.restore();
 
-  // --- Filas (alineadas por fila) ---
+  // --- Filas ---
   doc.font('Helvetica').fontSize(10);
 
-  let y = sepY + 6; // punto de inicio para las filas
+  let y = sepY + 6;
   let sumCents = 0;
 
   items.forEach((it) => {
@@ -812,7 +954,7 @@ async function createPaidReceiptPDF({
     const qty  = `x${it.quantity || 1}`;
     const totalCents = Number(it.totalCents || 0);
     sumCents += totalCents;
-    const totalFmt = currencyFormat(totalCents / 100, it.currency);
+    const totalFmt = currencyFormat(totalCents / 100, (it.currency || currency));
 
     const hDesc = hOf(desc, wDesc, { align: 'left'  });
     const hQty  = hOf(qty,  wQty,  { align: 'right' });
@@ -828,29 +970,24 @@ async function createPaidReceiptPDF({
     y += rowHeight + padY;
   });
 
-  // Sitúa el cursor al final de la tabla
   doc.y = y;
 
-  // Separador bajo filas
   doc.moveDown(0.5);
   doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
   doc.moveDown(0.6);
 
-  // Total
   doc.font('Helvetica-Bold').fontSize(11);
   const sumFmt = currencyFormat(sumCents / 100, (currency || 'EUR'));
   doc.text('Total pagado', 56, doc.y, { width: 340, align: 'left' });
   doc.text(sumFmt,        396, doc.y, { width: 140, align: 'right' });
   doc.moveDown(0.8);
 
-  // Sello PAGADO
   doc.save();
   doc.rotate(-10, { origin: [400, doc.y] });
   doc.font('Helvetica-Bold').fontSize(28).fillColor('#D62828');
   doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
   doc.restore();
 
-  // Pie (columna derecha)
   doc.moveDown(1.6);
   doc.font('Helvetica').fontSize(9).fillColor('#444');
 
@@ -871,7 +1008,6 @@ async function createPaidReceiptPDF({
 }
 
 /* ---------- Resolver dirección real del checkout ---------- */
-// Saca address de: invoice.customer_details.address -> PaymentIntent.latest_charge.shipping/billing -> Customer.shipping/address -> Checkout Session metadata
 async function resolveCheckoutAddress(stripeClient, invoice) {
   const normalize = (a, meta = {}) => {
     if (!a && !meta) return null;
@@ -945,4 +1081,410 @@ async function resolveCheckoutAddress(stripeClient, invoice) {
   });
   if (norm) return norm;
 
- 
+  // 6) Último recurso
+  return invoice.customer_details?.address || { country: invoice.customer_details?.address?.country || '' };
+}
+
+/* ---------- Email ADMIN ---------- */
+async function sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping }) {
+  const to = process.env.CORPORATE_EMAIL || 'pedidos@tudominio.com';
+  const from = process.env.CORPORATE_FROM || process.env.SMTP_USER || 'no-reply@tu-dominio.com';
+
+  const itemsPlain = formatLineItemsPlain(lineItems, currency);
+  const itemsHTML = formatLineItemsHTML(lineItems, currency);
+  const totalFmt = currencyFormat(amountTotal, currency);
+
+  const text = `
+Nuevo pedido completado (Stripe)
+
+Cliente: ${name || '(sin nombre)'} <${customerEmail || 'sin email'}>
+Teléfono: ${phone || '-'}
+
+Total: ${totalFmt}
+Session ID: ${session.id}
+
+Dirección:
+${shipping?.line1 || ''} ${shipping?.line2 || ''}
+${shipping?.postal_code || ''} ${shipping?.city || ''}
+${shipping?.country || ''}
+
+Productos:
+${itemsPlain}
+
+Metadata:
+${JSON.stringify(metadata || {}, null, 2)}
+`.trim();
+
+  const bodyHTML = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:14px/1.5 system-ui; color:#374151;">
+    <strong>Cliente:</strong> ${escapeHtml(name || '(sin nombre)')} &lt;${escapeHtml(customerEmail || 'sin email')}&gt;<br/>
+    <strong>Teléfono:</strong> ${escapeHtml(phone || '-')}
+  </p>
+  <div style="height:1px; background:#e5e7eb;"></div>
+</td></tr>
+<tr><td style="padding:8px 24px 0; background:#ffffff;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
+    <thead>
+      <tr>
+        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
+        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
+        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
+      </tr>
+    </thead>
+    <tbody>${itemsHTML}</tbody>
+    <tfoot>
+      <tr><td colspan="3"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+      <tr>
+        <td style="padding:12px 0; font-size:14px; color:#111827; font-weight:700;">Total</td>
+        <td></td>
+        <td style="padding:12px 0; font-size:16px; color:#111827; font-weight:800; text-align:right;">${escapeHtml(totalFmt)}</td>
+      </tr>
+    </tfoot>
+  </table>
+</td></tr>
+<tr><td style="padding:8px 24px 8px; background:#ffffff;">
+  <div style="font:12px system-ui; color:#6b7280;">
+    <strong>Session ID:</strong> ${escapeHtml(session.id)}<br/>
+    <strong>Dirección:</strong> ${escapeHtml([shipping?.line1, shipping?.line2].filter(Boolean).join(' ') || '')}<br/>
+    ${escapeHtml([shipping?.postal_code, shipping?.city, shipping?.country].filter(Boolean).join(' ') || '')}<br/>
+    <strong>Metadata:</strong><pre style="white-space:pre-wrap; font-size:12px; color:#374151; background:#f9fafb; border:1px solid #e5e7eb; padding:8px; border-radius:8px;">${escapeHtml(JSON.stringify(metadata || {}, null, 2))}</pre>
+  </div>
+</td></tr>`;
+
+  const html = emailShell({
+    title: `Nuevo pedido — ${totalFmt}`,
+    headerLabel: `Nuevo pedido — ${totalFmt}`,
+    bodyHTML,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>`
+  });
+
+  if (process.env.RESEND_API_KEY) {
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({ from, to, subject: `🧾 Nuevo pedido — ${totalFmt}`, text, html });
+    return;
+  }
+  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    await sendViaGmailSMTP({ from, to, subject: `🧾 Nuevo pedido — ${totalFmt}`, text, html });
+    return;
+  }
+  console.warn('[email admin] Sin proveedor email configurado');
+}
+
+/* ---------- Email cliente (solo confirmación; SIN adjuntos) ---------- */
+async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand, isSubscription }) {
+  if (!to) { console.warn('[email cliente] Falta "to"'); return; }
+  const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
+  const replyTo = process.env.SUPPORT_EMAIL || supportEmail || 'soporte@guarrosextremenos.com';
+  const totalFmt = currencyFormat(Number(amountTotal || 0), currency || 'EUR');
+  const itemsPlain = formatLineItemsPlain(lineItems, currency || 'EUR');
+  const itemsHTML = formatLineItemsHTML(lineItems, currency || 'EUR');
+
+  const wantBcc = String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true';
+  const corp = (process.env.CORPORATE_EMAIL || '').toLowerCase();
+  const dest = String(to || '').toLowerCase();
+  const bccList = wantBcc && corp && corp !== dest ? [process.env.CORPORATE_EMAIL] : [];
+
+  const subject = isSubscription
+    ? `✅ Suscripción activada ${orderId ? `#${orderId}` : ''} — ${brand || BRAND}`
+    : `✅ Confirmación de pedido ${orderId ? `#${orderId}` : ''} — ${brand || BRAND}`;
+
+  const intro = isSubscription
+    ? `¡Gracias por suscribirte a ${brand || BRAND}! Tu suscripción ha quedado activada correctamente.`
+    : `¡Gracias por tu compra en ${brand || BRAND}! Tu pago se ha recibido correctamente.`;
+
+  const text = [
+    name ? `Hola ${name},` : 'Hola,', '',
+    intro, '', 'Resumen:', itemsPlain, '',
+    `Total ${isSubscription ? 'del primer cargo' : 'pagado'}: ${totalFmt}`,
+    orderId ? `ID de ${isSubscription ? 'suscripción/pedido' : 'pedido'} (Stripe): ${orderId}` : '',
+    '', `Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.`,
+    '', `Un saludo,`, `Equipo ${brand || BRAND}`
+  ].filter(Boolean).join('\n');
+
+  const bodyHTML = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">${escapeHtml(intro)}</p>
+</td></tr>
+<tr><td style="padding:0 24px 8px; background:#ffffff;"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+<tr><td style="padding:8px 24px 0; background:#ffffff;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
+    <thead>
+      <tr>
+        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
+        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
+        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
+      </tr>
+    </thead>
+    <tbody>${itemsHTML}</tbody>
+    <tfoot>
+      <tr><td colspan="3"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+      <tr>
+        <td style="padding:12px 0; font-size:14px; color:#111827; font-weight:700;">Total ${isSubscription ? 'primer cargo' : ''}</td>
+        <td></td>
+        <td style="padding:12px 0; font-size:16px; color:#111827; font-weight:800; text-align:right;">${escapeHtml(totalFmt)}</td>
+      </tr>
+    </tfoot>
+  </table>
+</td></tr>`;
+
+  const html = emailShell({
+    title: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
+    headerLabel: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
+    bodyHTML,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand || BRAND)}. Todos los derechos reservados.</p>`
+  });
+
+  if (process.env.RESEND_API_KEY) {
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({ from, to, ...(bccList.length ? { bcc: bccList } : {}), reply_to: replyTo, subject, text, html });
+    return;
+  }
+  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    await sendViaGmailSMTP({ from, to, subject, text, html });
+    return;
+  }
+  console.warn('[email cliente] Sin proveedor email configurado');
+}
+
+/* ---------- Email SUSCRIPCIÓN: Bienvenida ---------- */
+async function sendSubscriptionWelcomeEmail({ to, name, priceAmount, currency, brand }) {
+  if (!to) return;
+  const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
+  const subject = `✅ Suscripción activada — ${brand || BRAND}`;
+  const totalFmt = currencyFormat(priceAmount/100, currency || 'EUR');
+
+  const bodyHTML = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
+    ¡Gracias por suscribirte a ${escapeHtml(brand || BRAND)}! Tu suscripción ha quedado activada.
+  </p>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
+    Importe del plan: <strong>${escapeHtml(totalFmt)}</strong> al mes.
+  </p>
+</td></tr>`;
+
+  const html = emailShell({
+    title: 'Suscripción activada',
+    headerLabel: 'Suscripción activada',
+    bodyHTML,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand || BRAND)}</p>`
+  });
+
+  if (process.env.RESEND_API_KEY) {
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({ from, to, subject, html, text: `Suscripción activada en ${brand || BRAND}` });
+  } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    await sendViaGmailSMTP({ from, to, subject, html, text: `Suscripción activada en ${brand || BRAND}` });
+  }
+}
+
+/* ---------- Email SUSCRIPCIÓN: Cancelación ---------- */
+async function sendSubscriptionCanceledEmails({ to, name, brand, subscription_id }) {
+  const corpTo = process.env.CORPORATE_EMAIL;
+  const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
+  const subjectUser = `❌ Suscripción cancelada — ${brand || BRAND}`;
+  const subjectCorp = `❌ Baja de suscripción — ${brand || BRAND}`;
+
+  const htmlUser = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
+    Tu suscripción ha sido cancelada correctamente. Sentimos verte marchar; si podemos mejorar algo, respóndenos a este correo.
+  </p>
+</td></tr>`;
+
+  const htmlCorp = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
+    Se ha cancelado la suscripción <strong>${escapeHtml(subscription_id || '')}</strong>.
+  </p>
+</td></tr>`;
+
+  const shellUser = emailShell({
+    title: 'Suscripción cancelada',
+    headerLabel: 'Suscripción cancelada',
+    bodyHTML: htmlUser,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(brand || BRAND)}</p>`
+  });
+
+  const shellCorp = emailShell({
+    title: 'Baja de suscripción',
+    headerLabel: 'Baja de suscripción',
+    bodyHTML: htmlCorp,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(brand || BRAND)}</p>`
+  });
+
+  // Cliente
+  if (to) {
+    if (process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      await resend.emails.send({ from, to, subject: subjectUser, html: shellUser });
+    } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      await sendViaGmailSMTP({ from, to, subject: subjectUser, html: shellUser });
+    }
+  }
+  // Corporativo
+  if (corpTo) {
+    if (process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      await resend.emails.send({ from, to: corpTo, subject: subjectCorp, html: shellCorp });
+    } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      await sendViaGmailSMTP({ from, to: corpTo, subject: subjectCorp, html: shellCorp });
+    }
+  }
+}
+
+/* ---------- SMTP fallback ---------- */
+async function sendViaGmailSMTP({ from, to, subject, text, html, attachments }) {
+  const port = Number(process.env.SMTP_PORT || 465);
+  const secure = String(port) === '465';
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port, secure,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    logger: true, debug: true,
+  });
+  await transporter.verify();
+  const info = await transporter.sendMail({ from, to, subject, text, html, attachments });
+  console.log('[smtp] Message sent:', info.messageId, 'accepted:', info.accepted, 'rejected:', info.rejected);
+  return info;
+}
+
+/* ========================= DB (POOL) ========================= */
+const pool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { require: true, rejectUnauthorized: false } })
+  : null;
+
+/* ---------- Pedidos one-time ---------- */
+async function logOrder(order) {
+  if (!pool) { console.warn('[db] DATABASE_URL no configurado. No se guardará el pedido.'); return; }
+  const text = `
+    INSERT INTO orders (session_id, email, name, phone, total, currency, items, metadata, shipping, status, created_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    ON CONFLICT (session_id) DO NOTHING
+  `;
+  const values = [
+    order.sessionId,
+    order.customerEmail || null,
+    order.name || null,
+    order.phone || null,
+    order.amountTotal || 0,
+    order.currency || 'EUR',
+    JSON.stringify(order.lineItems || []),
+    JSON.stringify(order.metadata || {}),
+    JSON.stringify(order.shipping || {}),
+    order.status || 'paid',
+    order.createdAt || new Date().toISOString(),
+  ];
+  await pool.query(text, values);
+}
+
+async function logOrderItems(sessionId, lineItems, currency) {
+  if (!pool || !Array.isArray(lineItems)) return;
+  const text = `
+    insert into order_items
+      (session_id, description, product_id, price_id, quantity, unit_amount_cents, amount_total_cents, currency, raw)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    on conflict do nothing
+  `;
+  for (const li of lineItems) {
+    const vals = [
+      sessionId,
+      li.description || null,
+      li.price?.product || null,
+      li.price?.id || null,
+      li.quantity || 1,
+      li.price?.unit_amount ?? null,
+      (li.amount_total ?? li.amount ?? 0),
+      (li.currency || currency || 'eur').toUpperCase(),
+      JSON.stringify(li),
+    ];
+    await pool.query(text, vals);
+  }
+}
+
+/* ---------- Suscriptores ---------- */
+async function upsertSubscriber({
+  customer_id,
+  subscription_id,
+  email,
+  name,
+  price_id,
+  status,
+  current_period_start,
+  current_period_end,
+  cancel_at,
+  canceled_at,
+  metadata = {}
+}) {
+  if (!pool) { console.warn('[db] DATABASE_URL no configurado (upsertSubscriber)'); return; }
+
+  const text = `
+    INSERT INTO subscribers
+      (customer_id, subscription_id, email, name, price_id, status,
+       current_period_start, current_period_end, cancel_at, canceled_at, metadata)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    ON CONFLICT (subscription_id) DO UPDATE SET
+      email = EXCLUDED.email,
+      name = EXCLUDED.name,
+      price_id = EXCLUDED.price_id,
+      status = EXCLUDED.status,
+      current_period_start = EXCLUDED.current_period_start,
+      current_period_end = EXCLUDED.current_period_end,
+      cancel_at = EXCLUDED.cancel_at,
+      canceled_at = EXCLUDED.canceled_at,
+      metadata = EXCLUDED.metadata
+  `;
+  const values = [
+    customer_id,
+    subscription_id,
+    email || null,
+    name || null,
+    price_id || null,
+    status || null,
+    current_period_start ? new Date(current_period_start * 1000).toISOString() : null,
+    current_period_end ? new Date(current_period_end * 1000).toISOString() : null,
+    cancel_at ? new Date(cancel_at * 1000).toISOString() : null,
+    canceled_at ? new Date(canceled_at * 1000).toISOString() : null,
+    JSON.stringify(metadata || {})
+  ];
+  await pool.query(text, values);
+}
+
+async function markSubscriptionCanceled({ subscription_id }) {
+  if (!pool) return;
+  const text = `
+    UPDATE subscribers
+    SET status = 'canceled',
+        canceled_at = NOW()
+    WHERE subscription_id = $1
+  `;
+  await pool.query(text, [subscription_id]);
+}
+
+async function logSubscriptionInvoice({ invoice, items = [] }) {
+  if (!pool) return;
+  const text = `
+    INSERT INTO subscription_invoices
+      (invoice_id, subscription_id, customer_id, amount_paid, currency,
+       invoice_number, hosted_invoice_url, invoice_pdf, lines, paid_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    ON CONFLICT (invoice_id) DO NOTHING
+  `;
+  const values = [
+    invoice.id,
+    invoice.subscription || null,
+    invoice.customer || null,
+    invoice.amount_paid ?? invoice.amount_due ?? 0,
+    (invoice.currency || 'eur').toUpperCase(),
+    invoice.number || null,
+    invoice.hosted_invoice_url || null,
+    invoice.invoice_pdf || null,
+    JSON.stringify(items || []),
+    invoice.status === 'paid' ? new Date((invoice.status_transitions?.paid_at || invoice.created) * 1000).toISOString() : null
+  ];
+  await pool.query(text, values);
+}
