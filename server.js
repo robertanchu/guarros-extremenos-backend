@@ -562,20 +562,21 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 /* =================  CHECKOUT SUSCRIPCIÓN  ================= */
-// === /create-subscription-session (REEMPLAZA ESTE BLOQUE) ===
+// === /create-subscription-session (con recogida de datos) ===
 app.post('/create-subscription-session', async (req, res) => {
   try {
     const { price, quantity = 1, success_url, cancel_url, customer } = req.body || {};
     if (!price) return res.status(400).json({ error: 'Missing price' });
     if (!success_url || !cancel_url) return res.status(400).json({ error: 'Missing URLs' });
 
-    // Resolver alias → price_ real
+    // Alias -> price_ real
     const realPrice = resolvePriceAlias(price);
     if (!realPrice || !String(realPrice).startsWith('price_')) {
       return res.status(400).json({ error: `Invalid price id: ${price}` });
     }
 
-    // Si nos mandas datos del cliente, busca/crea el Customer en Stripe
+    // Si nos pasan datos del cliente, intentamos reusar/actualizar Customer.
+    // OJO: si NO envías "customer", Stripe creará uno nuevo con lo que el usuario rellene en Checkout.
     let customerId;
     if (customer?.email) {
       try {
@@ -584,32 +585,59 @@ app.post('/create-subscription-session', async (req, res) => {
         if (exists) {
           customerId = exists.id;
           await stripe.customers.update(customerId, {
-            name: customer.name || undefined,
+            name:  customer.name  || undefined,
             phone: customer.phone || undefined,
           });
         } else {
           const created = await stripe.customers.create({
             email: customer.email,
-            name: customer.name || undefined,
+            name:  customer.name  || undefined,
             phone: customer.phone || undefined,
           });
           customerId = created.id;
         }
       } catch (e) {
-        console.warn('[create-subscription-session] customer upsert warn:', e?.message || e);
+        console.warn('[create-subscription-session] upsert customer warn:', e?.message || e);
       }
     }
 
-    // ⚠️ IMPORTANTE: NO usar customer_creation en modo 'subscription'
+    // ✅ Forzar recogida de datos en Checkout
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      ...(customerId ? { customer: customerId } : {}), // si no hay, Stripe creará uno al completar
+      ...(customerId ? { customer: customerId } : {}),
       success_url,
       cancel_url,
       allow_promotion_codes: true,
       line_items: [{ price: realPrice, quantity }],
-      billing_address_collection: 'auto',
-      automatic_tax: { enabled: false }, // activa si usas Stripe Tax
+
+      // Pide SIEMPRE dirección de facturación
+      billing_address_collection: 'required',
+
+      // Pide dirección de envío (ajusta países si quieres)
+      shipping_address_collection: {
+        allowed_countries: ['ES', 'PT']
+      },
+
+      // Pide teléfono
+      phone_number_collection: { enabled: true },
+
+      // (Opcional) Campos extra en el Checkout (por ejemplo, DNI)
+      // custom_fields: [
+      //   {
+      //     key: 'dni',
+      //     label: { type: 'custom', custom: 'DNI/NIF' },
+      //     type: 'text',
+      //     optional: true
+      //   }
+      // ],
+
+      // IMPORTANTE: NO usar customer_creation en 'subscription'
+      // customer_update solo es válido si pasas "customer"
+      ...(customerId ? { customer_update: { address: 'auto', name: 'auto', shipping: 'auto' } } : {}),
+
+      // Desactiva impuestos automáticos si no usas Stripe Tax
+      automatic_tax: { enabled: false },
+
       metadata: { source: 'guarros-front-subscription' },
     });
 
@@ -619,7 +647,6 @@ app.post('/create-subscription-session', async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 });
-
 
 /* =====================  CUSTOMER PORTAL  ===================== */
 app.post('/billing-portal', async (req, res) => {
