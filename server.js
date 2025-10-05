@@ -519,15 +519,15 @@ async function sendCustomerOrderAndInvoiceEmail({
   total,
   currency,
   pdfUrl,            // invoice.invoice_pdf de Stripe (opcional)
-  lineItems = [],    // para nuestro recibo propio
+  lineItems = [],    // se mostrará en la tabla (igual que en sendCustomerEmail)
   brand = BRAND,
   isSubscription = false,
   alsoBccCorporate = false,
-  customer = {}      // { name, email, address: {line1,line2,city,postal_code,country} }
+  customer = {}      // { name, email, address: {line1,line2,city,postal_code,country} } (para nuestro PDF)
 }) {
   if (!to) return;
 
-  // Recibo PDF propio con logo (usa emailShell/BRAND_LOGO_URL indirectamente)
+  // --- Adjuntos: nuestro recibo PDF (siempre) + (opcional) factura de Stripe ---
   const receiptBuffer = await createPaidReceiptPDF({
     invoiceNumber,
     total,
@@ -544,7 +544,6 @@ async function sendCustomerOrderAndInvoiceEmail({
     contentType: 'application/pdf'
   }];
 
-  // (Opcional) Adjuntar factura de Stripe
   const ATTACH_STRIPE_INVOICE = String(process.env.ATTACH_STRIPE_INVOICE || 'false') === 'true';
   if (ATTACH_STRIPE_INVOICE && pdfUrl) {
     try {
@@ -562,33 +561,63 @@ async function sendCustomerOrderAndInvoiceEmail({
     }
   }
 
-  const wantBcc = alsoBccCorporate && process.env.CORPORATE_EMAIL;
+  // --- MISMO “look & feel” que sendCustomerEmail ---
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
+  const wantBcc = alsoBccCorporate && process.env.CORPORATE_EMAIL;
+
+  // Usamos el MISMO subject/intro que en sendCustomerEmail
   const subject = isSubscription
-    ? `✅ Suscripción: pago confirmado — ${brand}`
-    : `✅ Confirmación de pago — ${brand}`;
+    ? `✅ Suscripción activada ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand || BRAND}`
+    : `✅ Confirmación de pedido ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand || BRAND}`;
+
+  const intro = isSubscription
+    ? `¡Gracias por suscribirte a ${brand || BRAND}! Tu suscripción ha quedado activada correctamente.`
+    : `¡Gracias por tu compra en ${brand || BRAND}! Tu pago se ha recibido correctamente.`;
 
   const totalFmt = currencyFormat(Number(total || 0), currency || 'EUR');
+  const itemsHTML = formatLineItemsHTML(lineItems, currency || 'EUR');
 
-  // **AHORA usamos emailShell → incluye logo y estilo como antes**
+  // Cuerpo HTML calcado al de sendCustomerEmail (tabla + total)
   const bodyHTML = `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
   <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
-  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">Hemos recibido tu pago correctamente.</p>
-  <ul style="margin:0 0 12px; padding:0 0 0 16px; color:#111827; font:14px system-ui;">
-    <li><b>Importe pagado:</b> ${escapeHtml(totalFmt)}</li>
-    <li><b>Nº factura/recibo:</b> ${escapeHtml(invoiceNumber || '-')}</li>
-  </ul>
-  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">Adjuntamos el recibo en PDF${ATTACH_STRIPE_INVOICE ? ' y la factura de Stripe' : ''}.</p>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">${escapeHtml(intro)}</p>
+</td></tr>
+<tr><td style="padding:0 24px 8px; background:#ffffff;"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+<tr><td style="padding:8px 24px 0; background:#ffffff;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
+    <thead>
+      <tr>
+        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
+        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
+        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
+      </tr>
+    </thead>
+    <tbody>${itemsHTML}</tbody>
+    <tfoot>
+      <tr><td colspan="3"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+      <tr>
+        <td style="padding:12px 0; font-size:14px; color:#111827; font-weight:700;">Total ${isSubscription ? 'primer cargo' : ''}</td>
+        <td></td>
+        <td style="padding:12px 0; font-size:16px; color:#111827; font-weight:800; text-align:right;">${escapeHtml(totalFmt)}</td>
+      </tr>
+    </tfoot>
+  </table>
+</td></tr>
+<tr><td style="padding:12px 24px 0; background:#ffffff;">
+  <p style="margin:0; font:12px system-ui; color:#6b7280;">
+    Adjuntamos tu recibo en PDF${ATTACH_STRIPE_INVOICE ? ' y la factura oficial de Stripe' : ''}.
+  </p>
 </td></tr>`;
 
   const html = emailShell({
-    title: isSubscription ? 'Suscripción: pago confirmado' : 'Confirmación de pago',
-    headerLabel: isSubscription ? 'Suscripción: pago confirmado' : 'Confirmación de pago',
+    title: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
+    headerLabel: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
     bodyHTML,
-    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}. Todos los derechos reservados.</p>`
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand || BRAND)}. Todos los derechos reservados.</p>`
   });
 
+  // Envío con el mismo proveedor que el resto
   if (process.env.RESEND_API_KEY) {
     const resend = new Resend(process.env.RESEND_API_KEY);
     await resend.emails.send({
