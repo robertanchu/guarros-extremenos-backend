@@ -1,4 +1,4 @@
-// server.js (ESM)
+// server.js (ESM, completo)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -20,7 +20,6 @@ const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
 const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || 'https://guarros-extremenos-api.onrender.com';
 const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || 'https://guarrosextremenos.com/account';
-// (nuevo) configuración opcional del Billing Portal
 const BILLING_PORTAL_CONFIG = process.env.STRIPE_BILLING_PORTAL_CONFIG || null;
 
 // ====== CORS ======
@@ -101,6 +100,14 @@ function emailShell({ title, headerLabel, bodyHTML, footerHTML }) {
   </table>
 </body></html>`;
 }
+// boolean helper
+function bool(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  if (v == null) return false;
+  const s = String(v).toLowerCase();
+  return ['true','1','yes','y','on'].includes(s);
+}
 
 // ====== PDF Recibo Propio ======
 async function createPaidReceiptPDF({ invoiceNumber, total, currency='EUR', lineItems=[], customer={}, paidAt=new Date(), brand=BRAND, logoUrl=BRAND_LOGO_URL }) {
@@ -117,7 +124,7 @@ async function createPaidReceiptPDF({ invoiceNumber, total, currency='EUR', line
   const items = (lineItems || []).map(li => ({
     description: li?.description || 'Producto',
     quantity: li?.quantity || 1,
-    totalCents: typeof li?.amount_total === 'number' ? li.amount_total : (typeof li?.amount === 'number' ? li.amount : 0),
+    totalCents: Number(li?.amount_total ?? li?.amount ?? 0),
     unitCents: (li?.price?.unit_amount ?? null),
     currency: (li?.currency || currency || 'EUR').toUpperCase()
   }));
@@ -182,6 +189,7 @@ async function createPaidReceiptPDF({ invoiceNumber, total, currency='EUR', line
   doc.text(invText, rightX, topY, { align: 'right' });
   doc.moveDown(1);
 
+  // Cliente (alineado derecha, con dirección)
   if (customer && (customer.name || customer.email || addressStr)) {
     const pageWidth = doc.page.width;
     const { right } = doc.page.margins;
@@ -421,7 +429,6 @@ async function sendCustomerOrderAndInvoiceEmail({
 }) {
   if (!to) return;
 
-  // Adjuntos: nuestro recibo + (opcional) factura Stripe
   const receiptBuffer = await createPaidReceiptPDF({
     invoiceNumber, total, currency, lineItems, customer, paidAt: new Date(), brand, logoUrl: BRAND_LOGO_URL,
   });
@@ -509,7 +516,7 @@ ${afterAttachmentsNote}`;
   }
 }
 
-// === (nuevo) Email interno al admin ===
+// Email interno admin
 async function sendAdminEmail({
   session,
   lineItems = [],
@@ -601,7 +608,7 @@ async function sendAdminEmail({
   console.warn('[sendAdminEmail] sin proveedor email configurado');
 }
 
-// === (nuevo) Emails al cancelar suscripción (cliente + admin)
+// === Emails al cancelar suscripción (cliente + admin)
 async function sendSubscriptionCanceledEmails({
   toCustomer, customerName, customerId, subscriptionId,
   corporateEmail,
@@ -666,6 +673,53 @@ async function sendSubscriptionCanceledEmails({
     return;
   }
   console.warn('[sendSubscriptionCanceledEmails] No hay proveedor de email configurado');
+}
+
+// === Email cancelación programada (opcional)
+async function sendSubscriptionScheduledCancelEmail({
+  toCustomer, customerName, customerId, subscriptionId, cancelAt,
+  brand = BRAND
+}) {
+  if (!toCustomer) return;
+  const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
+  const subject = `⏳ Cancelación programada de tu suscripción — ${brand}`;
+  const when = cancelAt ? new Date(cancelAt * 1000) : null;
+  const whenTxt = when ? when.toLocaleString('es-ES', { dateStyle: 'medium' }) : 'fin de ciclo';
+
+  const body = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${customerName ? `Hola ${escapeHtml(customerName)},` : 'Hola,'}</p>
+  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">
+    Has solicitado cancelar tu suscripción al <strong>final del periodo</strong>. Dejará de renovarse el <strong>${escapeHtml(whenTxt)}</strong>.
+  </p>
+  <p style="margin:0 0 8px; font:13px system-ui; color:#6b7280;">
+    ID cliente: ${escapeHtml(customerId || '-')}<br/>
+    ID suscripción: ${escapeHtml(subscriptionId || '-')}
+  </p>
+  <p style="margin:12px 0 0; font:13px system-ui; color:#374151;">
+    Si quieres reactivarla o cancelar inmediatamente, usa el botón de gestión o contesta a este correo.
+  </p>
+</td></tr>
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  ${manageSubscriptionButtonHTML(customerId)}
+</td></tr>
+`;
+
+  const html = emailShell({
+    title: 'Cancelación programada',
+    headerLabel: 'Cancelación programada',
+    bodyHTML: body,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}.</p>`
+  });
+
+  if (process.env.RESEND_API_KEY) {
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({ from, to: toCustomer, subject, html });
+  } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    await sendViaGmailSMTP({ from, to: toCustomer, subject, html });
+  } else {
+    console.warn('[sendSubscriptionScheduledCancelEmail] Sin proveedor de email configurado');
+  }
 }
 
 // ====== Middl. y logs ======
@@ -769,6 +823,15 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   async function markSubscriptionCanceled({ subscription_id }) {
     if (!pool) return;
     await pool.query(`UPDATE subscribers SET status='canceled', canceled_at=now() WHERE subscription_id=$1`, [subscription_id]);
+  }
+  async function markSubscriptionScheduledCancel({ subscription_id, cancel_at_epoch }) {
+    if (!pool) return;
+    const ts = cancel_at_epoch ? new Date(cancel_at_epoch * 1000).toISOString() : null;
+    await pool.query(
+      `UPDATE subscribers SET cancel_at = $2, status = COALESCE(status,'active'), updated_at = timezone('utc', now())
+       WHERE subscription_id = $1`,
+      [subscription_id, ts]
+    );
   }
   async function logSubscriptionInvoice({ invoice, items=[] }) {
     if (!pool) return;
@@ -951,24 +1014,105 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         break;
       }
 
-      // === CANCELACIÓN DE SUSCRIPCIÓN ===
-      case 'customer.subscription.deleted': {
-        const sub = event.data.object; // Stripe Subscription
+      // === CANCELACIÓN PROGRAMADA / CAMBIOS DE ESTADO ===
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        const prev = event.data.previous_attributes || {};
         try {
-          // 1) DB
+          const nowCancelAtPeriodEnd = bool(sub.cancel_at_period_end);
+          const beforeCancelAtPeriodEnd = bool(prev.cancel_at_period_end ?? false);
+          const nowStatus = sub.status;
+          const beforeStatus = prev.status;
+
+          // Programación de cancelación (de false -> true)
+          if (!beforeCancelAtPeriodEnd && nowCancelAtPeriodEnd) {
+            await markSubscriptionScheduledCancel({
+              subscription_id: sub.id,
+              cancel_at_epoch: sub.cancel_at || sub.current_period_end
+            });
+
+            const sendScheduledMail = String(process.env.EMAIL_ON_SCHEDULED_CANCEL || 'true').toLowerCase() !== 'false';
+            if (sendScheduledMail) {
+              let to = null, name = '';
+              try {
+                const cust = await stripe.customers.retrieve(sub.customer);
+                to = cust?.email || null;
+                name = cust?.name || '';
+              } catch (e) { console.warn('[updated] get customer warn:', e?.message || e); }
+
+              try {
+                await sendSubscriptionScheduledCancelEmail({
+                  toCustomer: to,
+                  customerName: name,
+                  customerId: sub.customer,
+                  subscriptionId: sub.id,
+                  cancelAt: sub.cancel_at || sub.current_period_end
+                });
+                console.log('📧 Email cancelación programada enviado');
+              } catch (e) {
+                console.error('📧 Email cancelación programada ERROR:', e);
+              }
+            }
+          }
+
+          // Transición a canceled (poco común pero posible desde updated)
+          const becameCanceled = (beforeStatus && beforeStatus !== 'canceled') && nowStatus === 'canceled';
+          if (becameCanceled) {
+            await markSubscriptionCanceled({ subscription_id: sub.id });
+
+            let to = null, name = '';
+            try {
+              const cust = await stripe.customers.retrieve(sub.customer);
+              to = cust?.email || null;
+              name = cust?.name || '';
+            } catch (e) { console.warn('[updated->canceled] get customer warn:', e?.message || e); }
+
+            try {
+              await sendSubscriptionCanceledEmails({
+                toCustomer: to,
+                customerName: name,
+                customerId: sub.customer,
+                subscriptionId: sub.id,
+                corporateEmail: process.env.CORPORATE_EMAIL,
+                brand: BRAND
+              });
+              console.log('📧 Emails de cancelación (desde updated) enviados OK');
+            } catch (e) {
+              console.error('📧 Emails de cancelación (desde updated) ERROR:', e);
+            }
+          }
+
+          // Mantener ficha sincronizada
+          try {
+            await upsertSubscriber({
+              customer_id: sub.customer, subscription_id: sub.id,
+              email: null, name: null,
+              plan: sub.items?.data?.[0]?.price?.id || null,
+              status: sub.status, meta: sub.metadata || {}
+            });
+          } catch (e) { console.error('[updated] upsertSubscriber ERROR:', e); }
+
+        } catch (e) {
+          console.error('[webhook] subscription.updated ERROR:', e);
+        }
+        break;
+      }
+
+      // === CANCELACIÓN EFECTIVA ===
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        try {
           await markSubscriptionCanceled({ subscription_id: sub.id });
 
-          // 2) Datos cliente
           let to = null, name = '';
           try {
             const cust = await stripe.customers.retrieve(sub.customer);
             to = cust?.email || null;
             name = cust?.name || '';
           } catch (e) {
-            console.warn('[webhook] get customer on canceled warn:', e?.message || e);
+            console.warn('[deleted] get customer warn:', e?.message || e);
           }
 
-          // 3) Emails
           try {
             await sendSubscriptionCanceledEmails({
               toCustomer: to,
@@ -987,19 +1131,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         } catch (e) {
           console.error('[webhook] subscription.deleted ERROR:', e);
         }
-        break;
-      }
-
-      case 'customer.subscription.updated': {
-        const sub = event.data.object;
-        try {
-          await upsertSubscriber({
-            customer_id: sub.customer, subscription_id: sub.id,
-            email: null, name: null,
-            plan: sub.items?.data?.[0]?.price?.id || null,
-            status: sub.status, meta: sub.metadata || {}
-          });
-        } catch (e) { console.error('[webhook] subscription.updated ERROR:', e); }
         break;
       }
 
@@ -1155,7 +1286,7 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// Suscripción (forzando datos en Stripe)
+// Suscripción (Checkout Session)
 app.post('/create-subscription-session', async (req, res) => {
   try {
     const { price, quantity = 1, success_url, cancel_url, customer } = req.body || {};
