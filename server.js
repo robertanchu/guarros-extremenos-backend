@@ -1152,6 +1152,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
 // ================= API REST =================
 app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
 
 app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
