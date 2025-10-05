@@ -440,10 +440,10 @@ ${JSON.stringify(metadata || {}, null, 2)}
 
 async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand, isSubscription }) {
   if (!to) { console.warn('[email cliente] Falta "to"'); return; }
+
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const replyTo = process.env.SUPPORT_EMAIL || supportEmail || 'soporte@guarrosextremenos.com';
   const totalFmt = currencyFormat(Number(amountTotal || 0), currency || 'EUR');
-  const itemsPlain = formatLineItemsPlain(lineItems, currency || 'EUR');
   const itemsHTML = formatLineItemsHTML(lineItems, currency || 'EUR');
 
   const wantBcc = String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true';
@@ -458,15 +458,6 @@ async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, o
   const intro = isSubscription
     ? `¡Gracias por suscribirte a ${brand || BRAND}! Tu suscripción ha quedado activada correctamente.`
     : `¡Gracias por tu compra en ${brand || BRAND}! Tu pago se ha recibido correctamente.`;
-
-  const text = [
-    name ? `Hola ${name},` : 'Hola,', '',
-    intro, '', 'Resumen:', itemsPlain, '',
-    `Total ${isSubscription ? 'del primer cargo' : 'pagado'}: ${totalFmt}`,
-    orderId ? `ID de ${isSubscription ? 'suscripción/pedido' : 'pedido'} (Stripe): ${orderId}` : '',
-    '', `Si tienes cualquier duda, responde a este correo o escríbenos a ${replyTo}.`,
-    '', `Un saludo,`, `Equipo ${brand || BRAND}`
-  ].filter(Boolean).join('\n');
 
   const bodyHTML = `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
@@ -504,11 +495,18 @@ async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, o
 
   if (process.env.RESEND_API_KEY) {
     const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({ from, to, ...(bccList.length ? { bcc: bccList } : {}), reply_to: replyTo, subject, text, html });
+    await resend.emails.send({
+      from,
+      to,
+      ...(bccList.length ? { bcc: bccList } : {}),
+      reply_to: replyTo,
+      subject,
+      html
+    });
     return;
   }
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    await sendViaGmailSMTP({ from, to, subject, text, html });
+    await sendViaGmailSMTP({ from, to, subject, html });
     return;
   }
   console.warn('[email cliente] Sin proveedor email configurado');
@@ -529,7 +527,7 @@ async function sendCustomerOrderAndInvoiceEmail({
 }) {
   if (!to) return;
 
-  // Recibo PDF propio:
+  // Recibo PDF propio con logo (usa emailShell/BRAND_LOGO_URL indirectamente)
   const receiptBuffer = await createPaidReceiptPDF({
     invoiceNumber,
     total,
@@ -571,19 +569,25 @@ async function sendCustomerOrderAndInvoiceEmail({
     : `✅ Confirmación de pago — ${brand}`;
 
   const totalFmt = currencyFormat(Number(total || 0), currency || 'EUR');
-  const html = `
-    <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;">
-      <h2 style="color:${BRAND_PRIMARY}; margin:0 0 6px;">${escapeHtml(brand)} — Confirmación de pago</h2>
-      <p>Hola${name ? ` ${escapeHtml(name)}` : ''},</p>
-      <p>Hemos recibido tu pago correctamente.</p>
-      <ul>
-        <li><b>Importe pagado:</b> ${escapeHtml(totalFmt)}</li>
-        <li><b>Nº factura/recibo:</b> ${escapeHtml(invoiceNumber || '-')}</li>
-      </ul>
-      <p>Adjuntamos el recibo en PDF${ATTACH_STRIPE_INVOICE ? ' y la factura de Stripe' : ''}.</p>
-      <p style="margin-top:16px">¡Gracias!</p>
-    </div>
-  `;
+
+  // **AHORA usamos emailShell → incluye logo y estilo como antes**
+  const bodyHTML = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">Hemos recibido tu pago correctamente.</p>
+  <ul style="margin:0 0 12px; padding:0 0 0 16px; color:#111827; font:14px system-ui;">
+    <li><b>Importe pagado:</b> ${escapeHtml(totalFmt)}</li>
+    <li><b>Nº factura/recibo:</b> ${escapeHtml(invoiceNumber || '-')}</li>
+  </ul>
+  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">Adjuntamos el recibo en PDF${ATTACH_STRIPE_INVOICE ? ' y la factura de Stripe' : ''}.</p>
+</td></tr>`;
+
+  const html = emailShell({
+    title: isSubscription ? 'Suscripción: pago confirmado' : 'Confirmación de pago',
+    headerLabel: isSubscription ? 'Suscripción: pago confirmado' : 'Confirmación de pago',
+    bodyHTML,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}. Todos los derechos reservados.</p>`
+  });
 
   if (process.env.RESEND_API_KEY) {
     const resend = new Resend(process.env.RESEND_API_KEY);
@@ -596,10 +600,7 @@ async function sendCustomerOrderAndInvoiceEmail({
       attachments
     });
   } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    await sendViaGmailSMTP({
-      from, to, subject, html,
-      attachments
-    });
+    await sendViaGmailSMTP({ from, to, subject, html, attachments });
   } else {
     console.warn('[email combine] Sin proveedor email configurado');
   }
