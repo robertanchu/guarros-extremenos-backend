@@ -562,6 +562,7 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 /* =================  CHECKOUT SUSCRIPCIÓN  ================= */
+// === /create-subscription-session (REEMPLAZA ESTE BLOQUE) ===
 app.post('/create-subscription-session', async (req, res) => {
   try {
     const { price, quantity = 1, success_url, cancel_url, customer } = req.body || {};
@@ -574,36 +575,41 @@ app.post('/create-subscription-session', async (req, res) => {
       return res.status(400).json({ error: `Invalid price id: ${price}` });
     }
 
-    // Upsert de Customer por email (evita doble formulario)
+    // Si nos mandas datos del cliente, busca/crea el Customer en Stripe
     let customerId;
     if (customer?.email) {
-      const list = await stripe.customers.list({ email: customer.email, limit: 1 });
-      const exists = list.data[0];
-      if (exists) {
-        customerId = exists.id;
-        await stripe.customers.update(customerId, {
-          name: customer.name || undefined,
-          phone: customer.phone || undefined,
-        });
-      } else {
-        const created = await stripe.customers.create({
-          email: customer.email,
-          name: customer.name || undefined,
-          phone: customer.phone || undefined,
-        });
-        customerId = created.id;
+      try {
+        const list = await stripe.customers.list({ email: customer.email, limit: 1 });
+        const exists = list.data[0];
+        if (exists) {
+          customerId = exists.id;
+          await stripe.customers.update(customerId, {
+            name: customer.name || undefined,
+            phone: customer.phone || undefined,
+          });
+        } else {
+          const created = await stripe.customers.create({
+            email: customer.email,
+            name: customer.name || undefined,
+            phone: customer.phone || undefined,
+          });
+          customerId = created.id;
+        }
+      } catch (e) {
+        console.warn('[create-subscription-session] customer upsert warn:', e?.message || e);
       }
     }
 
+    // ⚠️ IMPORTANTE: NO usar customer_creation en modo 'subscription'
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      ...(customerId ? { customer: customerId } : { customer_creation: 'always' }),
+      ...(customerId ? { customer: customerId } : {}), // si no hay, Stripe creará uno al completar
       success_url,
       cancel_url,
       allow_promotion_codes: true,
       line_items: [{ price: realPrice, quantity }],
       billing_address_collection: 'auto',
-      automatic_tax: { enabled: false }, // pon true si usas Stripe Tax
+      automatic_tax: { enabled: false }, // activa si usas Stripe Tax
       metadata: { source: 'guarros-front-subscription' },
     });
 
@@ -613,6 +619,7 @@ app.post('/create-subscription-session', async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 });
+
 
 /* =====================  CUSTOMER PORTAL  ===================== */
 app.post('/billing-portal', async (req, res) => {
