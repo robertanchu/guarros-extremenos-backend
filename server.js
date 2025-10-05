@@ -903,6 +903,54 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     return invoice.customer_details?.address || { country: invoice.customer_details?.address?.country || '' };
   }
 
+async function getCustomerEmailAndNameForSubscription(stripeClient, sub) {
+  let email = null, name = '';
+  // 1) Customer directo
+  try {
+    const cust = await stripeClient.customers.retrieve(sub.customer);
+    email = cust?.email || email;
+    name  = cust?.name  || name;
+    if (email && name) return { email, name };
+  } catch (e) {
+    console.warn('[cancel helper] customers.retrieve warn:', e?.message || e);
+  }
+
+  // 2) Última invoice de la suscripción
+  try {
+    // Buscar la invoice más reciente asociada
+    const invs = await stripeClient.invoices.list({ subscription: sub.id, limit: 1 });
+    const inv  = invs?.data?.[0];
+    if (inv) {
+      email = inv.customer_email || inv.customer_details?.email || email;
+      name  = inv.customer_name  || inv.customer_details?.name  || name;
+      if (email) return { email, name };
+    }
+  } catch (e) {
+    console.warn('[cancel helper] invoices.list warn:', e?.message || e);
+  }
+
+  // 3) Últimas sesiones de checkout del customer
+  try {
+    const sessions = await stripeClient.checkout.sessions.list({ customer: sub.customer, limit: 5 });
+    const completed = (sessions?.data || []).find(s => s.status === 'complete') || sessions?.data?.[0];
+    if (completed) {
+      email = completed.customer_details?.email || completed.customer_email || email;
+      name  = completed.customer_details?.name  || name;
+      if (email) return { email, name };
+    }
+  } catch (e) {
+    console.warn('[cancel helper] sessions.list warn:', e?.message || e);
+  }
+
+  // 4) Metadata de la suscripción (por si guardasteis ahí)
+  email = sub.metadata?.email || email;
+  name  = sub.metadata?.name  || name;
+
+  return { email, name };
+}
+
+
+
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
@@ -1071,124 +1119,118 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
 
 
-      case 'customer.subscription.updated': {
-        const sub = event.data.object;
-        const prev = event.data.previous_attributes || {};
-        try {
-          const nowCancelAtPeriodEnd = bool(sub.cancel_at_period_end);
-          const beforeCancelAtPeriodEnd = bool(prev.cancel_at_period_end ?? false);
-          const nowStatus = sub.status;
-          const beforeStatus = prev.status;
+case 'customer.subscription.updated': {
+  const sub = event.data.object;
+  const prev = event.data.previous_attributes || {};
+  try {
+    const nowCancelAtPeriodEnd    = !!sub.cancel_at_period_end;
+    const beforeCancelAtPeriodEnd = !!(prev.cancel_at_period_end ?? false);
+    const nowStatus   = sub.status;
+    const beforeStatus= prev.status;
 
-          // Programación de cancelación (de false -> true)
-          if (!beforeCancelAtPeriodEnd && nowCancelAtPeriodEnd) {
-            await markSubscriptionScheduledCancel({
-              subscription_id: sub.id,
-              cancel_at_epoch: sub.cancel_at || sub.current_period_end
-            });
+    // (A) Cancelación programada: false -> true
+    if (!beforeCancelAtPeriodEnd && nowCancelAtPeriodEnd) {
+      await markSubscriptionScheduledCancel({
+        subscription_id: sub.id,
+        cancel_at_epoch: sub.cancel_at || sub.current_period_end
+      });
 
-            const sendScheduledMail = String(process.env.EMAIL_ON_SCHEDULED_CANCEL || 'true').toLowerCase() !== 'false';
-            if (sendScheduledMail) {
-              let to = null, name = '';
-              try {
-                const cust = await stripe.customers.retrieve(sub.customer);
-                to = cust?.email || null;
-                name = cust?.name || '';
-              } catch (e) { console.warn('[updated] get customer warn:', e?.message || e); }
-
-              try {
-                await sendSubscriptionScheduledCancelEmail({
-                  toCustomer: to,
-                  customerName: name,
-                  customerId: sub.customer,
-                  subscriptionId: sub.id,
-                  cancelAt: sub.cancel_at || sub.current_period_end
-                });
-                console.log('📧 Email cancelación programada enviado');
-              } catch (e) {
-                console.error('📧 Email cancelación programada ERROR:', e);
-              }
-            }
-          }
-
-          // Transición a canceled (poco común pero posible desde updated)
-          const becameCanceled = (beforeStatus && beforeStatus !== 'canceled') && nowStatus === 'canceled';
-          if (becameCanceled) {
-            await markSubscriptionCanceled({ subscription_id: sub.id });
-
-            let to = null, name = '';
-            try {
-              const cust = await stripe.customers.retrieve(sub.customer);
-              to = cust?.email || null;
-              name = cust?.name || '';
-            } catch (e) { console.warn('[updated->canceled] get customer warn:', e?.message || e); }
-
-            try {
-              await sendSubscriptionCanceledEmails({
-                toCustomer: to,
-                customerName: name,
-                customerId: sub.customer,
-                subscriptionId: sub.id,
-                corporateEmail: process.env.CORPORATE_EMAIL,
-                brand: BRAND
-              });
-              console.log('📧 Emails de cancelación (desde updated) enviados OK');
-            } catch (e) {
-              console.error('📧 Emails de cancelación (desde updated) ERROR:', e);
-            }
-          }
-
-          // Mantener ficha sincronizada
+      const sendScheduledMail = String(process.env.EMAIL_ON_SCHEDULED_CANCEL || 'true').toLowerCase() !== 'false';
+      if (sendScheduledMail) {
+        const { email, name } = await getCustomerEmailAndNameForSubscription(stripe, sub);
+        if (email) {
           try {
-            await upsertSubscriber({
-              customer_id: sub.customer, subscription_id: sub.id,
-              email: null, name: null,
-              plan: sub.items?.data?.[0]?.price?.id || null,
-              status: sub.status, meta: sub.metadata || {}
-            });
-          } catch (e) { console.error('[updated] upsertSubscriber ERROR:', e); }
-
-        } catch (e) {
-          console.error('[webhook] subscription.updated ERROR:', e);
-        }
-        break;
-      }
-
-      // === CANCELACIÓN EFECTIVA ===
-      case 'customer.subscription.deleted': {
-        const sub = event.data.object;
-        try {
-          await markSubscriptionCanceled({ subscription_id: sub.id });
-
-          let to = null, name = '';
-          try {
-            const cust = await stripe.customers.retrieve(sub.customer);
-            to = cust?.email || null;
-            name = cust?.name || '';
-          } catch (e) {
-            console.warn('[deleted] get customer warn:', e?.message || e);
-          }
-
-          try {
-            await sendSubscriptionCanceledEmails({
-              toCustomer: to,
+            await sendSubscriptionScheduledCancelEmail({
+              toCustomer: email,
               customerName: name,
               customerId: sub.customer,
               subscriptionId: sub.id,
-              corporateEmail: process.env.CORPORATE_EMAIL,
-              brand: BRAND
+              cancelAt: sub.cancel_at || sub.current_period_end
             });
-            console.log('📧 Emails de cancelación enviados OK');
+            console.log('📧 Email cancelación programada enviado →', email);
           } catch (e) {
-            console.error('📧 Emails de cancelación ERROR:', e);
+            console.error('📧 Email cancelación programada ERROR:', e);
           }
-
-          console.log('✅ subscription.deleted', sub.id);
-        } catch (e) {
-          console.error('[webhook] subscription.deleted ERROR:', e);
+        } else {
+          console.warn('⚠️ No hay email del cliente para cancelación programada (updated). Se enviará solo a admin.');
+          // Aviso interno a admin
+          await sendSubscriptionCanceledEmails({
+            toCustomer: null, // no cliente
+            customerName: name,
+            customerId: sub.customer,
+            subscriptionId: sub.id,
+            corporateEmail: process.env.CORPORATE_EMAIL,
+            brand: BRAND
+          });
         }
-        break;
       }
+    }
+
+    // (B) Si pasa a "canceled" aquí
+    const becameCanceled = (beforeStatus && beforeStatus !== 'canceled') && nowStatus === 'canceled';
+    if (becameCanceled) {
+      await markSubscriptionCanceled({ subscription_id: sub.id });
+
+      const { email, name } = await getCustomerEmailAndNameForSubscription(stripe, sub);
+      try {
+        await sendSubscriptionCanceledEmails({
+          toCustomer: email || null,
+          customerName: name,
+          customerId: sub.customer,
+          subscriptionId: sub.id,
+          corporateEmail: process.env.CORPORATE_EMAIL,
+          brand: BRAND
+        });
+        console.log('📧 Emails de cancelación (desde updated) enviados', email ? `→ ${email}` : '(solo admin)');
+      } catch (e) {
+        console.error('📧 Emails de cancelación (desde updated) ERROR:', e);
+      }
+    }
+
+    // (C) Mantener ficha sincronizada
+    try {
+      await upsertSubscriber({
+        customer_id: sub.customer, subscription_id: sub.id,
+        email: null, name: null,
+        plan: sub.items?.data?.[0]?.price?.id || null,
+        status: sub.status, meta: sub.metadata || {}
+      });
+    } catch (e) { console.error('[updated] upsertSubscriber ERROR:', e); }
+
+    console.log('✅ customer.subscription.updated', sub.id, 'status:', nowStatus, 'cancel_at_period_end:', nowCancelAtPeriodEnd);
+  } catch (e) {
+    console.error('[webhook] subscription.updated ERROR:', e);
+  }
+  break;
+}
+
+case 'customer.subscription.deleted': {
+  const sub = event.data.object;
+  try {
+    await markSubscriptionCanceled({ subscription_id: sub.id });
+
+    const { email, name } = await getCustomerEmailAndNameForSubscription(stripe, sub);
+    try {
+      await sendSubscriptionCanceledEmails({
+        toCustomer: email || null,
+        customerName: name,
+        customerId: sub.customer,
+        subscriptionId: sub.id,
+        corporateEmail: process.env.CORPORATE_EMAIL,
+        brand: BRAND
+      });
+      console.log('📧 Emails de cancelación enviados', email ? `→ ${email}` : '(solo admin)');
+    } catch (e) {
+      console.error('📧 Emails de cancelación ERROR:', e);
+    }
+
+    console.log('✅ customer.subscription.deleted', sub.id);
+  } catch (e) {
+    console.error('[webhook] subscription.deleted ERROR:', e);
+  }
+  break;
+}
+
 
       case 'invoice.payment_failed':
         console.warn('⚠️ invoice.payment_failed', event.data.object.id);
