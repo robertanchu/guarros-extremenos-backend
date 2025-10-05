@@ -1015,6 +1015,62 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       }
 
       // === CANCELACIÓN PROGRAMADA / CAMBIOS DE ESTADO ===
+	case 'customer.subscription.created': {
+  // Cuando se crea la suscripción (justo después del checkout, o desde el Portal)
+  const sub = event.data.object; // Stripe Subscription
+  try {
+    // Cargamos el customer para obtener email/nombre si es posible
+    let cust = null;
+    try {
+      cust = await stripe.customers.retrieve(sub.customer);
+    } catch (e) {
+      console.warn('[subscription.created] get customer warn:', e?.message || e);
+    }
+
+    // Guardamos/actualizamos el suscriptor en DB
+    try {
+      await upsertSubscriber({
+        customer_id: sub.customer,
+        subscription_id: sub.id,
+        email: cust?.email || null,
+        name: cust?.name || null,
+        phone: cust?.phone || null,
+        // IMPORTANTE: la migración SQL ya te añadió columna "plan"
+        plan: sub.items?.data?.[0]?.price?.id || null,
+        status: sub.status,
+        // Dirección básica si la tuviera ya el customer (no siempre ocurre aquí)
+        address: cust?.address?.line1 || null,
+        city: cust?.address?.city || null,
+        postal: cust?.address?.postal_code || null,
+        country: cust?.address?.country || null,
+        meta: sub.metadata || {}
+      });
+      console.log('🗄️ subscriber upsert (created) OK', sub.id);
+    } catch (e) {
+      console.error('[subscription.created] upsertSubscriber ERROR:', e);
+    }
+
+    // Si ya viniera marcada cancelación al final (raro al crear, pero por robustez)
+    if (sub.cancel_at_period_end) {
+      try {
+        await markSubscriptionScheduledCancel({
+          subscription_id: sub.id,
+          cancel_at_epoch: sub.cancel_at || sub.current_period_end
+        });
+      } catch (e) {
+        console.error('[subscription.created] mark scheduled cancel ERROR:', e);
+      }
+    }
+
+    console.log('✅ customer.subscription.created', sub.id);
+  } catch (e) {
+    console.error('[webhook] subscription.created ERROR:', e);
+  }
+  break;
+}
+
+
+
       case 'customer.subscription.updated': {
         const sub = event.data.object;
         const prev = event.data.previous_attributes || {};
