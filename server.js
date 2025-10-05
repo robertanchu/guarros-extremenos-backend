@@ -20,6 +20,8 @@ const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
 const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || 'https://guarros-extremenos-api.onrender.com';
 const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || 'https://guarrosextremenos.com/account';
+// (nuevo) configuración opcional del Billing Portal
+const BILLING_PORTAL_CONFIG = process.env.STRIPE_BILLING_PORTAL_CONFIG || null;
 
 // ====== CORS ======
 const exactOrigins = (process.env.ALLOWED_ORIGINS || '')
@@ -509,6 +511,98 @@ ${afterAttachmentsNote}`;
   } else {
     console.warn('[email combine] Sin proveedor email configurado');
   }
+}
+
+// === (nuevo) Email interno al admin ===
+async function sendAdminEmail({
+  session,
+  lineItems = [],
+  customerEmail,
+  name,
+  phone,
+  amountTotal,
+  currency = 'EUR',
+  metadata = {},
+  shipping = {}
+}) {
+  const to = process.env.CORPORATE_EMAIL || process.env.SMTP_USER;
+  if (!to) { console.warn('[sendAdminEmail] CORPORATE_EMAIL/SMTP_USER no definido'); return; }
+
+  const from = process.env.CORPORATE_FROM || process.env.CUSTOMER_FROM || 'no-reply@guarrosextremenos.com';
+  const subject = `🧾 Nuevo ${session?.mode === 'subscription' ? 'alta de suscripción' : 'pedido'} — ${session?.id || ''}`;
+  const itemsHTML = formatLineItemsHTML(lineItems, currency);
+  const totalFmt = currencyFormat(Number(amountTotal || 0), currency);
+
+  const metaHTML = Object.entries(metadata || {})
+    .filter(([k,v]) => v != null && v !== '')
+    .map(([k,v]) => `<li><b>${escapeHtml(k)}:</b> ${escapeHtml(String(v))}</li>`)
+    .join('');
+
+  const shipHTML = Object.entries(shipping || {})
+    .filter(([k,v]) => v != null && v !== '')
+    .map(([k,v]) => `<li><b>${escapeHtml(k)}:</b> ${escapeHtml(String(v))}</li>`)
+    .join('');
+
+  const whoHTML = `
+    <ul style="margin:0; padding-left:16px; color:#111827; font:14px system-ui;">
+      <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
+      <li><b>Email:</b> ${escapeHtml(customerEmail || '-')}</li>
+      <li><b>Teléfono:</b> ${escapeHtml(phone || '-')}</li>
+      <li><b>Session ID:</b> ${escapeHtml(session?.id || '-')}</li>
+      <li><b>Modo:</b> ${escapeHtml(session?.mode || '-')}</li>
+    </ul>
+    ${metaHTML ? `<p style="margin:10px 0 0; font:13px system-ui; color:#374151;"><b>Metadata:</b></p><ul style="margin:6px 0 0; padding-left:16px; font:13px system-ui; color:#374151;">${metaHTML}</ul>` : ''}
+    ${shipHTML ? `<p style="margin:10px 0 0; font:13px system-ui; color:#374151;"><b>Shipping:</b></p><ul style="margin:6px 0 0; padding-left:16px; font:13px system-ui; color:#374151;">${shipHTML}</ul>` : ''}
+  `;
+
+  const bodyHTML = `
+<tr><td style="padding:0 24px 8px; background:#ffffff;">
+  <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">
+    Nuevo ${session?.mode === 'subscription' ? 'ALTA DE SUSCRIPCIÓN' : 'PEDIDO'} desde la web.
+  </p>
+  ${whoHTML}
+</td></tr>
+
+<tr><td style="padding:12px 24px 8px; background:#ffffff;"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+
+<tr><td style="padding:8px 24px 0; background:#ffffff;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
+    <thead>
+      <tr>
+        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
+        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
+        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
+      </tr>
+    </thead>
+    <tbody>${itemsHTML}</tbody>
+    <tfoot>
+      <tr><td colspan="3"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
+      <tr>
+        <td style="padding:12px 0; font-size:14px; color:#111827; font-weight:700;">Total</td>
+        <td></td>
+        <td style="padding:12px 0; font-size:16px; color:#111827; font-weight:800; text-align:right;">${escapeHtml(totalFmt)}</td>
+      </tr>
+    </tfoot>
+  </table>
+</td></tr>`;
+
+  const html = emailShell({
+    title: 'Nuevo pedido',
+    headerLabel: 'Nuevo pedido web',
+    bodyHTML,
+    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
+  });
+
+  if (process.env.RESEND_API_KEY) {
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({ from, to, subject, html });
+    return;
+  }
+  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    await sendViaGmailSMTP({ from, to, subject, html });
+    return;
+  }
+  console.warn('[sendAdminEmail] sin proveedor email configurado');
 }
 
 // ====== Middl. y logs ======
@@ -1038,7 +1132,8 @@ app.post('/billing-portal', async (req, res) => {
     if (!customer_id) return res.status(400).json({ error: 'Missing customer_id' });
     const portal = await stripe.billingPortal.sessions.create({
       customer: customer_id,
-      return_url: return_url || PORTAL_RETURN_URL
+      return_url: return_url || PORTAL_RETURN_URL,
+      ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {})
     });
     return res.json({ url: portal.url });
   } catch (e) {
@@ -1053,7 +1148,11 @@ app.get('/billing-portal/link', async (req, res) => {
     const customer_id = req.query.customer_id;
     const return_url = req.query.return || PORTAL_RETURN_URL;
     if (!customer_id) return res.status(400).send('Missing customer_id');
-    const portal = await stripe.billingPortal.sessions.create({ customer: customer_id, return_url });
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: customer_id,
+      return_url,
+      ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {})
+    });
     return res.redirect(302, portal.url);
   } catch (e) {
     console.error('billing-portal/link error:', e);
