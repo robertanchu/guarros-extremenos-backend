@@ -484,7 +484,15 @@ async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, o
       </tr>
     </tfoot>
   </table>
+</td></tr>
+<tr><td style="padding:12px 24px 0; background:#ffffff;">
+  <p style="margin:0 0 6px; font:13px system-ui; color:#374151;">
+    ${isSubscription
+      ? 'Tu suscripción se renovará automáticamente cada mes. Si necesitas gestionar o cancelar tu suscripción, escríbenos a <strong>soporte@guarrosextremenos.com</strong> y te ayudamos.'
+      : 'En breve prepararemos tu pedido. Si necesitas cualquier cambio o ayuda, responde a este correo o escríbenos a <strong>soporte@guarrosextremenos.com</strong>.'}
+  </p>
 </td></tr>`;
+
 
   const html = emailShell({
     title: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
@@ -604,11 +612,19 @@ async function sendCustomerOrderAndInvoiceEmail({
     </tfoot>
   </table>
 </td></tr>
-<tr><td style="padding:12px 24px 0; background:#ffffff;">
-  <p style="margin:0; font:12px system-ui; color:#6b7280;">
+<tr><td style="padding:12px 24px 6px; background:#ffffff;">
+  <p style="margin:0 0 6px; font:12px system-ui; color:#6b7280;">
     Adjuntamos tu recibo en PDF${ATTACH_STRIPE_INVOICE ? ' y la factura oficial de Stripe' : ''}.
   </p>
+</td></tr>
+<tr><td style="padding:0 24px 0; background:#ffffff;">
+  <p style="margin:0 0 6px; font:13px system-ui; color:#374151;">
+    ${isSubscription
+      ? 'Tu suscripción se renovará automáticamente cada mes. Si necesitas gestionar o cancelar tu suscripción, escríbenos a <strong>soporte@guarrosextremenos.com</strong> y te ayudamos.'
+      : 'En breve prepararemos tu pedido. Si necesitas cualquier cambio o ayuda, responde a este correo o escríbenos a <strong>soporte@guarrosextremenos.com</strong>.'}
+  </p>
 </td></tr>`;
+
 
   const html = emailShell({
     title: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
