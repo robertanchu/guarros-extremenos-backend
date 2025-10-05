@@ -1513,52 +1513,221 @@ async function logOrderItems(sessionId, lineItems, currency) {
 }
 
 /* ---------- Suscriptores ---------- */
-async function upsertSubscriber({
-  customer_id,
-  subscription_id,
-  email,
-  name,
-  price_id,
-  status,
-  current_period_start,
-  current_period_end,
-  cancel_at,
-  canceled_at,
-  metadata = {}
-}) {
-  if (!pool) { console.warn('[db] DATABASE_URL no configurado (upsertSubscriber)'); return; }
 
+async function upsertSubscriber(pg, {
+  customer_id,
+  subscription_id = null,
+  email,
+  plan,
+  status,
+  name = null,
+  phone = null,
+  address = null,
+  city = null,
+  postal = null,
+  country = null,
+  meta = null
+}) {
   const text = `
-    INSERT INTO subscribers
-      (customer_id, subscription_id, email, name, price_id, status,
-       current_period_start, current_period_end, cancel_at, canceled_at, metadata)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-    ON CONFLICT (subscription_id) DO UPDATE SET
-      email = EXCLUDED.email,
-      name = EXCLUDED.name,
-      price_id = EXCLUDED.price_id,
-      status = EXCLUDED.status,
-      current_period_start = EXCLUDED.current_period_start,
-      current_period_end = EXCLUDED.current_period_end,
-      cancel_at = EXCLUDED.cancel_at,
-      canceled_at = EXCLUDED.canceled_at,
-      metadata = EXCLUDED.metadata
+    INSERT INTO subscribers (
+      customer_id, subscription_id, email, plan, status,
+      name, phone, address, city, postal, country, meta,
+      created_at, updated_at
+    ) VALUES (
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9, $10, $11, $12,
+      timezone('utc', now()), timezone('utc', now())
+    )
+    ON CONFLICT (customer_id) DO UPDATE
+    SET
+      subscription_id = COALESCE(EXCLUDED.subscription_id, subscribers.subscription_id),
+      email           = COALESCE(EXCLUDED.email, subscribers.email),
+      plan            = COALESCE(EXCLUDED.plan, subscribers.plan),
+      status          = COALESCE(EXCLUDED.status, subscribers.status),
+      name            = COALESCE(EXCLUDED.name, subscribers.name),
+      phone           = COALESCE(EXCLUDED.phone, subscribers.phone),
+      address         = COALESCE(EXCLUDED.address, subscribers.address),
+      city            = COALESCE(EXCLUDED.city, subscribers.city),
+      postal          = COALESCE(EXCLUDED.postal, subscribers.postal),
+      country         = COALESCE(EXCLUDED.country, subscribers.country),
+      meta            = COALESCE(EXCLUDED.meta, subscribers.meta),
+      updated_at      = timezone('utc', now())
+    RETURNING *;
   `;
   const values = [
-    customer_id,
-    subscription_id,
-    email || null,
-    name || null,
-    price_id || null,
-    status || null,
-    current_period_start ? new Date(current_period_start * 1000).toISOString() : null,
-    current_period_end ? new Date(current_period_end * 1000).toISOString() : null,
-    cancel_at ? new Date(cancel_at * 1000).toISOString() : null,
-    canceled_at ? new Date(canceled_at * 1000).toISOString() : null,
-    JSON.stringify(metadata || {})
+    customer_id, subscription_id, email, plan, status,
+    name, phone, address, city, postal, country,
+    meta ? JSON.stringify(meta) : null
   ];
-  await pool.query(text, values);
+  const { rows } = await pg.query(text, values);
+  return rows[0];
 }
+
+// DEDUP: intenta insertar el id del evento; si ya existe, ya fue procesado.
+async function dedupEvent(pg, eventId) {
+  const q = `
+    INSERT INTO processed_events(event_id) VALUES($1)
+    ON CONFLICT DO NOTHING
+    RETURNING event_id
+  `;
+  const r = await pg.query(q, [eventId]);
+  return r.rowCount === 1; // true si es nuevo; false si ya existía
+}
+
+// Helper para extraer el primer priceId de un objeto invoice/checkout
+function firstLinePriceIdFromInvoice(inv) {
+  const line = inv?.lines?.data?.[0];
+  return line?.price?.id || null;
+}
+
+app.post('/webhook',
+  // 👇 raw body SOLO aquí
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error('[webhook] signature error:', err?.message || err);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // DEDUP
+    try {
+      const isNew = await dedupEvent(pg, event.id);
+      if (!isNew) {
+        // Ya procesado: responde 200 para que Stripe no reintente
+        return res.status(200).json({ ok: true, dedup: true });
+      }
+    } catch (e) {
+      console.error('[webhook] dedup error:', e?.message || e);
+      // aunque falle dedup, no rompemos el flujo
+    }
+
+    console.log('[webhook] EVENT', { id: event.id, type: event.type, livemode: event.livemode, created: event.created });
+
+    try {
+      switch (event.type) {
+
+        // 1) Checkout completado (suscripción creada, pero puede no estar “active” aún)
+        case 'checkout.session.completed': {
+          const session = event.data.object;
+          const customerId = session.customer || null;
+          const subscriptionId = session.subscription || null;
+          const email = session.customer_details?.email || session.customer_email || null;
+          const name = session.customer_details?.name || null;
+          const phone = session.customer_details?.phone || null;
+          const country = session.customer_details?.address?.country || null;
+          const address = session.customer_details?.address?.line1 || null;
+          const city = session.customer_details?.address?.city || null;
+          const postal = session.customer_details?.address?.postal_code || null;
+
+          // Intentamos averiguar el priceId del plan consultando las line items (1º de la lista)
+          let planPriceId = null;
+          try {
+            const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
+            planPriceId = li?.data?.[0]?.price?.id || null;
+          } catch (e) {
+            console.warn('[webhook] listLineItems warn:', e?.message || e);
+          }
+
+          // status preliminar (se consolidará en invoice.payment_succeeded)
+          const status = session.mode === 'subscription'
+            ? (session.payment_status === 'paid' ? 'active' : session.payment_status || 'incomplete')
+            : session.payment_status || 'paid';
+
+          await upsertSubscriber(pg, {
+            customer_id: customerId,
+            subscription_id: subscriptionId,
+            email,
+            plan: planPriceId,
+            status,
+            name,
+            phone,
+            address,
+            city,
+            postal,
+            country,
+            meta: { event_id: event.id, event_type: event.type, session_id: session.id }
+          });
+
+          break;
+        }
+
+        // 2) Cobro de factura correcto (ya “active” de verdad)
+        case 'invoice.payment_succeeded': {
+          const invoice = event.data.object;
+          const customerId = invoice.customer || null;
+          const subscriptionId = invoice.subscription || null;
+          const email = invoice.customer_email || invoice.customer_name || null;
+          const name = invoice.customer_name || null;
+          const planPriceId = firstLinePriceIdFromInvoice(invoice);
+          const status = 'active';
+
+          // Dirección (si viene)
+          const address = invoice.customer_address?.line1 || null;
+          const city    = invoice.customer_address?.city || null;
+          const postal  = invoice.customer_address?.postal_code || null;
+          const country = invoice.customer_address?.country || null;
+          const phone   = invoice.customer_phone || null;
+
+          await upsertSubscriber(pg, {
+            customer_id: customerId,
+            subscription_id: subscriptionId,
+            email,
+            plan: planPriceId,
+            status,
+            name,
+            phone,
+            address,
+            city,
+            postal,
+            country,
+            meta: { event_id: event.id, event_type: event.type, invoice_id: invoice.id }
+          });
+
+          break;
+        }
+
+        // 3) Cancelación de suscripción (deja de facturarse)
+        case 'customer.subscription.deleted': {
+          const sub = event.data.object;
+          const customerId = sub.customer || null;
+          const subscriptionId = sub.id || null;
+          const status = 'canceled';
+
+          await upsertSubscriber(pg, {
+            customer_id: customerId,
+            subscription_id: subscriptionId,
+            email: null,
+            plan: sub.items?.data?.[0]?.price?.id || null,
+            status,
+            name: null, phone: null, address: null, city: null, postal: null, country: null,
+            meta: { event_id: event.id, event_type: event.type }
+          });
+
+          break;
+        }
+
+        default:
+          // otros eventos: no acción
+          break;
+      }
+
+      return res.status(200).json({ ok: true });
+    } catch (err) {
+      console.error('[webhook] handler error:', err);
+      // Nota: NO borrar el registro de dedup aunque falle
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 async function markSubscriptionCanceled({ subscription_id }) {
   if (!pool) return;
