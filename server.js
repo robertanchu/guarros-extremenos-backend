@@ -489,7 +489,7 @@ async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, o
   <p style="margin:0 0 6px; font:13px system-ui; color:#374151;">
     ${isSubscription
       ? 'Tu suscripción se renovará automáticamente cada mes. Si necesitas gestionar o cancelar tu suscripción, escríbenos a <strong>soporte@guarrosextremenos.com</strong> y te ayudamos.'
-      : 'En breve prepararemos tu pedido. Si necesitas cualquier cambio o ayuda, responde a este correo o escríbenos a <strong>soporte@guarrosextremenos.com</strong>.'}
+      : 'En breve prepararemos tu pedido. Si necesitas cualquier cambio o ayuda, escríbenos a <strong>soporte@guarrosextremenos.com</strong>.'}
   </p>
 </td></tr>`;
 
@@ -621,7 +621,7 @@ async function sendCustomerOrderAndInvoiceEmail({
   <p style="margin:0 0 6px; font:13px system-ui; color:#374151;">
     ${isSubscription
       ? 'Tu suscripción se renovará automáticamente cada mes. Si necesitas gestionar o cancelar tu suscripción, escríbenos a <strong>soporte@guarrosextremenos.com</strong> y te ayudamos.'
-      : 'En breve prepararemos tu pedido. Si necesitas cualquier cambio o ayuda, responde a este correo o escríbenos a <strong>soporte@guarrosextremenos.com</strong>.'}
+      : 'En breve prepararemos tu pedido. Si necesitas cualquier cambio o ayuda, escríbenos a <strong>soporte@guarrosextremenos.com</strong>.'}
   </p>
 </td></tr>`;
 
