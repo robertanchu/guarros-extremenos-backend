@@ -14,30 +14,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
-/*
-ENV recomendadas:
-- STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
-- RESEND_API_KEY  (o SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS)
-- DATABASE_URL    (SSL on, rejectUnauthorized=false)
-- CORPORATE_EMAIL, CORPORATE_FROM, CUSTOMER_FROM, SUPPORT_EMAIL
-- BRAND_NAME, BRAND_PRIMARY (#D62828), BRAND_LOGO_URL
-- ALLOWED_ORIGINS (comma), ALLOWED_DOMAINS (comma)
-- COMBINE_CONFIRMATION_AND_INVOICE = true|false
-- ATTACH_STRIPE_INVOICE = true|false
-- CUSTOMER_BCC_CORPORATE = true|false
-- COMPANY_NAME, COMPANY_TAX_ID, COMPANY_ADDRESS, COMPANY_CITY, COMPANY_POSTAL, COMPANY_COUNTRY, RECEIPT_SERIE
-- STRIPE_SHIPPING_RATE_ID (opcional, para envíos en one-time)
-- CUSTOMER_PORTAL_RETURN_URL (URL de retorno del portal)
-- SUB_500_PRICE_ID, SUB_1000_PRICE_ID  (IDs reales de Stripe para alias)
-*/
+// ====== ENV / Marca ======
+const BRAND = process.env.BRAND_NAME || "Guarros Extremeños";
+const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
+const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
+const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || 'https://guarros-extremenos-api.onrender.com';
+const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || 'https://guarrosextremenos.com/account';
 
-// ---------- CORS ----------
+// ====== CORS ======
 const exactOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
-
 const baseDomains = (process.env.ALLOWED_DOMAINS || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-
 function isOriginAllowed(origin) {
   if (!origin) return true;
   try {
@@ -45,11 +33,8 @@ function isOriginAllowed(origin) {
     const u = new URL(origin);
     const host = (u.hostname || '').toLowerCase();
     return baseDomains.some(d => host === d || host.endsWith('.' + d));
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
-
 const corsOptions = {
   origin: (origin, cb) => isOriginAllowed(origin) ? cb(null, true) : cb(new Error('Not allowed by CORS: ' + origin)),
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -57,34 +42,25 @@ const corsOptions = {
   maxAge: 600
 };
 
-app.use(morgan('tiny'));
-
-// ========================= DB (POOL) =========================
+// ====== DB ======
 const pool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { require: true, rejectUnauthorized: false } })
   : null;
 
-// ================== HELPERS DE FORMATO / BRAND ==================
-const BRAND = process.env.BRAND_NAME || "Guarros Extremeños";
-const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
-const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
-
+// ====== Utils ======
 function escapeHtml(str) {
   return String(str || '')
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
 }
-
 function currencyFormat(amount = 0, currency = 'EUR') {
   try { return new Intl.NumberFormat('es-ES', { style: 'currency', currency }).format(Number(amount)); }
   catch { return `${Number(amount).toFixed(2)} ${(currency||'EUR').toUpperCase()}`; }
 }
-
 function formatLineItemsPlain(lineItems = [], currency = 'EUR') {
   const lines = (lineItems || []).map(li => `• ${li.description} x${li.quantity} — ${currencyFormat((li.amount_total ?? li.amount ?? 0)/100, currency)}`);
   return lines.length ? lines.join('\n') : '—';
 }
-
 function formatLineItemsHTML(lineItems = [], currency = 'EUR') {
   if (!Array.isArray(lineItems) || !lineItems.length)
     return '<tr><td colspan="3" style="padding:8px 0;color:#6b7280">No hay productos.</td></tr>';
@@ -103,7 +79,6 @@ function formatLineItemsHTML(lineItems = [], currency = 'EUR') {
     `;
   }).join('');
 }
-
 function emailShell({ title, headerLabel, bodyHTML, footerHTML }) {
   const logoBlock = BRAND_LOGO_URL
     ? `<img src="${BRAND_LOGO_URL}" alt="${escapeHtml(BRAND)}" width="200" style="display:block; max-width:200px; width:100%; height:auto; margin:0 auto 8px;" />`
@@ -129,18 +104,8 @@ function emailShell({ title, headerLabel, bodyHTML, footerHTML }) {
 </body></html>`;
 }
 
-// ================== PDF RECIBO (PAGADO) ==================
-async function createPaidReceiptPDF({
-  invoiceNumber,
-  total,
-  currency = 'EUR',
-  lineItems = [],
-  customer = {},
-  paidAt = new Date(),
-  brand = BRAND,
-  logoUrl = BRAND_LOGO_URL,
-}) {
-  // Normaliza address (string u objeto tipo Stripe)
+// ====== PDF Recibo Propio ======
+async function createPaidReceiptPDF({ invoiceNumber, total, currency='EUR', lineItems=[], customer={}, paidAt=new Date(), brand=BRAND, logoUrl=BRAND_LOGO_URL }) {
   const addrObj = (customer.address && typeof customer.address === 'object') ? customer.address : null;
   const line1   = addrObj?.line1 || (typeof customer.address === 'string' ? customer.address : '') || customer.line1 || '';
   const line2   = addrObj?.line2 || customer.line2 || '';
@@ -177,7 +142,6 @@ async function createPaidReceiptPDF({
     doc.on('error', reject);
   });
 
-  // Header: logo o marca
   try {
     if (logoUrl) {
       const resp = await fetch(logoUrl);
@@ -197,7 +161,6 @@ async function createPaidReceiptPDF({
   doc.moveDown(0.5);
   doc.font('Helvetica-Bold').fontSize(18).fillColor('#D62828').text('RECIBO DE PAGO', { align: 'right' });
 
-  // Datos emisor / recibo
   doc.moveDown(0.5);
   doc.font('Helvetica').fontSize(10).fillColor('#111');
   const leftX = doc.x, topY = doc.y;
@@ -209,7 +172,6 @@ async function createPaidReceiptPDF({
     [company.postal, company.city].filter(Boolean).join(' '),
     company.country
   ].filter(Boolean).join('\n');
-
   doc.text(emisor, leftX, topY, { width: 260 });
 
   const rightX = 300;
@@ -220,34 +182,26 @@ async function createPaidReceiptPDF({
     `Estado: PAGADO`,
   ].join('\n');
   doc.text(invText, rightX, topY, { align: 'right' });
-
   doc.moveDown(1);
 
-  // --- Cliente (columna derecha, alineado a la derecha) ---
   if (customer && (customer.name || customer.email || addressStr)) {
     const pageWidth = doc.page.width;
     const { right } = doc.page.margins;
     const colWidth = 260;
     const xRight   = pageWidth - right - colWidth;
-
     doc.font('Helvetica-Bold').fontSize(11).fillColor('#111')
        .text('Cliente', xRight, doc.y, { width: colWidth, align: 'right' });
-
     doc.moveDown(0.2);
-
     doc.font('Helvetica').fontSize(10).fillColor('#111');
     const custLines = [
       customer.name,
       customer.email,
       addressStr || null
     ].filter(Boolean).join('\n');
-
     doc.text(custLines || '-', xRight, doc.y, { width: colWidth, align: 'right' });
   }
 
   doc.moveDown(0.8);
-
-  // --- Tabla: Cabecera alineada ---
   doc.font('Helvetica-Bold').fontSize(10);
 
   const xDesc = 56,  wDesc = 280;
@@ -273,7 +227,6 @@ async function createPaidReceiptPDF({
      .moveTo(56, sepY).lineTo(56 + 480, sepY).stroke();
   doc.restore();
 
-  // --- Filas ---
   doc.font('Helvetica').fontSize(10);
 
   let y = sepY + 6;
@@ -337,7 +290,7 @@ async function createPaidReceiptPDF({
   return await done;
 }
 
-// ================== EMAIL (Resend/SMTP) ==================
+// ====== Email / Envío ======
 async function sendViaGmailSMTP({ from, to, subject, text, html, attachments }) {
   const port = Number(process.env.SMTP_PORT || 465);
   const secure = String(port) === '465';
@@ -353,94 +306,27 @@ async function sendViaGmailSMTP({ from, to, subject, text, html, attachments }) 
   return info;
 }
 
-async function sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping }) {
-  const to = process.env.CORPORATE_EMAIL || 'pedidos@tudominio.com';
-  const from = process.env.CORPORATE_FROM || process.env.SMTP_USER || 'no-reply@tu-dominio.com';
-
-  const itemsPlain = formatLineItemsPlain(lineItems, currency);
-  const itemsHTML = formatLineItemsHTML(lineItems, currency);
-  const totalFmt = currencyFormat(amountTotal, currency);
-
-  const text = `
-Nuevo pedido completado (Stripe)
-
-Cliente: ${name || '(sin nombre)'} <${customerEmail || 'sin email'}>
-Teléfono: ${phone || '-'}
-
-Total: ${totalFmt}
-Session ID: ${session.id}
-
-Dirección:
-${shipping?.line1 || ''} ${shipping?.line2 || ''}
-${shipping?.postal_code || ''} ${shipping?.city || ''}
-${shipping?.country || ''}
-
-Productos:
-${itemsPlain}
-
-Metadata:
-${JSON.stringify(metadata || {}, null, 2)}
-`.trim();
-
-  const bodyHTML = `
-<tr><td style="padding:0 24px 8px; background:#ffffff;">
-  <p style="margin:0 0 12px; font:14px/1.5 system-ui; color:#374151;">
-    <strong>Cliente:</strong> ${escapeHtml(name || '(sin nombre)')} &lt;${escapeHtml(customerEmail || 'sin email')}&gt;<br/>
-    <strong>Teléfono:</strong> ${escapeHtml(phone || '-')}
-  </p>
-  <div style="height:1px; background:#e5e7eb;"></div>
-</td></tr>
-<tr><td style="padding:8px 24px 0; background:#ffffff;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
-    <thead>
-      <tr>
-        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
-        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
-        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
-      </tr>
-    </thead>
-    <tbody>${itemsHTML}</tbody>
-    <tfoot>
-      <tr><td colspan="3"><div style="height:1px; background:#e5e7eb;"></div></td></tr>
-      <tr>
-        <td style="padding:12px 0; font-size:14px; color:#111827; font-weight:700;">Total</td>
-        <td></td>
-        <td style="padding:12px 0; font-size:16px; color:#111827; font-weight:800; text-align:right;">${escapeHtml(totalFmt)}</td>
-      </tr>
-    </tfoot>
-  </table>
-</td></tr>
-<tr><td style="padding:8px 24px 8px; background:#ffffff;">
-  <div style="font:12px system-ui; color:#6b7280;">
-    <strong>Session ID:</strong> ${escapeHtml(session.id)}<br/>
-    <strong>Dirección:</strong> ${escapeHtml([shipping?.line1, shipping?.line2].filter(Boolean).join(' ') || '')}<br/>
-    ${escapeHtml([shipping?.postal_code, shipping?.city, shipping?.country].filter(Boolean).join(' ') || '')}<br/>
-    <strong>Metadata:</strong><pre style="white-space:pre-wrap; font-size:12px; color:#374151; background:#f9fafb; border:1px solid #e5e7eb; padding:8px; border-radius:8px;">${escapeHtml(JSON.stringify(metadata || {}, null, 2))}</pre>
-  </div>
-</td></tr>`;
-
-  const html = emailShell({
-    title: `Nuevo pedido — ${totalFmt}`,
-    headerLabel: `Nuevo pedido — ${totalFmt}`,
-    bodyHTML,
-    footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>`
-  });
-
-  if (process.env.RESEND_API_KEY) {
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({ from, to, subject: `🧾 Nuevo pedido — ${totalFmt}`, text, html });
-    return;
-  }
-  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    await sendViaGmailSMTP({ from, to, subject: `🧾 Nuevo pedido — ${totalFmt}`, text, html });
-    return;
-  }
-  console.warn('[email admin] Sin proveedor email configurado');
+function manageSubscriptionButtonHTML(customerId) {
+  if (!customerId) return '';
+  const link = `${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId)}&return=${encodeURIComponent(PORTAL_RETURN_URL)}`;
+  return `
+    <div style="text-align:center; margin:16px 0 6px;">
+      <a href="${link}"
+         style="display:inline-block; background:${BRAND_PRIMARY};
+                color:#fff; text-decoration:none; font-weight:700;
+                padding:10px 16px; border-radius:10px; letter-spacing:.2px">
+        Gestionar suscripción
+      </a>
+    </div>
+    <p style="margin:6px 0 0; font:12px system-ui; color:#6b7280; text-align:center;">
+      Puedes pausar o cancelar cuando quieras
+    </p>
+  `;
 }
 
-async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand, isSubscription }) {
+// === Email Confirmación (COMBINE=false) ===
+async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, orderId, supportEmail, brand, isSubscription, customerId }) {
   if (!to) { console.warn('[email cliente] Falta "to"'); return; }
-
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const replyTo = process.env.SUPPORT_EMAIL || supportEmail || 'soporte@guarrosextremenos.com';
   const totalFmt = currencyFormat(Number(amountTotal || 0), currency || 'EUR');
@@ -458,6 +344,22 @@ async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, o
   const intro = isSubscription
     ? `¡Gracias por suscribirte a ${brand || BRAND}! Tu suscripción ha quedado activada correctamente.`
     : `¡Gracias por tu compra en ${brand || BRAND}! Tu pago se ha recibido correctamente.`;
+
+  const afterTableNote = `
+  <tr><td style="padding:12px 24px 0; background:#ffffff;">
+    <p style="margin:0 0 6px; font:13px system-ui; color:#374151;">
+      ${isSubscription
+        ? 'Tu suscripción se renovará automáticamente cada mes.'
+        : 'En breve prepararemos tu pedido.'}
+    </p>
+  </td></tr>
+  ${isSubscription ? `<tr><td style="padding:0 24px 8px; background:#ffffff;">${manageSubscriptionButtonHTML(customerId)}</td></tr>` : ''}
+  <tr><td style="padding:0 24px 0; background:#ffffff;">
+    <p style="margin:0 0 6px; font:13px system-ui; color:#374151;">
+      Si necesitas cualquier ayuda, responde a este correo o escríbenos a <strong>soporte@guarrosextremenos.com</strong>.
+    </p>
+  </td></tr>
+`;
 
   const bodyHTML = `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
@@ -485,14 +387,7 @@ async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, o
     </tfoot>
   </table>
 </td></tr>
-<tr><td style="padding:12px 24px 0; background:#ffffff;">
-  <p style="margin:0 0 6px; font:13px system-ui; color:#374151;">
-    ${isSubscription
-      ? 'Tu suscripción se renovará automáticamente cada mes. Si necesitas gestionar o cancelar tu suscripción, escríbenos a <strong>soporte@guarrosextremenos.com</strong> y te ayudamos.'
-      : 'En breve prepararemos tu pedido. Si necesitas cualquier cambio o ayuda, escríbenos a <strong>soporte@guarrosextremenos.com</strong>.'}
-  </p>
-</td></tr>`;
-
+${afterTableNote}`;
 
   const html = emailShell({
     title: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
@@ -520,37 +415,19 @@ async function sendCustomerEmail({ to, name, amountTotal, currency, lineItems, o
   console.warn('[email cliente] Sin proveedor email configurado');
 }
 
+// === Email Combinado (COMBINE=true) ===
 async function sendCustomerOrderAndInvoiceEmail({
-  to,
-  name,
-  invoiceNumber,
-  total,
-  currency,
-  pdfUrl,            // invoice.invoice_pdf de Stripe (opcional)
-  lineItems = [],    // se mostrará en la tabla (igual que en sendCustomerEmail)
-  brand = BRAND,
-  isSubscription = false,
-  alsoBccCorporate = false,
-  customer = {}      // { name, email, address: {line1,line2,city,postal_code,country} } (para nuestro PDF)
+  to, name, invoiceNumber, total, currency, pdfUrl,
+  lineItems = [], brand = BRAND, isSubscription = false,
+  alsoBccCorporate = false, customer = {}, customerId
 }) {
   if (!to) return;
 
-  // --- Adjuntos: nuestro recibo PDF (siempre) + (opcional) factura de Stripe ---
+  // Adjuntos: nuestro recibo + (opcional) factura Stripe
   const receiptBuffer = await createPaidReceiptPDF({
-    invoiceNumber,
-    total,
-    currency,
-    lineItems,
-    customer,
-    paidAt: new Date(),
-    brand: brand,
-    logoUrl: BRAND_LOGO_URL,
+    invoiceNumber, total, currency, lineItems, customer, paidAt: new Date(), brand, logoUrl: BRAND_LOGO_URL,
   });
-  const attachments = [{
-    filename: `recibo-${invoiceNumber || 'pago'}.pdf`,
-    content: receiptBuffer,
-    contentType: 'application/pdf'
-  }];
+  const attachments = [{ filename: `recibo-${invoiceNumber || 'pago'}.pdf`, content: receiptBuffer, contentType: 'application/pdf' }];
 
   const ATTACH_STRIPE_INVOICE = String(process.env.ATTACH_STRIPE_INVOICE || 'false') === 'true';
   if (ATTACH_STRIPE_INVOICE && pdfUrl) {
@@ -558,22 +435,13 @@ async function sendCustomerOrderAndInvoiceEmail({
       const resp = await fetch(pdfUrl);
       if (resp.ok) {
         const buf = Buffer.from(await resp.arrayBuffer());
-        attachments.push({
-          filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf`,
-          content: buf,
-          contentType: 'application/pdf'
-        });
+        attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf`, content: buf, contentType: 'application/pdf' });
       }
-    } catch (e) {
-      console.warn('[email combine] No se pudo descargar invoice_pdf:', e?.message || e);
-    }
+    } catch (e) { console.warn('[email combine] No se pudo descargar invoice_pdf:', e?.message || e); }
   }
 
-  // --- MISMO “look & feel” que sendCustomerEmail ---
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const wantBcc = alsoBccCorporate && process.env.CORPORATE_EMAIL;
-
-  // Usamos el MISMO subject/intro que en sendCustomerEmail
   const subject = isSubscription
     ? `✅ Suscripción activada ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand || BRAND}`
     : `✅ Confirmación de pedido ${invoiceNumber ? `#${invoiceNumber}` : ''} — ${brand || BRAND}`;
@@ -585,7 +453,19 @@ async function sendCustomerOrderAndInvoiceEmail({
   const totalFmt = currencyFormat(Number(total || 0), currency || 'EUR');
   const itemsHTML = formatLineItemsHTML(lineItems, currency || 'EUR');
 
-  // Cuerpo HTML calcado al de sendCustomerEmail (tabla + total)
+  const afterAttachmentsNote = `
+  <tr><td style="padding:12px 24px 6px; background:#ffffff;">
+    <p style="margin:0 0 6px; font:12px system-ui; color:#6b7280;">
+      Adjuntamos tu recibo en PDF${ATTACH_STRIPE_INVOICE ? ' y la factura oficial de Stripe' : ''}.
+    </p>
+  </td></tr>
+  ${isSubscription ? `<tr><td style="padding:0 24px 8px; background:#ffffff;">${manageSubscriptionButtonHTML(customerId)}</td></tr>` : ''}
+  <tr><td style="padding:0 24px 0; background:#ffffff;">
+    <p style="margin:0 0 6px; font:13px system-ui; color:#374151;">
+      Si necesitas cualquier ayuda, responde a este correo o escríbenos a <strong>soporte@guarrosextremenos.com</strong>.
+    </p>
+  </td></tr>`;
+
   const bodyHTML = `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
   <p style="margin:0 0 12px; font:15px system-ui; color:#111827;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
@@ -612,19 +492,7 @@ async function sendCustomerOrderAndInvoiceEmail({
     </tfoot>
   </table>
 </td></tr>
-<tr><td style="padding:12px 24px 6px; background:#ffffff;">
-  <p style="margin:0 0 6px; font:12px system-ui; color:#6b7280;">
-    Adjuntamos tu recibo en PDF${ATTACH_STRIPE_INVOICE ? ' y la factura oficial de Stripe' : ''}.
-  </p>
-</td></tr>
-<tr><td style="padding:0 24px 0; background:#ffffff;">
-  <p style="margin:0 0 6px; font:13px system-ui; color:#374151;">
-    ${isSubscription
-      ? 'Tu suscripción se renovará automáticamente cada mes. Si necesitas gestionar o cancelar tu suscripción, escríbenos a <strong>soporte@guarrosextremenos.com</strong> y te ayudamos.'
-      : 'En breve prepararemos tu pedido. Si necesitas cualquier cambio o ayuda, escríbenos a <strong>soporte@guarrosextremenos.com</strong>.'}
-  </p>
-</td></tr>`;
-
+${afterAttachmentsNote}`;
 
   const html = emailShell({
     title: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
@@ -633,17 +501,9 @@ async function sendCustomerOrderAndInvoiceEmail({
     footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand || BRAND)}. Todos los derechos reservados.</p>`
   });
 
-  // Envío con el mismo proveedor que el resto
   if (process.env.RESEND_API_KEY) {
     const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({
-      from,
-      to,
-      ...(wantBcc ? { bcc: [process.env.CORPORATE_EMAIL] } : {}),
-      subject,
-      html,
-      attachments
-    });
+    await resend.emails.send({ from, to, ...(wantBcc ? { bcc: [process.env.CORPORATE_EMAIL] } : {}), subject, html, attachments });
   } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
     await sendViaGmailSMTP({ from, to, subject, html, attachments });
   } else {
@@ -651,311 +511,187 @@ async function sendCustomerOrderAndInvoiceEmail({
   }
 }
 
-// ================== DB HELPERS ==================
-async function logOrder(order) {
-  if (!pool) { console.warn('[db] DATABASE_URL no configurado. No se guardará el pedido.'); return; }
-  const text = `
-    INSERT INTO orders (session_id, email, name, phone, total, currency, items, metadata, shipping, status, created_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-    ON CONFLICT (session_id) DO NOTHING
-  `;
-  const values = [
-    order.sessionId,
-    order.customerEmail || null,
-    order.name || null,
-    order.phone || null,
-    order.amountTotal || 0,
-    order.currency || 'EUR',
-    JSON.stringify(order.lineItems || []),
-    JSON.stringify(order.metadata || {}),
-    JSON.stringify(order.shipping || {}),
-    order.status || 'paid',
-    order.createdAt || new Date().toISOString(),
-  ];
-  await pool.query(text, values);
-}
+// ====== Middl. y logs ======
+app.use(morgan('tiny'));
 
-async function logOrderItems(sessionId, lineItems, currency) {
-  if (!pool || !Array.isArray(lineItems)) return;
-  const text = `
-    insert into order_items
-      (session_id, description, product_id, price_id, quantity, unit_amount_cents, amount_total_cents, currency, raw)
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-    on conflict do nothing
-  `;
-  for (const li of lineItems) {
-    const vals = [
-      sessionId,
-      li.description || null,
-      li.price?.product || null,
-      li.price?.id || null,
-      li.quantity || 1,
-      li.price?.unit_amount ?? null,
-      (li.amount_total ?? li.amount ?? 0),
-      (li.currency || currency || 'eur').toUpperCase(),
-      JSON.stringify(li),
-    ];
-    await pool.query(text, vals);
-  }
-}
-
-async function upsertSubscriber({
-  customer_id,
-  subscription_id = null,
-  email,
-  plan,
-  status,
-  name = null,
-  phone = null,
-  address = null,
-  city = null,
-  postal = null,
-  country = null,
-  meta = null
-}) {
-  if (!pool) return null;
-  const text = `
-    INSERT INTO subscribers (
-      customer_id, subscription_id, email, plan, status,
-      name, phone, address, city, postal, country, meta,
-      created_at, updated_at
-    ) VALUES (
-      $1, $2, $3, $4, $5,
-      $6, $7, $8, $9, $10, $11, $12,
-      timezone('utc', now()), timezone('utc', now())
-    )
-    ON CONFLICT (customer_id) DO UPDATE
-    SET
-      subscription_id = COALESCE(EXCLUDED.subscription_id, subscribers.subscription_id),
-      email           = COALESCE(EXCLUDED.email, subscribers.email),
-      plan            = COALESCE(EXCLUDED.plan, subscribers.plan),
-      status          = COALESCE(EXCLUDED.status, subscribers.status),
-      name            = COALESCE(EXCLUDED.name, subscribers.name),
-      phone           = COALESCE(EXCLUDED.phone, subscribers.phone),
-      address         = COALESCE(EXCLUDED.address, subscribers.address),
-      city            = COALESCE(EXCLUDED.city, subscribers.city),
-      postal          = COALESCE(EXCLUDED.postal, subscribers.postal),
-      country         = COALESCE(EXCLUDED.country, subscribers.country),
-      meta            = COALESCE(EXCLUDED.meta, subscribers.meta),
-      updated_at      = timezone('utc', now())
-    RETURNING *;
-  `;
-  const values = [
-    customer_id, subscription_id, email, plan, status,
-    name, phone, address, city, postal, country,
-    meta ? JSON.stringify(meta) : null
-  ];
-  const { rows } = await pool.query(text, values);
-  return rows[0];
-}
-
-async function markSubscriptionCanceled({ subscription_id }) {
-  if (!pool) return;
-  const text = `
-    UPDATE subscribers
-    SET status = 'canceled',
-        canceled_at = NOW()
-    WHERE subscription_id = $1
-  `;
-  await pool.query(text, [subscription_id]);
-}
-
-async function logSubscriptionInvoice({ invoice, items = [] }) {
-  if (!pool) return;
-  const text = `
-    INSERT INTO subscription_invoices
-      (invoice_id, subscription_id, customer_id, amount_paid, currency,
-       invoice_number, hosted_invoice_url, invoice_pdf, lines, paid_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-    ON CONFLICT (invoice_id) DO NOTHING
-  `;
-  const values = [
-    invoice.id,
-    invoice.subscription || null,
-    invoice.customer || null,
-    invoice.amount_paid ?? invoice.amount_due ?? 0,
-    (invoice.currency || 'eur').toUpperCase(),
-    invoice.number || null,
-    invoice.hosted_invoice_url || null,
-    invoice.invoice_pdf || null,
-    JSON.stringify(items || []),
-    invoice.status === 'paid' ? new Date((invoice.status_transitions?.paid_at || invoice.created) * 1000).toISOString() : null
-  ];
-  await pool.query(text, values);
-}
-
-// =============== DEDUP de eventos Stripe =================
-async function dedupEvent(eventId) {
-  if (!pool) return true; // si no hay DB, no deduplicamos
-  const q = `
-    INSERT INTO processed_events(event_id) VALUES($1)
-    ON CONFLICT DO NOTHING
-    RETURNING event_id
-  `;
-  const r = await pool.query(q, [eventId]);
-  return r.rowCount === 1; // true si es nuevo; false si ya existía
-}
-
-function firstLinePriceIdFromInvoice(inv) {
-  const line = inv?.lines?.data?.[0];
-  return line?.price?.id || null;
-}
-
-// ============== NORMALIZADORES / ALIAS PRECIOS ==============
-function resolvePriceAlias(maybePrice) {
-  if (!maybePrice) return null;
-  const alias = String(maybePrice).trim();
-
-  const map = {
-    'price_sub_500': process.env.SUB_500_PRICE_ID,
-    'sub_500':       process.env.SUB_500_PRICE_ID,
-    'plan_500':      process.env.SUB_500_PRICE_ID,
-    'price_sub_1000':process.env.SUB_1000_PRICE_ID,
-    'sub_1000':      process.env.SUB_1000_PRICE_ID,
-    'plan_1000':     process.env.SUB_1000_PRICE_ID,
-  };
-
-  if (alias.startsWith('price_')) return alias;
-  const resolved = map[alias];
-  return resolved || alias;
-}
-
-function sanitizeLineItems(rawItems = []) {
-  if (!Array.isArray(rawItems)) return [];
-  return rawItems.map((it) => {
-    const out = { quantity: Number(it?.quantity || 1) };
-    const incoming = it?.price || it?.priceId;
-    if (incoming) out.price = resolvePriceAlias(incoming);
-    if (!out.price && it?.price_data) {
-      return { ...it, quantity: out.quantity };
-    }
-    return out;
-  });
-}
-
-// ------------- Construir dirección real para PDF/email -------------
-async function resolveCheckoutAddress(stripeClient, invoice) {
-  const normalize = (a, meta = {}) => {
-    if (!a && !meta) return null;
-    const o = (a && typeof a === 'object') ? a : {};
-    const line1 = o.line1 || meta.address || '';
-    const line2 = o.line2 || '';
-    const city  = o.city  || meta.city    || '';
-    const state = o.state || '';
-    const postal_code = o.postal_code || meta.postal || meta.postal_code || '';
-    const country = o.country || meta.country || '';
-    if (!line1 && !city && !postal_code && !country) return null;
-    return { line1, line2, city, state, postal_code, country };
-  };
-
-  // 1) La propia invoice
-  let addr = invoice.customer_details?.address || invoice.customer_address || null;
-  let norm = normalize(addr);
-  if (norm) return norm;
-
-  // 2) PaymentIntent -> Charge -> shipping/billing
-  if (invoice.payment_intent) {
-    try {
-      const pi = await stripeClient.paymentIntents.retrieve(invoice.payment_intent, { expand: ['latest_charge'] });
-      let charge = pi.latest_charge;
-      if (charge && typeof charge !== 'object') {
-        charge = await stripeClient.charges.retrieve(charge);
-      }
-      const ship = charge?.shipping?.address || null;
-      const bill = charge?.billing_details?.address || null;
-      norm = normalize(ship) || normalize(bill);
-      if (norm) return norm;
-    } catch (e) {
-      console.warn('[resolveCheckoutAddress] PI/Charge error:', e?.message || e);
-    }
-  }
-
-  // 3) Customer
-  if (invoice.customer) {
-    try {
-      const cust = await stripeClient.customers.retrieve(invoice.customer);
-      norm = normalize(cust?.shipping?.address) || normalize(cust?.address);
-      if (norm) return norm;
-    } catch (e) {
-      console.warn('[resolveCheckoutAddress] customer error:', e?.message || e);
-    }
-  }
-
-  // 4) Últimas Checkout Sessions
-  try {
-    if (invoice.customer) {
-      const sessions = await stripeClient.checkout.sessions.list({ customer: invoice.customer, limit: 5 });
-      const completed = (sessions?.data || []).find(s => s.status === 'complete') || sessions?.data?.[0];
-      if (completed) {
-        norm = normalize(completed.shipping_details?.address);
-        if (norm) return norm;
-        const meta = completed.metadata || {};
-        norm = normalize(null, { address: meta.address, city: meta.city, postal: meta.postal, country: meta.country });
-        if (norm) return norm;
-      }
-    }
-  } catch (e) {
-    console.warn('[resolveCheckoutAddress] sessions.list error:', e?.message || e);
-  }
-
-  // 5) Metadata de la invoice
-  norm = normalize(null, {
-    address: invoice.metadata?.address,
-    city:    invoice.metadata?.city,
-    postal:  invoice.metadata?.postal,
-    country: invoice.metadata?.country
-  });
-  if (norm) return norm;
-
-  // 6) Último recurso
-  return invoice.customer_details?.address || { country: invoice.customer_details?.address?.country || '' };
-}
-
-// ================== WEBHOOK STRIPE ==================
-// ⚠️ RAW body SOLO aquí, y ANTES de express.json()
+// ====== Webhook Stripe (RAW) ======
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
-
   try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error('[webhook] signature error:', err?.message || err);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // DEDUP
+  // dedup
+  async function dedupEvent(eventId) {
+    if (!pool) return true;
+    const r = await pool.query(
+      `INSERT INTO processed_events(event_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING event_id`,
+      [eventId]
+    );
+    return r.rowCount === 1;
+  }
   try {
     const isNew = await dedupEvent(event.id);
-    if (!isNew) {
-      return res.status(200).json({ ok: true, dedup: true });
-    }
-  } catch (e) {
-    console.error('[webhook] dedup error:', e?.message || e);
-  }
+    if (!isNew) return res.status(200).json({ ok: true, dedup: true });
+  } catch (e) { console.error('[webhook] dedup error:', e?.message || e); }
 
   console.log('[webhook] EVENT', { id: event.id, type: event.type, livemode: event.livemode, created: event.created });
+
+  // helpers DB
+  async function logOrder(order) {
+    if (!pool) { console.warn('[db] no DATABASE_URL'); return; }
+    const text = `
+      INSERT INTO orders (session_id, email, name, phone, total, currency, items, metadata, shipping, status, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      ON CONFLICT (session_id) DO NOTHING
+    `;
+    const values = [
+      order.sessionId, order.customerEmail || null, order.name || null, order.phone || null,
+      order.amountTotal || 0, order.currency || 'EUR',
+      JSON.stringify(order.lineItems || []), JSON.stringify(order.metadata || {}), JSON.stringify(order.shipping || {}),
+      order.status || 'paid', order.createdAt || new Date().toISOString(),
+    ];
+    await pool.query(text, values);
+  }
+  async function logOrderItems(sessionId, lineItems, currency) {
+    if (!pool || !Array.isArray(lineItems)) return;
+    const text = `
+      insert into order_items
+        (session_id, description, product_id, price_id, quantity, unit_amount_cents, amount_total_cents, currency, raw)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      on conflict do nothing
+    `;
+    for (const li of lineItems) {
+      const vals = [
+        sessionId,
+        li.description || null,
+        li.price?.product || null,
+        li.price?.id || null,
+        li.quantity || 1,
+        li.price?.unit_amount ?? null,
+        (li.amount_total ?? li.amount ?? 0),
+        (li.currency || currency || 'eur').toUpperCase(),
+        JSON.stringify(li),
+      ];
+      await pool.query(text, vals);
+    }
+  }
+  async function upsertSubscriber({ customer_id, subscription_id=null, email, plan, status, name=null, phone=null, address=null, city=null, postal=null, country=null, meta=null }) {
+    if (!pool) return null;
+    const text = `
+      INSERT INTO subscribers (
+        customer_id, subscription_id, email, plan, status,
+        name, phone, address, city, postal, country, meta,
+        created_at, updated_at
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, timezone('utc',now()), timezone('utc',now())
+      )
+      ON CONFLICT (customer_id) DO UPDATE
+      SET subscription_id = COALESCE(EXCLUDED.subscription_id, subscribers.subscription_id),
+          email = COALESCE(EXCLUDED.email, subscribers.email),
+          plan  = COALESCE(EXCLUDED.plan,  subscribers.plan),
+          status= COALESCE(EXCLUDED.status,subscribers.status),
+          name  = COALESCE(EXCLUDED.name,  subscribers.name),
+          phone = COALESCE(EXCLUDED.phone, subscribers.phone),
+          address=COALESCE(EXCLUDED.address,subscribers.address),
+          city  = COALESCE(EXCLUDED.city,  subscribers.city),
+          postal= COALESCE(EXCLUDED.postal,subscribers.postal),
+          country=COALESCE(EXCLUDED.country,subscribers.country),
+          meta  = COALESCE(EXCLUDED.meta,  subscribers.meta),
+          updated_at = timezone('utc', now())
+      RETURNING *;
+    `;
+    const values = [customer_id, subscription_id, email, plan, status, name, phone, address, city, postal, country, meta ? JSON.stringify(meta) : null];
+    const { rows } = await pool.query(text, values);
+    return rows[0];
+  }
+  async function markSubscriptionCanceled({ subscription_id }) {
+    if (!pool) return;
+    await pool.query(`UPDATE subscribers SET status='canceled', canceled_at=now() WHERE subscription_id=$1`, [subscription_id]);
+  }
+  async function logSubscriptionInvoice({ invoice, items=[] }) {
+    if (!pool) return;
+    const text = `
+      INSERT INTO subscription_invoices
+        (invoice_id, subscription_id, customer_id, amount_paid, currency,
+         invoice_number, hosted_invoice_url, invoice_pdf, lines, paid_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT (invoice_id) DO NOTHING
+    `;
+    const values = [
+      invoice.id, invoice.subscription || null, invoice.customer || null,
+      invoice.amount_paid ?? invoice.amount_due ?? 0,
+      (invoice.currency || 'eur').toUpperCase(),
+      invoice.number || null, invoice.hosted_invoice_url || null, invoice.invoice_pdf || null,
+      JSON.stringify(items || []),
+      invoice.status === 'paid' ? new Date((invoice.status_transitions?.paid_at || invoice.created) * 1000).toISOString() : null
+    ];
+    await pool.query(text, values);
+  }
+
+  // address resolver
+  async function resolveCheckoutAddress(stripeClient, invoice) {
+    const normalize = (a, meta = {}) => {
+      if (!a && !meta) return null;
+      const o = (a && typeof a === 'object') ? a : {};
+      const line1 = o.line1 || meta.address || '';
+      const line2 = o.line2 || '';
+      const city  = o.city  || meta.city    || '';
+      const state = o.state || '';
+      const postal_code = o.postal_code || meta.postal || meta.postal_code || '';
+      const country = o.country || meta.country || '';
+      if (!line1 && !city && !postal_code && !country) return null;
+      return { line1, line2, city, state, postal_code, country };
+    };
+    let norm = normalize(invoice.customer_details?.address) || normalize(invoice.customer_address);
+    if (norm) return norm;
+    if (invoice.payment_intent) {
+      try {
+        const pi = await stripeClient.paymentIntents.retrieve(invoice.payment_intent, { expand: ['latest_charge'] });
+        let charge = pi.latest_charge;
+        if (charge && typeof charge !== 'object') charge = await stripeClient.charges.retrieve(charge);
+        norm = normalize(charge?.shipping?.address) || normalize(charge?.billing_details?.address);
+        if (norm) return norm;
+      } catch (e) { console.warn('[resolveCheckoutAddress] PI/Charge error:', e?.message || e); }
+    }
+    if (invoice.customer) {
+      try {
+        const cust = await stripeClient.customers.retrieve(invoice.customer);
+        norm = normalize(cust?.shipping?.address) || normalize(cust?.address);
+        if (norm) return norm;
+      } catch (e) { console.warn('[resolveCheckoutAddress] customer error:', e?.message || e); }
+    }
+    try {
+      if (invoice.customer) {
+        const sessions = await stripeClient.checkout.sessions.list({ customer: invoice.customer, limit: 5 });
+        const completed = (sessions?.data || []).find(s => s.status === 'complete') || sessions?.data?.[0];
+        if (completed) {
+          norm = normalize(completed.shipping_details?.address);
+          if (norm) return norm;
+          const meta = completed.metadata || {};
+          norm = normalize(null, { address: meta.address, city: meta.city, postal: meta.postal, country: meta.country });
+          if (norm) return norm;
+        }
+      }
+    } catch (e) { console.warn('[resolveCheckoutAddress] sessions.list error:', e?.message || e); }
+    norm = normalize(null, { address: invoice.metadata?.address, city: invoice.metadata?.city, postal: invoice.metadata?.postal, country: invoice.metadata?.country });
+    if (norm) return norm;
+    return invoice.customer_details?.address || { country: invoice.customer_details?.address?.country || '' };
+  }
 
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object;
-
-        // Line items de la sesión
         let lineItems = [];
         try {
-          const li = await stripe.checkout.sessions.listLineItems(session.id, {
-            limit: 100,
-            expand: ['data.price.product']
-          });
+          const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] });
           lineItems = li?.data || [];
-        } catch (e) {
-          console.warn('[webhook] listLineItems error:', e.message);
-        }
+        } catch (e) { console.warn('[webhook] listLineItems error:', e.message); }
 
         const customerEmail = session.customer_details?.email || session.customer_email;
         const name = session.customer_details?.name || session.metadata?.name;
@@ -964,177 +700,96 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         const metadata = session.metadata || {};
         const amountTotal = (session.amount_total ?? 0) / 100;
         const currency = (session.currency || 'eur').toUpperCase();
+        const isSubscription = session.mode === 'subscription' || lineItems.some(li => li?.price?.recurring);
 
-        const isSubscription =
-          session.mode === 'subscription' ||
-          (Array.isArray(lineItems) && lineItems.some(li => li?.price?.recurring));
-
-        // Si es suscripción: sincroniza DB y manda bienvenida
         if (isSubscription && session.subscription) {
           try {
             const sub = await stripe.subscriptions.retrieve(session.subscription);
             const cust = await stripe.customers.retrieve(session.customer);
-
             await upsertSubscriber({
-              customer_id: sub.customer,
-              subscription_id: sub.id,
+              customer_id: sub.customer, subscription_id: sub.id,
               email: cust?.email || session.customer_details?.email || session.customer_email || null,
               name: cust?.name || session.customer_details?.name || null,
               plan: sub.items?.data?.[0]?.price?.id || null,
-              status: sub.status,
-              meta: sub.metadata || {}
+              status: sub.status, meta: sub.metadata || {}
             });
-
-            const unitAmount = sub.items?.data?.[0]?.price?.unit_amount ?? 0;
-            const curr = (sub.items?.data?.[0]?.price?.currency || 'eur').toUpperCase();
-            const to = cust?.email || session.customer_details?.email || session.customer_email || null;
-            await sendSubscriptionWelcomeEmail({
-              to,
-              name: cust?.name || session.customer_details?.name || '',
-              priceAmount: unitAmount,
-              currency: curr,
-              brand: BRAND
-            });
-            console.log('📧 Bienvenida suscripción OK');
-          } catch (e) {
-            console.error('[webhook] suscripción (alta) ERROR:', e);
-          }
+          } catch (e) { console.error('[webhook] suscripción (alta) ERROR:', e); }
         }
 
-        // Email admin (pedido)
         try {
           await sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping });
           console.log('📧 Email admin enviado OK');
-        } catch (e) {
-          console.error('📧 Email admin ERROR:', e);
-        }
+        } catch (e) { console.error('📧 Email admin ERROR:', e); }
 
         const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
-
-        // COMBINE=false → Solo CONFIRMACIÓN (sin adjuntos) en checkout
         if (!combine) {
           try {
             await sendCustomerEmail({
               to: customerEmail, name, amountTotal, currency,
               lineItems, orderId: session.id,
               supportEmail: process.env.SUPPORT_EMAIL,
-              brand: BRAND,
-              isSubscription,
+              brand: BRAND, isSubscription,
+              customerId: session.customer
             });
             console.log('📧 Email cliente enviado OK (solo confirmación)');
-          } catch (e) {
-            console.error('📧 Email cliente (confirmación) ERROR:', e);
-          }
+          } catch (e) { console.error('📧 Email cliente (confirmación) ERROR:', e); }
         } else {
-          console.log('📧 [combine=true] No enviamos correo al cliente en checkout; se enviará combinado en invoice.payment_succeeded');
+          console.log('[combine=true] correo al cliente se enviará en invoice.payment_succeeded');
         }
 
-        // Registro en DB (pedido one-time; para sub guardamos arriba)
         try {
           await logOrder({
-            sessionId: session.id,
-            amountTotal,
-            currency,
-            customerEmail,
-            name,
-            phone,
-            lineItems,
-            metadata,
-            shipping,
-            status: 'paid',
-            createdAt: new Date().toISOString(),
+            sessionId: session.id, amountTotal, currency, customerEmail, name, phone,
+            lineItems, metadata, shipping, status: 'paid', createdAt: new Date().toISOString(),
           });
           await logOrderItems(session.id, lineItems, currency);
           console.log('🗄️ Pedido registrado OK');
-        } catch (e) {
-          console.error('🗄️ Registro en DB ERROR:', e);
-        }
+        } catch (e) { console.error('🗄️ Registro en DB ERROR:', e); }
 
-        console.log('✅ Procesado checkout.session.completed', session.id);
+        console.log('✅ checkout.session.completed', session.id);
         break;
       }
 
       case 'invoice.payment_succeeded': {
         const invoice = event.data.object;
-
-        // Email destino
         let to = invoice.customer_email || invoice.customer_details?.email || null;
         if (!to && invoice.customer) {
-          try {
-            const cust = await stripe.customers.retrieve(invoice.customer);
-            to = cust?.email || null;
-          } catch (e) {
-            console.warn('[invoice.email] retrieve customer error:', e?.message || e);
-          }
+          try { const cust = await stripe.customers.retrieve(invoice.customer); to = cust?.email || null; } catch {}
         }
-
-        const name =
-          invoice.customer_name ||
-          invoice.customer_details?.name ||
-          '';
-
-        // PDF (retry si aún no está listo)
+        const name = invoice.customer_name || invoice.customer_details?.name || '';
         let pdfUrl = invoice.invoice_pdf;
         if (!pdfUrl) {
-          for (let i = 0; i < 3 && !pdfUrl; i++) {
+          for (let i=0; i<3 && !pdfUrl; i++) {
             await new Promise(r => setTimeout(r, 3000));
-            try {
-              const inv2 = await stripe.invoices.retrieve(invoice.id);
-              pdfUrl = inv2.invoice_pdf || null;
-              console.log(`[invoice.retry] intento ${i + 1}: invoice_pdf ${pdfUrl ? 'OK' : 'aún no'}`);
-            } catch (e) {
-              console.warn('[invoice.retry] retrieve error:', e?.message || e);
-            }
+            try { const inv2 = await stripe.invoices.retrieve(invoice.id); pdfUrl = inv2.invoice_pdf || null; } catch {}
           }
         }
-
-        // Líneas para recibo propio
         let invItems = [];
         try {
-          const li = await stripe.invoices.listLineItems(invoice.id, {
-            limit: 100,
-            expand: ['data.price.product']
-          });
+          const li = await stripe.invoices.listLineItems(invoice.id, { limit: 100, expand: ['data.price.product'] });
           invItems = li?.data || [];
-        } catch (e) {
-          console.warn('[invoice.email] listLineItems error:', e?.message || e);
-        }
+        } catch (e) { console.warn('[invoice.email] listLineItems error:', e?.message || e); }
 
-        // Log de invoice de suscripción
-        if (invoice.subscription) {
-          await logSubscriptionInvoice({ invoice, items: invItems });
-        }
+        if (invoice.subscription) await logSubscriptionInvoice({ invoice, items: invItems });
 
-        const isSubscription =
-          !!invoice.subscription || (Array.isArray(invItems) && invItems.some(it => it?.price?.recurring));
+        const isSubscription = !!invoice.subscription || invItems.some(it => it?.price?.recurring);
         const currency = (invoice.currency || 'eur').toUpperCase();
         const total = (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100;
         const invoiceNumber = invoice.number || invoice.id;
 
-        // Dirección enriquecida para el recibo
         const resolvedAddress = await resolveCheckoutAddress(stripe, invoice);
-        const customerForPDF = {
-          name,
-          email: to,
-          address: resolvedAddress
-        };
+        const customerForPDF = { name, email: to, address: resolvedAddress };
 
         const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
-
         if (combine && to) {
           await sendCustomerOrderAndInvoiceEmail({
-            to, name, invoiceNumber, total, currency,
-            pdfUrl, lineItems: invItems,
-            brand: BRAND,
-            isSubscription,
+            to, name, invoiceNumber, total, currency, pdfUrl,
+            lineItems: invItems, brand: BRAND, isSubscription,
             alsoBccCorporate: String(process.env.CUSTOMER_BCC_CORPORATE || '').toLowerCase() === 'true',
-            customer: customerForPDF
+            customer: customerForPDF, customerId: invoice.customer
           });
-          console.log('📧 Email combinado (confirmación + recibo [+ factura]) enviado OK →', to);
-        } else {
-          console.log('[invoice.email] combine=false → no se envía correo al cliente en invoice.payment_succeeded');
+          console.log('📧 Combinado enviado →', to);
         }
-
         console.log('✅ invoice.payment_succeeded', invoice.id);
         break;
       }
@@ -1143,17 +798,12 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         const sub = event.data.object;
         try {
           await upsertSubscriber({
-            customer_id: sub.customer,
-            subscription_id: sub.id,
-            email: null,
-            name: null,
+            customer_id: sub.customer, subscription_id: sub.id,
+            email: null, name: null,
             plan: sub.items?.data?.[0]?.price?.id || null,
-            status: sub.status,
-            meta: sub.metadata || {}
+            status: sub.status, meta: sub.metadata || {}
           });
-        } catch (e) {
-          console.error('[webhook] subscription.updated ERROR:', e);
-        }
+        } catch (e) { console.error('[webhook] subscription.updated ERROR:', e); }
         break;
       }
 
@@ -1161,23 +811,16 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         const sub = event.data.object;
         try {
           await markSubscriptionCanceled({ subscription_id: sub.id });
-
-          // Emails de baja (cliente + corporativo)
-          let to = null, name = '';
-          try {
-            const cust = await stripe.customers.retrieve(sub.customer);
-            to = cust?.email || null;
-            name = cust?.name || '';
-          } catch {}
-          await sendSubscriptionCanceledEmails({
+          let to=null, name='';
+          try { const cust = await stripe.customers.retrieve(sub.customer); to=cust?.email||null; name=cust?.name||''; } catch {}
+          await sendCustomerEmail({
             to, name,
-            brand: BRAND,
-            subscription_id: sub.id
+            amountTotal: 0, currency: 'EUR',
+            lineItems: [], orderId: sub.id,
+            brand: BRAND, isSubscription: true, customerId: sub.customer
           });
           console.log('📧 Baja de suscripción OK');
-        } catch (e) {
-          console.error('[webhook] subscription.deleted ERROR:', e);
-        }
+        } catch (e) { console.error('[webhook] subscription.deleted ERROR:', e); }
         break;
       }
 
@@ -1188,7 +831,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       default:
         console.log('ℹ️ Evento ignorado:', event.type);
     }
-
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error('[webhook] handler error:', err);
@@ -1196,95 +838,83 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   }
 });
 
-// ================= API REST =================
+// ====== CORS + JSON (después del webhook RAW) ======
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
 
+// ====== Rutas públicas ======
 app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
-// ---- Helper: buscar/crear/actualizar Customer con datos del front (one-time) ----
+// Crear/actualizar Customer desde el front (one-time)
 async function upsertStripeCustomerFromFront(stripeClient, payload) {
   const email = payload?.customer?.email;
   if (!email) return null;
-
   const addr = {
-    line1:       payload?.shipping_address?.address     || payload?.metadata?.address || '',
-    line2:       payload?.shipping_address?.line2       || '',
-    city:        payload?.shipping_address?.city        || payload?.metadata?.city || '',
+    line1: payload?.shipping_address?.address || payload?.metadata?.address || '',
+    line2: payload?.shipping_address?.line2 || '',
+    city:  payload?.shipping_address?.city || payload?.metadata?.city || '',
     postal_code: payload?.shipping_address?.postal_code || payload?.metadata?.postal || '',
-    country:     payload?.shipping_address?.country     || payload?.metadata?.country || 'ES',
-    state:       payload?.shipping_address?.state       || '',
+    country: payload?.shipping_address?.country || payload?.metadata?.country || 'ES',
+    state: payload?.shipping_address?.state || '',
   };
   const hasLine1 = !!addr.line1;
-
   let customer = null;
   try {
     const list = await stripeClient.customers.list({ email, limit: 1 });
     customer = list.data[0] || null;
-  } catch (e) {
-    console.warn('[upsertCustomer] list error:', e?.message || e);
-  }
-
-  const base = {
-    email,
-    name:  payload?.customer?.name  || payload?.metadata?.name  || undefined,
-    phone: payload?.customer?.phone || payload?.metadata?.phone || undefined,
-  };
-
+  } catch {}
+  const base = { email, name: payload?.customer?.name || payload?.metadata?.name || undefined, phone: payload?.customer?.phone || payload?.metadata?.phone || undefined };
   try {
     if (!customer) {
-      customer = await stripeClient.customers.create({
-        ...base,
-        ...(hasLine1 ? { address: addr, shipping: { name: base.name || email, address: addr } } : {})
-      });
+      customer = await stripeClient.customers.create({ ...base, ...(hasLine1 ? { address: addr, shipping: { name: base.name || email, address: addr } } : {}) });
     } else {
       const update = { ...base };
-      if (hasLine1) {
-        update.address  = addr;
-        update.shipping = { name: base.name || customer.name || email, address: addr };
-      }
+      if (hasLine1) { update.address = addr; update.shipping = { name: base.name || customer.name || email, address: addr }; }
       customer = await stripeClient.customers.update(customer.id, update);
     }
-  } catch (e) {
-    console.warn('[upsertCustomer] create/update error:', e?.message || e);
-  }
-
+  } catch {}
   return customer;
 }
 
-// ---- CREATE CHECKOUT SESSION (one-time) ----
+// Normalizadores de items/precios
+function resolvePriceAlias(maybePrice) {
+  if (!maybePrice) return null;
+  const alias = String(maybePrice).trim();
+  const map = {
+    'price_sub_500': process.env.SUB_500_PRICE_ID,
+    'sub_500':       process.env.SUB_500_PRICE_ID,
+    'plan_500':      process.env.SUB_500_PRICE_ID,
+    'price_sub_1000':process.env.SUB_1000_PRICE_ID,
+    'sub_1000':      process.env.SUB_1000_PRICE_ID,
+    'plan_1000':     process.env.SUB_1000_PRICE_ID,
+  };
+  if (alias.startsWith('price_')) return alias;
+  return map[alias] || alias;
+}
+function sanitizeLineItems(rawItems = []) {
+  if (!Array.isArray(rawItems)) return [];
+  return rawItems.map((it) => {
+    const out = { quantity: Number(it?.quantity || 1) };
+    const incoming = it?.price || it?.priceId;
+    if (incoming) out.price = resolvePriceAlias(incoming);
+    if (!out.price && it?.price_data) return { ...it, quantity: out.quantity };
+    return out;
+  });
+}
+
+// Checkout (one-time)
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    let {
-      items,
-      mode = 'payment',
-      success_url,
-      cancel_url,
-      customer,
-      shipping_address,
-      metadata,
-      price,
-      quantity,
-    } = req.body || {};
-
-    if (!success_url || !cancel_url) {
-      return res.status(400).json({ error: 'Missing success_url/cancel_url' });
-    }
-
-    if ((!items || !Array.isArray(items) || items.length === 0) && price) {
-      items = [{ price, quantity: Number(quantity || 1) }];
-    }
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: 'Missing items or price' });
-    }
+    let { items, mode='payment', success_url, cancel_url, customer, shipping_address, metadata, price, quantity } = req.body || {};
+    if (!success_url || !cancel_url) return res.status(400).json({ error: 'Missing success_url/cancel_url' });
+    if ((!items || !Array.isArray(items) || items.length===0) && price) items = [{ price, quantity: Number(quantity || 1) }];
+    if (!Array.isArray(items) || items.length===0) return res.status(400).json({ error: 'Missing items or price' });
 
     const isSubscription = mode === 'subscription';
     const normalizedItems = sanitizeLineItems(items);
     const invalid = normalizedItems.find(it => it.price && !String(it.price).startsWith('price_'));
-    if (invalid) {
-      return res.status(400).json({ error: `Invalid price id: ${invalid.price}` });
-    }
+    if (invalid) return res.status(400).json({ error: `Invalid price id: ${invalid.price}` });
 
     const hasFrontAddress =
       !!(shipping_address?.address || metadata?.address) &&
@@ -1292,13 +922,11 @@ app.post('/create-checkout-session', async (req, res) => {
       !!(shipping_address?.postal  || shipping_address?.postal_code || metadata?.postal);
 
     let customerId;
-    if (customer?.id && String(customer.id).startsWith('cus_')) {
-      customerId = customer.id;
-    } else if (hasFrontAddress && (customer?.email || metadata?.email)) {
+    if (customer?.id && String(customer.id).startsWith('cus_')) customerId = customer.id;
+    else if (hasFrontAddress && (customer?.email || metadata?.email)) {
       const cust = await upsertStripeCustomerFromFront(stripe, {
         customer: { email: customer?.email || metadata?.email, name: customer?.name, phone: customer?.phone },
-        shipping_address,
-        metadata
+        shipping_address, metadata
       });
       customerId = cust?.id;
     }
@@ -1306,8 +934,7 @@ app.post('/create-checkout-session', async (req, res) => {
     const sessionParams = {
       mode,
       line_items: normalizedItems,
-      success_url,
-      cancel_url,
+      success_url, cancel_url,
       allow_promotion_codes: true,
       ...(customerId
         ? { customer: customerId, billing_address_collection: 'auto' }
@@ -1326,9 +953,7 @@ app.post('/create-checkout-session', async (req, res) => {
       phone_number_collection: { enabled: true },
     };
 
-    if (!customerId) {
-      sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
-    }
+    if (!customerId) sessionParams.shipping_address_collection = { allowed_countries: ['ES', 'PT'] };
 
     if (!isSubscription) {
       sessionParams.invoice_creation = {
@@ -1345,14 +970,13 @@ app.post('/create-checkout-session', async (req, res) => {
 
     const session = await stripe.checkout.sessions.create(sessionParams);
     return res.json({ url: session.url });
-
   } catch (err) {
     console.error('create-checkout-session error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ---- CREATE SUBSCRIPTION SESSION (forzando datos en Stripe) ----
+// Suscripción (forzando datos en Stripe)
 app.post('/create-subscription-session', async (req, res) => {
   try {
     const { price, quantity = 1, success_url, cancel_url, customer } = req.body || {};
@@ -1364,7 +988,6 @@ app.post('/create-subscription-session', async (req, res) => {
       return res.status(400).json({ error: `Invalid price id: ${price}` });
     }
 
-    // Reusar/actualizar Customer si viene email (sin duplication de datos en session)
     let customerId;
     if (customer?.email) {
       try {
@@ -1384,16 +1007,13 @@ app.post('/create-subscription-session', async (req, res) => {
           });
           customerId = created.id;
         }
-      } catch (e) {
-        console.warn('[create-subscription-session] upsert customer warn:', e?.message || e);
-      }
+      } catch (e) { console.warn('[create-subscription-session] upsert customer warn:', e?.message || e); }
     }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       ...(customerId ? { customer: customerId } : {}),
-      success_url,
-      cancel_url,
+      success_url, cancel_url,
       allow_promotion_codes: true,
       line_items: [{ price: realPrice, quantity }],
       billing_address_collection: 'required',
@@ -1411,17 +1031,15 @@ app.post('/create-subscription-session', async (req, res) => {
   }
 });
 
-// ---- CUSTOMER PORTAL ----
+// Billing Portal (POST programático)
 app.post('/billing-portal', async (req, res) => {
   try {
     const { customer_id, return_url } = req.body || {};
     if (!customer_id) return res.status(400).json({ error: 'Missing customer_id' });
-
     const portal = await stripe.billingPortal.sessions.create({
       customer: customer_id,
-      return_url: return_url || (process.env.CUSTOMER_PORTAL_RETURN_URL || 'https://guarrosextremenos.com/account')
+      return_url: return_url || PORTAL_RETURN_URL
     });
-
     return res.json({ url: portal.url });
   } catch (e) {
     console.error('billing-portal error:', e);
@@ -1429,42 +1047,35 @@ app.post('/billing-portal', async (req, res) => {
   }
 });
 
-// ---- CONTACTO ----
+// Billing Portal (GET para correos → redirige)
+app.get('/billing-portal/link', async (req, res) => {
+  try {
+    const customer_id = req.query.customer_id;
+    const return_url = req.query.return || PORTAL_RETURN_URL;
+    if (!customer_id) return res.status(400).send('Missing customer_id');
+    const portal = await stripe.billingPortal.sessions.create({ customer: customer_id, return_url });
+    return res.redirect(302, portal.url);
+  } catch (e) {
+    console.error('billing-portal/link error:', e);
+    return res.status(500).send('Error creating portal session');
+  }
+});
+
+// Contacto
 app.post('/contact', async (req, res) => {
   try {
     const { name, email, message, company, source } = req.body || {};
-
-    // Honeypot simple
-    if (company && company.trim() !== '') {
-      return res.json({ ok: true });
-    }
-
-    if (!name || !email || !message) {
-      return res.status(400).json({ ok: false, error: 'Faltan campos requeridos.' });
-    }
+    if (company && company.trim() !== '') return res.json({ ok: true }); // honeypot
+    if (!name || !email || !message) return res.status(400).json({ ok:false, error:'Faltan campos requeridos.' });
 
     const brand = BRAND;
     const fromUser = process.env.CUSTOMER_FROM || 'soporte@guarrosextremenos.com';
     const toUser = String(email).trim().toLowerCase();
-
     const corpTo = process.env.CORPORATE_EMAIL || 'pedidos@tudominio.com';
     const corpFrom = process.env.CORPORATE_FROM || fromUser;
 
     const subjectUser = `Hemos recibido tu mensaje — ${brand}`;
     const subjectCorp = `📨 Nuevo contacto — ${brand}`;
-
-    const plainUser = [
-      `Hola ${name},`,
-      ``,
-      `¡Gracias por escribirnos! Hemos recibido tu mensaje y te responderemos lo antes posible.`,
-      ``,
-      `Tu mensaje:`,
-      message,
-      ``,
-      `Un saludo,`,
-      `Equipo ${brand}`,
-      `soporte@guarrosextremenos.com`,
-    ].join('\n');
 
     const htmlUser = `
       <p>Hola ${escapeHtml(name)},</p>
@@ -1472,17 +1083,6 @@ app.post('/contact', async (req, res) => {
       <p style="color:#374151; white-space:pre-wrap; border-left:3px solid #e5e7eb; padding-left:10px;">${escapeHtml(message)}</p>
       <p>Un saludo,<br/>Equipo ${escapeHtml(brand)}</p>
     `;
-
-    const plainCorp = [
-      `Nuevo contacto desde la web (${source || 'contact'}):`,
-      ``,
-      `Nombre: ${name}`,
-      `Email: ${email}`,
-      ``,
-      `Mensaje:`,
-      message,
-    ].join('\n');
-
     const htmlCorp = `
       <p><strong>Nuevo contacto</strong> desde la web (${escapeHtml(source || 'contact')}):</p>
       <p><strong>Nombre:</strong> ${escapeHtml(name)}<br/>
@@ -1492,77 +1092,55 @@ app.post('/contact', async (req, res) => {
 
     if (process.env.RESEND_API_KEY) {
       const resend = new Resend(process.env.RESEND_API_KEY);
-
       await resend.emails.send({
-        from: fromUser,
-        to: toUser,
-        subject: subjectUser,
-        text: plainUser,
+        from: fromUser, to: toUser, subject: subjectUser,
         html: emailShell({
-          title: subjectUser,
-          headerLabel: 'Mensaje recibido',
+          title: subjectUser, headerLabel: 'Mensaje recibido',
           bodyHTML: `<tr><td style="padding:0 24px 16px; background:#ffffff;">${htmlUser}</td></tr>`,
           footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}</p>`
         }),
       });
-
       await resend.emails.send({
-        from: corpFrom,
-        to: corpTo,
-        subject: subjectCorp,
-        text: plainCorp,
+        from: corpFrom, to: corpTo, subject: subjectCorp,
         html: emailShell({
-          title: subjectCorp,
-          headerLabel: 'Nuevo contacto web',
+          title: subjectCorp, headerLabel: 'Nuevo contacto web',
           bodyHTML: `<tr><td style="padding:0 24px 16px; background:#ffffff;">${htmlCorp}</td></tr>`,
           footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(brand)}</p>`
         }),
       });
     } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
       await sendViaGmailSMTP({
-        from: fromUser,
-        to: toUser,
-        subject: subjectUser,
-        text: plainUser,
+        from: fromUser, to: toUser, subject: subjectUser,
         html: emailShell({
-          title: subjectUser,
-          headerLabel: 'Mensaje recibido',
+          title: subjectUser, headerLabel: 'Mensaje recibido',
           bodyHTML: `<tr><td style="padding:0 24px 16px; background:#ffffff;">${htmlUser}</td></tr>`,
           footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}</p>`
         }),
       });
-
       await sendViaGmailSMTP({
-        from: corpFrom,
-        to: corpTo,
-        subject: subjectCorp,
-        text: plainCorp,
+        from: corpFrom, to: corpTo, subject: subjectCorp,
         html: emailShell({
-          title: subjectCorp,
-          headerLabel: 'Nuevo contacto web',
+          title: subjectCorp, headerLabel: 'Nuevo contacto web',
           bodyHTML: `<tr><td style="padding:0 24px 16px; background:#ffffff;">${htmlCorp}</td></tr>`,
           footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(brand)}</p>`
         }),
       });
-    } else {
-      return res.status(500).json({ ok: false, error: 'No hay proveedor de email configurado.' });
-    }
+    } else return res.status(500).json({ ok:false, error:'No hay proveedor de email configurado.' });
 
     return res.json({ ok: true });
   } catch (e) {
     console.error('[POST /contact] error:', e);
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok:false, error:e.message });
   }
 });
 
-// ---- TESTS ----
+// Tests
 app.post('/test-email', async (req, res) => {
   try {
     const to = process.env.CORPORATE_EMAIL || (process.env.SMTP_USER || 'destino@tudominio.com');
     const from = process.env.CORPORATE_FROM || process.env.SMTP_USER || 'no-reply@example.com';
     const subject = 'Prueba email backend';
     const text = `Hola, prueba enviada a las ${new Date().toISOString()}`;
-
     if (process.env.RESEND_API_KEY) {
       const resend = new Resend(process.env.RESEND_API_KEY);
       const info = await resend.emails.send({ from, to, subject, text });
@@ -1587,5 +1165,5 @@ app.get('/health-db', async (req, res) => {
   }
 });
 
-// ================= START =================
+// ====== Start ======
 app.listen(PORT, () => console.log(`API listening on :${PORT}`));
