@@ -609,6 +609,7 @@ async function sendAdminEmail({
 }
 
 // === Emails al cancelar suscripción (cliente + admin)
+// Sustituye toda tu función sendSubscriptionCanceledEmails por esta:
 async function sendSubscriptionCanceledEmails({
   toCustomer, customerName, customerId, subscriptionId,
   corporateEmail,
@@ -617,7 +618,6 @@ async function sendSubscriptionCanceledEmails({
   const from = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
   const corpTo = corporateEmail || process.env.CORPORATE_EMAIL || process.env.SMTP_USER;
 
-  // Cliente
   const subjectCustomer = `❌ Suscripción cancelada — ${brand}`;
   const bodyCustomer = `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
@@ -629,9 +629,6 @@ async function sendSubscriptionCanceledEmails({
     ID cliente: ${escapeHtml(customerId || '-')}<br/>
     ID suscripción: ${escapeHtml(subscriptionId || '-')}
   </p>
-  <p style="margin:12px 0 0; font:13px system-ui; color:#374151;">
-    Si ha sido un error o quieres reactivarla, contesta a este correo y te ayudamos en seguida.
-  </p>
 </td></tr>`;
   const htmlCustomer = emailShell({
     title: 'Suscripción cancelada',
@@ -640,7 +637,6 @@ async function sendSubscriptionCanceledEmails({
     footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(brand)}.</p>`
   });
 
-  // Admin
   const subjectAdmin = `⚠️ Baja de suscripción — ${subscriptionId || ''}`;
   const bodyAdmin = `
 <tr><td style="padding:0 24px 8px; background:#ffffff;">
@@ -661,19 +657,45 @@ async function sendSubscriptionCanceledEmails({
     footerHTML: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(brand)} — ${new Date().toLocaleString('es-ES')}</p>`
   });
 
-  if (process.env.RESEND_API_KEY) {
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    if (toCustomer) await resend.emails.send({ from, to: toCustomer, subject: subjectCustomer, html: htmlCustomer });
-    if (corpTo) await resend.emails.send({ from, to: corpTo, subject: subjectAdmin, html: htmlAdmin });
-    return;
+  // Envío al cliente (si hay email)
+  if (toCustomer) {
+    try {
+      if (process.env.RESEND_API_KEY) {
+        const resend = new Resend(process.env.RESEND_API_KEY);
+        await resend.emails.send({ from, to: toCustomer, subject: subjectCustomer, html: htmlCustomer });
+      } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+        await sendViaGmailSMTP({ from, to: toCustomer, subject: subjectCustomer, html: htmlCustomer });
+      } else {
+        console.warn('[sendSubscriptionCanceledEmails] Sin proveedor email para cliente');
+      }
+      console.log('📧 Cancelación: email CLIENTE enviado →', toCustomer);
+    } catch (e) {
+      console.error('📧 Cancelación: email CLIENTE ERROR:', e);
+    }
+  } else {
+    console.warn('⚠️ Cancelación: no hay email de cliente; se omite email de cliente.');
   }
-  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    if (toCustomer) await sendViaGmailSMTP({ from, to: toCustomer, subject: subjectCustomer, html: htmlCustomer });
-    if (corpTo) await sendViaGmailSMTP({ from, to: corpTo, subject: subjectAdmin, html: htmlAdmin });
-    return;
+
+  // Envío al admin (SIEMPRE)
+  if (corpTo) {
+    try {
+      if (process.env.RESEND_API_KEY) {
+        const resend = new Resend(process.env.RESEND_API_KEY);
+        await resend.emails.send({ from, to: corpTo, subject: subjectAdmin, html: htmlAdmin });
+      } else if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+        await sendViaGmailSMTP({ from, to: corpTo, subject: subjectAdmin, html: htmlAdmin });
+      } else {
+        console.warn('[sendSubscriptionCanceledEmails] Sin proveedor email para admin');
+      }
+      console.log('📧 Cancelación: email ADMIN enviado →', corpTo);
+    } catch (e) {
+      console.error('📧 Cancelación: email ADMIN ERROR:', e);
+    }
+  } else {
+    console.warn('⚠️ Cancelación: CORPORATE_EMAIL/SMTP_USER no definido; no se pudo avisar al admin.');
   }
-  console.warn('[sendSubscriptionCanceledEmails] No hay proveedor de email configurado');
 }
+
 
 // === Email cancelación programada (opcional)
 async function sendSubscriptionScheduledCancelEmail({
@@ -1137,21 +1159,22 @@ case 'customer.subscription.updated': {
 
       const sendScheduledMail = String(process.env.EMAIL_ON_SCHEDULED_CANCEL || 'true').toLowerCase() !== 'false';
       if (sendScheduledMail) {
-        const { email, name } = await getCustomerEmailAndNameForSubscription(stripe, sub);
-        if (email) {
-          try {
-            await sendSubscriptionScheduledCancelEmail({
-              toCustomer: email,
-              customerName: name,
-              customerId: sub.customer,
-              subscriptionId: sub.id,
-              cancelAt: sub.cancel_at || sub.current_period_end
-            });
-            console.log('📧 Email cancelación programada enviado →', email);
-          } catch (e) {
-            console.error('📧 Email cancelación programada ERROR:', e);
-          }
-        } else {
+const { email, name } = await getCustomerEmailAndNameForSubscription(stripe, sub);
+
+try {
+  await sendSubscriptionCanceledEmails({
+    toCustomer: email || null,
+    customerName: name,
+    customerId: sub.customer,
+    subscriptionId: sub.id,
+    corporateEmail: process.env.CORPORATE_EMAIL,
+    brand: BRAND
+  });
+  console.log('📧 Emails de cancelación (updated) enviados', email ? `→ ${email}` : '(solo admin)');
+} catch (e) {
+  console.error('📧 Emails de cancelación (updated) ERROR:', e);
+}
+ else {
           console.warn('⚠️ No hay email del cliente para cancelación programada (updated). Se enviará solo a admin.');
           // Aviso interno a admin
           await sendSubscriptionCanceledEmails({
@@ -1172,20 +1195,21 @@ case 'customer.subscription.updated': {
       await markSubscriptionCanceled({ subscription_id: sub.id });
 
       const { email, name } = await getCustomerEmailAndNameForSubscription(stripe, sub);
-      try {
-        await sendSubscriptionCanceledEmails({
-          toCustomer: email || null,
-          customerName: name,
-          customerId: sub.customer,
-          subscriptionId: sub.id,
-          corporateEmail: process.env.CORPORATE_EMAIL,
-          brand: BRAND
-        });
-        console.log('📧 Emails de cancelación (desde updated) enviados', email ? `→ ${email}` : '(solo admin)');
-      } catch (e) {
-        console.error('📧 Emails de cancelación (desde updated) ERROR:', e);
-      }
-    }
+
+try {
+  await sendSubscriptionCanceledEmails({
+    toCustomer: email || null,
+    customerName: name,
+    customerId: sub.customer,
+    subscriptionId: sub.id,
+    corporateEmail: process.env.CORPORATE_EMAIL,
+    brand: BRAND
+  });
+  console.log('📧 Emails de cancelación (deleted) enviados', email ? `→ ${email}` : '(solo admin)');
+} catch (e) {
+  console.error('📧 Emails de cancelación (deleted) ERROR:', e);
+}
+
 
     // (C) Mantener ficha sincronizada
     try {
