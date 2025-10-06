@@ -872,21 +872,49 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
-        const session = event.data.object;
-        let lineItems = [];
-        try {
-          const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] });
-          lineItems = li?.data || [];
-        } catch (e) { console.warn('[webhook] listLineItems error:', e.message); }
+ // dentro del case 'checkout.session.completed':
+const session = event.data.object;
 
-        const customerEmail = session.customer_details?.email || session.customer_email;
-        const name = session.customer_details?.name || session.metadata?.name;
-        const phone = session.customer_details?.phone || session.metadata?.phone;
-        const shipping = session.shipping_details?.address;
-        const metadata = session.metadata || {};
-        const amountTotal = (session.amount_total ?? 0) / 100;
-        const currency = (session.currency || 'eur').toUpperCase();
-        const isSubscription = session.mode === 'subscription' || lineItems.some(li => li?.price?.recurring);
+// ¡OJO!: estos objetos vienen completos en el webhook más reciente
+const customerDetails = session.customer_details || null;       // {email, name, phone, address:{line1,line2,city,postal_code,country}}
+const shippingDetails  = session.shipping_details?.address
+  ? {
+      name: session.shipping_details?.name || null,
+      ...session.shipping_details.address // {line1,line2,city,postal_code,country}
+    }
+  : null;
+
+// Si además tú envías formulario previo, viene en metadata:
+const meta = session.metadata || {};
+
+await pool.query(
+  `INSERT INTO orders
+     (session_id, email, name, phone, customer_details, shipping, metadata, total, currency, status, created_at)
+   VALUES
+     ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+   ON CONFLICT (session_id) DO UPDATE SET
+     email = EXCLUDED.email,
+     name  = EXCLUDED.name,
+     phone = EXCLUDED.phone,
+     customer_details = EXCLUDED.customer_details,
+     shipping  = EXCLUDED.shipping,
+     metadata  = EXCLUDED.metadata,
+     total     = EXCLUDED.total,
+     currency  = EXCLUDED.currency,
+     status    = EXCLUDED.status`,
+  [
+    session.id,
+    customerDetails?.email || meta.email || null,
+    customerDetails?.name  || meta.name  || null,
+    customerDetails?.phone || meta.phone || null,
+    customerDetails ? JSON.stringify(customerDetails) : null,
+    shippingDetails ? JSON.stringify(shippingDetails) : null,
+    Object.keys(meta).length ? JSON.stringify(meta) : null,
+    (session.amount_total ?? 0) / 100,
+    session.currency ? session.currency.toUpperCase() : 'EUR',
+    session.payment_status || session.status || 'unknown'
+  ]
+);
 
         if (isSubscription && session.subscription) {
           try {
