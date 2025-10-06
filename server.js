@@ -871,98 +871,161 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
   try {
     switch (event.type) {
-      case 'checkout.session.completed': {
- // dentro del case 'checkout.session.completed':
-const session = event.data.object;
+case 'checkout.session.completed': {
+  const session = event.data.object;
 
-// ¡OJO!: estos objetos vienen completos en el webhook más reciente
-const customerDetails = session.customer_details || null;       // {email, name, phone, address:{line1,line2,city,postal_code,country}}
-const shippingDetails  = session.shipping_details?.address
-  ? {
-      name: session.shipping_details?.name || null,
-      ...session.shipping_details.address // {line1,line2,city,postal_code,country}
-    }
-  : null;
+  // 1) ¿Es suscripción?
+  const isSubscription = session.mode === 'subscription' || !!session.subscription;
 
-// Si además tú envías formulario previo, viene en metadata:
-const meta = session.metadata || {};
+  // 2) Line items del checkout (para el email y para guardar)
+  let lineItems = [];
+  try {
+    const li = await stripe.checkout.sessions.listLineItems(session.id, {
+      limit: 100,
+      expand: ['data.price.product']
+    });
+    lineItems = li?.data || [];
+  } catch (e) {
+    console.warn('[webhook] listLineItems warn:', e?.message || e);
+  }
 
-await pool.query(
-  `INSERT INTO orders
-     (session_id, email, name, phone, customer_details, shipping, metadata, total, currency, status, created_at)
-   VALUES
-     ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-   ON CONFLICT (session_id) DO UPDATE SET
-     email = EXCLUDED.email,
-     name  = EXCLUDED.name,
-     phone = EXCLUDED.phone,
-     customer_details = EXCLUDED.customer_details,
-     shipping  = EXCLUDED.shipping,
-     metadata  = EXCLUDED.metadata,
-     total     = EXCLUDED.total,
-     currency  = EXCLUDED.currency,
-     status    = EXCLUDED.status`,
-  [
-    session.id,
-    customerDetails?.email || meta.email || null,
-    customerDetails?.name  || meta.name  || null,
-    customerDetails?.phone || meta.phone || null,
-    customerDetails ? JSON.stringify(customerDetails) : null,
-    shippingDetails ? JSON.stringify(shippingDetails) : null,
-    Object.keys(meta).length ? JSON.stringify(meta) : null,
-    (session.amount_total ?? 0) / 100,
-    session.currency ? session.currency.toUpperCase() : 'EUR',
-    session.payment_status || session.status || 'unknown'
-  ]
-);
+  // 3) Datos básicos del pedido
+  const currency     = (session.currency || 'eur').toUpperCase();
+  const amountTotal  = (session.amount_total ?? 0) / 100;
+  const customerEmail= session.customer_details?.email || session.customer_email || null;
+  const name         = session.customer_details?.name  || null;
+  const phone        = session.customer_details?.phone || null;
+  const metadata     = session.metadata || {};
+  const shipping     = session.shipping_details?.address
+    ? { name: session.shipping_details?.name || null, ...session.shipping_details.address }
+    : {};
 
-        if (isSubscription && session.subscription) {
-          try {
-            const sub = await stripe.subscriptions.retrieve(session.subscription);
-            const cust = await stripe.customers.retrieve(session.customer);
-            await upsertSubscriber({
-              customer_id: sub.customer, subscription_id: sub.id,
-              email: cust?.email || session.customer_details?.email || session.customer_email || null,
-              name: cust?.name || session.customer_details?.name || null,
-              plan: sub.items?.data?.[0]?.price?.id || null,
-              status: sub.status, meta: sub.metadata || {}
-            });
-          } catch (e) { console.error('[webhook] suscripción (alta) ERROR:', e); }
-        }
+  // 4) Persistir el pedido con TODOS los datos (como ya hacías)
+  try {
+    await pool.query(
+      `INSERT INTO orders
+         (session_id, email, name, phone, customer_details, shipping, metadata, total, currency, status, created_at)
+       VALUES
+         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+       ON CONFLICT (session_id) DO UPDATE SET
+         email = EXCLUDED.email,
+         name  = EXCLUDED.name,
+         phone = EXCLUDED.phone,
+         customer_details = EXCLUDED.customer_details,
+         shipping  = EXCLUDED.shipping,
+         metadata  = EXCLUDED.metadata,
+         total     = EXCLUDED.total,
+         currency  = EXCLUDED.currency,
+         status    = EXCLUDED.status`,
+      [
+        session.id,
+        customerEmail,
+        name,
+        phone,
+        session.customer_details ? JSON.stringify(session.customer_details) : null,
+        Object.keys(shipping).length ? JSON.stringify(shipping) : null,
+        Object.keys(metadata).length ? JSON.stringify(metadata) : null,
+        amountTotal,
+        currency,
+        session.payment_status || session.status || 'unknown'
+      ]
+    );
+  } catch (e) {
+    console.error('🗄️ Registro orders ERROR:', e);
+  }
 
-        try {
-          await sendAdminEmail({ session, lineItems, customerEmail, name, phone, amountTotal, currency, metadata, shipping });
-          console.log('📧 Email admin enviado OK');
-        } catch (e) { console.error('📧 Email admin ERROR:', e); }
-
-        const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
-        if (!combine) {
-          try {
-            await sendCustomerEmail({
-              to: customerEmail, name, amountTotal, currency,
-              lineItems, orderId: session.id,
-              supportEmail: process.env.SUPPORT_EMAIL,
-              brand: BRAND, isSubscription,
-              customerId: session.customer
-            });
-            console.log('📧 Email cliente enviado OK (solo confirmación)');
-          } catch (e) { console.error('📧 Email cliente (confirmación) ERROR:', e); }
-        } else {
-          console.log('[combine=true] correo al cliente se enviará en invoice.payment_succeeded');
-        }
-
-        try {
-          await logOrder({
-            sessionId: session.id, amountTotal, currency, customerEmail, name, phone,
-            lineItems, metadata, shipping, status: 'paid', createdAt: new Date().toISOString(),
-          });
-          await logOrderItems(session.id, lineItems, currency);
-          console.log('🗄️ Pedido registrado OK');
-        } catch (e) { console.error('🗄️ Registro en DB ERROR:', e); }
-
-        console.log('✅ checkout.session.completed', session.id);
-        break;
+  // 5) Guardar items del pedido (tabla order_items)
+  try {
+    if (Array.isArray(lineItems) && lineItems.length) {
+      for (const li of lineItems) {
+        await pool.query(
+          `insert into order_items
+             (session_id, description, product_id, price_id, quantity, unit_amount_cents, amount_total_cents, currency, raw)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           on conflict do nothing`,
+          [
+            session.id,
+            li.description || null,
+            li.price?.product || null,
+            li.price?.id || null,
+            li.quantity || 1,
+            li.price?.unit_amount ?? null,
+            (li.amount_total ?? li.amount ?? 0),
+            currency,
+            JSON.stringify(li)
+          ]
+        );
       }
+    }
+  } catch (e) {
+    console.error('🗄️ Registro order_items ERROR:', e);
+  }
+
+  // 6) Si era alta de suscripción, sincroniza ficha del suscriptor
+  if (isSubscription && session.subscription) {
+    try {
+      const sub  = await stripe.subscriptions.retrieve(session.subscription);
+      const cust = session.customer ? await stripe.customers.retrieve(session.customer) : null;
+      await upsertSubscriber({
+        customer_id: sub.customer,
+        subscription_id: sub.id,
+        email: cust?.email || customerEmail || null,
+        name:  cust?.name  || name || null,
+        plan:  sub.items?.data?.[0]?.price?.id || null,
+        status: sub.status,
+        meta: sub.metadata || {}
+      });
+    } catch (e) {
+      console.error('[webhook] suscripción (alta) ERROR:', e);
+    }
+  }
+
+  // 7) **Correo al ADMIN** (¡ya con todos los datos!)
+  try {
+    await sendAdminEmail({
+      session,
+      lineItems,
+      customerEmail,
+      name,
+      phone,
+      amountTotal,
+      currency,
+      metadata,
+      shipping
+    });
+    console.log('📧 Email admin enviado OK');
+  } catch (e) {
+    console.error('📧 Email admin ERROR:', e);
+  }
+
+  // 8) Email al cliente según COMBINE
+  const combine = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true').toLowerCase() !== 'false';
+  if (!combine) {
+    try {
+      await sendCustomerEmail({
+        to: customerEmail,
+        name,
+        amountTotal,
+        currency,
+        lineItems,
+        orderId: session.id,
+        supportEmail: process.env.SUPPORT_EMAIL,
+        brand: BRAND,
+        isSubscription,
+        customerId: session.customer
+      });
+      console.log('📧 Email cliente enviado OK (solo confirmación)');
+    } catch (e) {
+      console.error('📧 Email cliente (confirmación) ERROR:', e);
+    }
+  } else {
+    console.log('[combine=true] correo al cliente se enviará en invoice.payment_succeeded');
+  }
+
+  console.log('✅ checkout.session.completed', session.id);
+  break;
+}
+
 
       case 'customer.subscription.created': {
         const sub = event.data.object;
