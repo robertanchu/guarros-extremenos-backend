@@ -1159,6 +1159,53 @@ app.get('/test-db-ping', async (req, res) => {
 // Raíz
 app.get('/', (req, res) => res.status(404).send('Not found'));
 
+// --- RESOLVER PRECIOS DE STRIPE ---
+// POST /prices/resolve  { ids: ["price_x", "price_y", ...] }
+app.post('/prices/resolve', async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
+    if (!ids.length) return res.status(400).json({ error: 'ids requeridos' });
+
+    const out = {};
+    for (const id of ids) {
+      try {
+        const p = await stripe.prices.retrieve(id, { expand: ['product'] });
+        out[id] = {
+          id: p.id,
+          currency: p.currency?.toUpperCase() || 'EUR',
+          unit_amount: p.unit_amount,          // en céntimos
+          recurring: !!p.recurring,
+          product_name: p.product?.name || null,
+        };
+      } catch (e) {
+        out[id] = { error: e.message || 'No encontrado' };
+      }
+    }
+    res.json({ prices: out });
+  } catch (e) {
+    console.error('/prices/resolve error:', e);
+    res.status(500).json({ error: 'Error resolviendo precios' });
+  }
+});
+
+// GET /price/:id
+app.get('/price/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const p = await stripe.prices.retrieve(id, { expand: ['product'] });
+    res.json({
+      id: p.id,
+      currency: p.currency?.toUpperCase() || 'EUR',
+      unit_amount: p.unit_amount,
+      recurring: !!p.recurring,
+      product_name: p.product?.name || null,
+    });
+  } catch (e) {
+    res.status(404).json({ error: e.message || 'No encontrado' });
+  }
+});
+
+
 // ---------------------------
 // Arranque
 // ---------------------------
