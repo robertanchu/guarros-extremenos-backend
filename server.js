@@ -25,11 +25,9 @@ const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
 const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 
 const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || 'https://guarros-extremenos-api.onrender.com';
-const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || 'https://guarrosextremenos.com/account';
+const FRONT_BASE = process.env.FRONT_BASE || 'https://guarrosextremenos.com';
+const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || `${FRONT_BASE}/account`;
 const BILLING_PORTAL_CONFIG = process.env.STRIPE_BILLING_PORTAL_CONFIG || null;
-
-const SUB_500_PRICE_ID = process.env.SUB_500_PRICE_ID || process.env.VITE_SUB_500_PRICE_ID;
-const SUB_1000_PRICE_ID = process.env.SUB_1000_PRICE_ID || process.env.VITE_SUB_1000_PRICE_ID;
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SMTP_HOST = process.env.SMTP_HOST || '';
@@ -55,6 +53,23 @@ const COMPANY = {
   country: process.env.COMPANY_COUNTRY || 'España',
   serie: process.env.RECEIPT_SERIE || 'WEB',
 };
+
+// ====== TABLA FIJA SUSCRIPCIONES (gramos → precio en céntimos) ======
+const SUB_PRICE_TABLE = Object.freeze({
+  100: 4600,
+  200: 5800,
+  300: 6900,
+  400: 8000,
+  500: 9100,
+  600: 10300,
+  700: 11400,
+  800: 12500,
+  900: 13600,
+  1000: 14800,
+  1500: 20400,
+  2000: 26000,
+});
+const ALLOWED_SUB_GRAMS = Object.keys(SUB_PRICE_TABLE).map(Number);
 
 // ---- Pool Postgres robusto ----
 const pool = process.env.DATABASE_URL
@@ -835,7 +850,7 @@ app.post('/webhook', async (req, res) => {
 
         // Envío al cliente
         if (!isSub) {
-          // PAGO ÚNICO: enviamos ahora
+          // PAGO ÚNICO
           if (COMBINE_CONFIRMATION_AND_INVOICE) {
             try {
               await sendCustomerCombined({
@@ -846,7 +861,7 @@ app.post('/webhook', async (req, res) => {
                 currency,
                 items,
                 customer: session.customer_details || {},
-                pdfUrl: null, // no hay factura Stripe en pagos únicos
+                pdfUrl: null,
                 isSubscription: false,
                 customerId: session.customer,
               });
@@ -1038,7 +1053,7 @@ app.post('/webhook', async (req, res) => {
 // 3) A PARTIR DE AQUÍ, parser JSON para el resto:
 app.use(express.json());
 
-// ---- Rutas normales (JSON) ----
+// ---- PAGO ÚNICO ----
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { items = [], success_url, cancel_url } = req.body || {};
@@ -1057,8 +1072,8 @@ app.post('/create-checkout-session', async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items,
-      success_url: success_url || 'https://guarrosextremenos.com/success',
-      cancel_url: cancel_url || 'https://guarrosextremenos.com/cancel',
+      success_url: success_url || `${FRONT_BASE}/success`,
+      cancel_url: cancel_url || `${FRONT_BASE}/cancel`,
       allow_promotion_codes: true,
       billing_address_collection: 'auto',
       customer_creation: 'if_required',
@@ -1071,50 +1086,73 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+// ---- SUSCRIPCIÓN (gramos fijos) ----
+app.options('/create-subscription-session', cors());
 app.post('/create-subscription-session', async (req, res) => {
   try {
-    const { plan, customer_info = {}, success_url, cancel_url } = req.body || {};
+    const {
+      grams,
+      currency = 'eur',
+      customer,                 // { email?, name?, phone? }
+      metadata = {},
+      success_url,
+      cancel_url,
+    } = req.body || {};
 
-    const priceId =
-      plan === 'price_1000' || plan === SUB_1000_PRICE_ID
-        ? SUB_1000_PRICE_ID
-        : plan === 'price_500' || plan === SUB_500_PRICE_ID
-        ? SUB_500_PRICE_ID
-        : null;
+    const g = Number(grams);
+    if (!g || !ALLOWED_SUB_GRAMS.includes(g)) {
+      return res.status(400).json({
+        error: 'Cantidad inválida. Debe ser una de: ' + ALLOWED_SUB_GRAMS.join(', '),
+      });
+    }
+    const amount = SUB_PRICE_TABLE[g]; // céntimos
 
-    if (!priceId) return res.status(400).json({ error: 'Plan no válido' });
+    // Buscar/crear customer (opcional, si viene email)
+    let customerId;
+    if (customer?.email) {
+      const found = await stripe.customers.list({ email: customer.email, limit: 1 });
+      customerId = found.data[0]?.id || (await stripe.customers.create({
+        email: customer.email,
+        name: customer.name,
+        phone: customer.phone,
+      })).id;
+    }
 
+    // price_data dinámico mensual
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      line_items: [{ price: priceId, quantity: 1 }],
-      success_url: success_url || 'https://guarrosextremenos.com/success',
-      cancel_url: cancel_url || 'https://guarrosextremenos.com/cancel',
-      allow_promotion_codes: true,
-      billing_address_collection: 'required',
-      subscription_data: {
-        metadata: {
-          source: 'guarros-front',
-          ...(customer_info?.email ? { email: customer_info.email } : {}),
-          ...(customer_info?.name ? { name: customer_info.name } : {}),
-          ...(customer_info?.phone ? { phone: customer_info.phone } : {}),
+      customer: customerId,
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency,
+          unit_amount: amount,
+          recurring: { interval: 'month' },
+          product_data: {
+            name: `Suscripción Jamón Canalla — ${g} g/mes`,
+            metadata: { grams: String(g), display_price: (amount / 100).toFixed(2) + ' €' },
+          },
         },
-      },
-      customer_update: { address: 'auto', name: 'auto' },
+      }],
+      allow_promotion_codes: true,
+      billing_address_collection: 'auto',
+      success_url: success_url || `${FRONT_BASE}/success`,
+      cancel_url: cancel_url || `${FRONT_BASE}/cancel`,
       metadata: {
-        source: 'guarros-front',
-        ...(customer_info?.email ? { email: customer_info.email } : {}),
-        ...(customer_info?.name ? { name: customer_info.name } : {}),
-        ...(customer_info?.phone ? { phone: customer_info.phone } : {}),
+        ...metadata,
+        subscription_grams: String(g),
+        pricing_model: 'fixed_table_g',
       },
     });
 
-    res.json({ url: session.url, id: session.id });
+    return res.json({ url: session.url, id: session.id });
   } catch (e) {
     console.error('create-subscription-session error:', e);
     res.status(500).json({ error: e.message || 'Error' });
   }
 });
 
+// ---- Billing portal ----
 app.get('/billing-portal/link', async (req, res) => {
   try {
     const { customer_id, return: ret } = req.query;
