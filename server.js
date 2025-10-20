@@ -732,104 +732,154 @@ app.post('/webhook', async (req, res) => {
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
-        const session = event.data.object;
-        const isSub = session.mode === 'subscription' || !!session.subscription;
+  const session = event.data.object;
+  const isSub = session.mode === 'subscription' || !!session.subscription;
 
-        let items = [];
-        try {
-          const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] });
-          items = li?.data || [];
-        } catch (e) {
-          console.warn('[listLineItems warn]', e?.message || e);
-        }
+  // Cargar line items
+  let items = [];
+  try {
+    const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] });
+    items = li?.data || [];
+  } catch (e) {
+    console.warn('[listLineItems warn]', e?.message || e);
+  }
 
-        const currency = (session.currency || 'eur').toUpperCase();
-        const amountTotal = (session.amount_total ?? 0) / 100;
-        const email = session.customer_details?.email || session.customer_email || null;
-        const name = session.customer_details?.name || null;
-        const phone = session.customer_details?.phone || null;
-        const metadata = session.metadata || {};
-        const shipping = session.shipping_details?.address
-          ? { name: session.shipping_details?.name || null, ...session.shipping_details.address }
-          : {};
+  const currency = (session.currency || 'eur').toUpperCase();
+  const amountTotal = (session.amount_total ?? 0) / 100;
+  const email = session.customer_details?.email || session.customer_email || null;
+  const name = session.customer_details?.name || null;
+  const phone = session.customer_details?.phone || null;
+  const metadata = session.metadata || {};
+  const shipping = session.shipping_details?.address
+    ? { name: session.shipping_details?.name || null, ...session.shipping_details.address }
+    : {};
 
-        await logOrder({
-          sessionId: session.id,
-          email,
+  // Log en DB (pedido y líneas)
+  await logOrder({
+    sessionId: session.id,
+    email,
+    name,
+    phone,
+    amountTotal,
+    currency,
+    items,
+    metadata,
+    shipping,
+    status: session.payment_status || session.status || 'unknown',
+    customer_details: session.customer_details || {},
+  });
+  await logOrderItems(session.id, items, currency);
+
+  // Si es suscripción, upsert en subscribers
+  if (isSub && session.subscription) {
+    try {
+      const sub = await stripe.subscriptions.retrieve(session.subscription);
+      const cust = session.customer ? await stripe.customers.retrieve(session.customer) : null;
+      await upsertSubscriber({
+        customer_id: sub.customer,
+        subscription_id: sub.id,
+        email: cust?.email || email || null,
+        name: cust?.name || name || null,
+        plan: sub.items?.data?.[0]?.price?.id || null,
+        status: sub.status,
+        meta: sub.metadata || {},
+        address: cust?.address?.line1 || null,
+        city: cust?.address?.city || null,
+        postal: cust?.address?.postal_code || null,
+        country: cust?.address?.country || null,
+      });
+    } catch (e) {
+      console.error('[suscripción (alta) ERROR]', e);
+    }
+  }
+
+  // Email a admin (como antes)
+  try {
+    await sendAdminEmail({
+      session,
+      items,
+      customerEmail: email,
+      name,
+      phone,
+      amountTotal,
+      currency,
+      metadata,
+      shipping,
+    });
+    console.log('Email admin enviado OK');
+  } catch (e) {
+    console.error('Email admin ERROR:', e);
+  }
+
+  // === NUEVA LÓGICA DE ENVÍO AL CLIENTE ===
+  if (!isSub) {
+    // PAGO ÚNICO: el evento invoice.payment_succeeded no existe → enviamos ahora
+    if (COMBINE_CONFIRMATION_AND_INVOICE) {
+      // Enviamos combinado con NUESTRO PDF de recibo (sin factura Stripe)
+      try {
+        await sendCustomerCombined({
+          to: email,
           name,
-          phone,
+          invoiceNumber: session.id,                 // usamos la session como número de recibo
+          total: amountTotal,
+          currency,
+          items,
+          customer: session.customer_details || {},
+          pdfUrl: null,                              // no hay invoice_pdf en pagos únicos
+          isSubscription: false,
+          customerId: session.customer,
+        });
+        console.log('Combinado (pago único) enviado ->', email);
+      } catch (e) {
+        console.error('Combinado (pago único) ERROR:', e);
+      }
+    } else {
+      // Confirmación simple inmediata
+      try {
+        await sendCustomerConfirmationOnly({
+          to: email,
+          name,
           amountTotal,
           currency,
           items,
-          metadata,
-          shipping,
-          status: session.payment_status || session.status || 'unknown',
-          customer_details: session.customer_details || {},
+          orderId: session.id,
+          isSubscription: false,
+          customerId: session.customer,
         });
-        await logOrderItems(session.id, items, currency);
-
-        if (isSub && session.subscription) {
-          try {
-            const sub = await stripe.subscriptions.retrieve(session.subscription);
-            const cust = session.customer ? await stripe.customers.retrieve(session.customer) : null;
-            await upsertSubscriber({
-              customer_id: sub.customer,
-              subscription_id: sub.id,
-              email: cust?.email || email || null,
-              name: cust?.name || name || null,
-              plan: sub.items?.data?.[0]?.price?.id || null,
-              status: sub.status,
-              meta: sub.metadata || {},
-              address: cust?.address?.line1 || null,
-              city: cust?.address?.city || null,
-              postal: cust?.address?.postal_code || null,
-              country: cust?.address?.country || null,
-            });
-          } catch (e) {
-            console.error('[suscripcion (alta) ERROR]', e);
-          }
-        }
-
-        try {
-          await sendAdminEmail({
-            session,
-            items,
-            customerEmail: email,
-            name,
-            phone,
-            amountTotal,
-            currency,
-            metadata,
-            shipping,
-          });
-          console.log('Email admin enviado OK');
-        } catch (e) {
-          console.error('Email admin ERROR:', e);
-        }
-
-        if (!COMBINE_CONFIRMATION_AND_INVOICE) {
-          try {
-            await sendCustomerConfirmationOnly({
-              to: email,
-              name,
-              amountTotal,
-              currency,
-              items,
-              orderId: session.id,
-              isSubscription: isSub,
-              customerId: session.customer,
-            });
-            console.log('Email cliente enviado OK (confirmacion solo)');
-          } catch (e) {
-            console.error('Email cliente ERROR:', e);
-          }
-        } else {
-          console.log('[combine=true] El correo al cliente se envia con invoice.payment_succeeded');
-        }
-
-        console.log('OK checkout.session.completed', session.id);
-        break;
+        console.log('Email cliente enviado OK (confirmación solo, pago único)');
+      } catch (e) {
+        console.error('Email cliente ERROR:', e);
       }
+    }
+  } else {
+    // SUSCRIPCIÓN
+    if (!COMBINE_CONFIRMATION_AND_INVOICE) {
+      // Si NO combinamos, mandamos ahora la confirmación simple
+      try {
+        await sendCustomerConfirmationOnly({
+          to: email,
+          name,
+          amountTotal,
+          currency,
+          items,
+          orderId: session.id,
+          isSubscription: true,
+          customerId: session.customer,
+        });
+        console.log('Email cliente enviado OK (suscripción, confirmación solo)');
+      } catch (e) {
+        console.error('Email cliente (suscripción) ERROR:', e);
+      }
+    } else {
+      // Si combinamos, esperamos a invoice.payment_succeeded (como antes)
+      console.log('[combine=true] suscripción: el correo combinado se enviará en invoice.payment_succeeded');
+    }
+  }
+
+  console.log('OK checkout.session.completed', session.id);
+  break;
+}
+
 
       case 'invoice.payment_succeeded': {
         const inv = event.data.object;
