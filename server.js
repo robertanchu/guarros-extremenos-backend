@@ -482,7 +482,7 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
       const r = await fetch(pdfUrl);
       if (r.ok) {
         const b = Buffer.from(await r.arrayBuffer());
-        attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf`, content: b, contentType: 'application/pdf' });
+        attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf', content: b, contentType: 'application/pdf' });
       }
     } catch (e) {
       console.warn('[combined] No se pudo descargar invoice_pdf:', e?.message || e);
