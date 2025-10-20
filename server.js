@@ -1,7 +1,4 @@
-// server.js — Backend ESM completo y ordenado (ASCII-safe)
-// -------------------------------------------
-// Requisitos Node 18+ (ESM). Instala dependencias:
-// npm i express cors morgan stripe resend nodemailer pdfkit pg dotenv
+// server.js — Backend ESM (Stripe webhook RAW body fix + resto intacto)
 
 import 'dotenv/config';
 import express from 'express';
@@ -15,9 +12,6 @@ import pg from 'pg';
 
 const { Pool } = pg;
 
-// ---------------------------
-// Configuracion principal
-// ---------------------------
 const app = express();
 const PORT = process.env.PORT || 10000;
 
@@ -25,21 +19,18 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: '2024-06-20',
 });
 
-// Marca
+// ---- Marca / Config ----
 const BRAND = process.env.BRAND_NAME || 'Guarros Extremeños';
 const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
-const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || ''; // URL publica del logo horizontal
+const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 
-// Front y CORS
 const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || 'https://guarros-extremenos-api.onrender.com';
 const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || 'https://guarrosextremenos.com/account';
 const BILLING_PORTAL_CONFIG = process.env.STRIPE_BILLING_PORTAL_CONFIG || null;
 
-// Planes de suscripcion (dos niveles)
-const SUB_500_PRICE_ID = process.env.SUB_500_PRICE_ID || process.env.VITE_SUB_500_PRICE_ID; // price_...
-const SUB_1000_PRICE_ID = process.env.SUB_1000_PRICE_ID || process.env.VITE_SUB_1000_PRICE_ID; // price_...
+const SUB_500_PRICE_ID = process.env.SUB_500_PRICE_ID || process.env.VITE_SUB_500_PRICE_ID;
+const SUB_1000_PRICE_ID = process.env.SUB_1000_PRICE_ID || process.env.VITE_SUB_1000_PRICE_ID;
 
-// Envio de emails
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
@@ -47,17 +38,14 @@ const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
 const SMTP_SECURE = String(SMTP_PORT) === '465';
 
-// Remitentes
 const CUSTOMER_FROM = process.env.CUSTOMER_FROM || process.env.CORPORATE_FROM || 'no-reply@guarrosextremenos.com';
 const CORPORATE_EMAIL = process.env.CORPORATE_EMAIL || process.env.SMTP_USER || '';
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'soporte@guarrosextremenos.com';
 
-// Comportamiento de email
 const COMBINE_CONFIRMATION_AND_INVOICE = String(process.env.COMBINE_CONFIRMATION_AND_INVOICE || 'true') !== 'false';
 const ATTACH_STRIPE_INVOICE = String(process.env.ATTACH_STRIPE_INVOICE || 'false') === 'true';
 const CUSTOMER_BCC_CORPORATE = String(process.env.CUSTOMER_BCC_CORPORATE || 'false') === 'true';
 
-// Empresa (recibo PDF)
 const COMPANY = {
   name: process.env.COMPANY_NAME || BRAND,
   taxId: process.env.COMPANY_TAX_ID || '',
@@ -68,7 +56,6 @@ const COMPANY = {
   serie: process.env.RECEIPT_SERIE || 'WEB',
 };
 
-// BBDD
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
@@ -76,9 +63,7 @@ const pool = process.env.DATABASE_URL
     })
   : null;
 
-// ---------------------------
-// Utilidades
-// ---------------------------
+// ---- Utils ----
 const escapeHtml = (s) =>
   String(s ?? '')
     .replace(/&/g, '&amp;')
@@ -142,7 +127,6 @@ ${body}
 </table>
 </body></html>`;
 
-// Boton "Gestionar suscripcion"
 const manageButtonHTML = (customerId) => {
   if (!customerId) return '';
   const link = `${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(
@@ -155,9 +139,7 @@ const manageButtonHTML = (customerId) => {
   <p style="margin:6px 0 0; font:12px system-ui; color:#6b7280; text-align:center;">Puedes pausar o cancelar cuando quieras</p>`;
 };
 
-// ---------------------------
-// PDF de recibo "PAGADO"
-// ---------------------------
+// ---- PDF Recibo ----
 async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineItems = [], customer = {}, paidAt = new Date() }) {
   const doc = new PDFDocument({ size: 'A4', margins: { top: 56, bottom: 56, left: 56, right: 56 } });
   const bufs = [];
@@ -167,7 +149,6 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineIte
     doc.on('error', rej);
   });
 
-  // Logo / marca
   try {
     if (BRAND_LOGO_URL) {
       const r = await fetch(BRAND_LOGO_URL);
@@ -184,11 +165,9 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineIte
     doc.font('Helvetica-Bold').fontSize(20).text(BRAND, { align: 'left' });
   }
 
-  // Titulo
   doc.moveDown(0.5);
   doc.font('Helvetica-Bold').fontSize(18).fillColor('#D62828').text('RECIBO DE PAGO', { align: 'right' });
 
-  // Emisor / recibo info
   doc.moveDown(0.5);
   doc.font('Helvetica').fontSize(10).fillColor('#111');
   const leftX = doc.x,
@@ -212,7 +191,6 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineIte
   doc.text(invText, 300, topY, { align: 'right' });
   doc.moveDown(1);
 
-  // Cliente (a la derecha)
   const addr = customer?.address || {};
   const line1 = addr.line1 || customer.line1 || '';
   const line2 = addr.line2 || customer.line2 || '';
@@ -243,7 +221,6 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineIte
   doc.moveDown(0.8);
   doc.font('Helvetica-Bold').fontSize(10);
 
-  // Cabecera tabla (alineada)
   const xDesc = 56,
     wDesc = 280;
   const xQty = 336,
@@ -264,7 +241,6 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineIte
   doc.lineWidth(0.7).strokeColor('#e5e7eb').moveTo(56, sepY).lineTo(536, sepY).stroke();
   doc.restore();
 
-  // Filas
   doc.font('Helvetica').fontSize(10);
 
   let y = sepY + 6;
@@ -289,20 +265,17 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineIte
   doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
   doc.moveDown(0.6);
 
-  // Total
   doc.font('Helvetica-Bold').fontSize(11);
   doc.text('Total pagado', 56, doc.y, { width: 340 });
   doc.text(fmt(sumCents / 100, currency), 396, doc.y, { width: 140, align: 'right' });
   doc.moveDown(0.8);
 
-  // Sello PAGADO
   doc.save();
   doc.rotate(-10, { origin: [400, doc.y] });
   doc.font('Helvetica-Bold').fontSize(28).fillColor('#D62828');
   doc.text('PAGADO', 320, doc.y - 12, { opacity: 0.6 });
   doc.restore();
 
-  // Nota lateral (derecha)
   doc.moveDown(1.4);
   doc.font('Helvetica').fontSize(9).fillColor('#444');
   const pageWidth = doc.page.width;
@@ -320,9 +293,7 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineIte
   return await done;
 }
 
-// ---------------------------
-// Emails
-// ---------------------------
+// ---- Email helpers ----
 async function sendSMTP({ from, to, subject, html, attachments }) {
   const transporter = nodemailer.createTransport({
     host: SMTP_HOST,
@@ -457,7 +428,6 @@ ${isSubscription ? `<tr><td style="padding:0 24px 8px;">${manageButtonHTML(custo
 async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, items, customer, pdfUrl, isSubscription, customerId }) {
   if (!to) return;
 
-  // Recibo propio
   const receiptBuf = await buildReceiptPDF({
     invoiceNumber,
     total,
@@ -471,16 +441,13 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
     paidAt: new Date(),
   });
 
-  const attachments = [
-    { filename: `recibo-${invoiceNumber || 'pago'}.pdf`, content: receiptBuf, contentType: 'application/pdf' },
-  ];
+  const attachments = [{ filename: `recibo-${invoiceNumber || 'pago'}.pdf`, content: receiptBuf, contentType: 'application/pdf' }];
 
   if (ATTACH_STRIPE_INVOICE && pdfUrl) {
     try {
       const r = await fetch(pdfUrl);
       if (r.ok) {
         const b = Buffer.from(await r.arrayBuffer());
-        // FIX: sin comilla suelta
         attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf`, content: b, contentType: 'application/pdf' });
       }
     } catch (e) {
@@ -540,7 +507,6 @@ ${isSubscription ? `<tr><td style="padding:0 24px 8px;">${manageButtonHTML(custo
 }
 
 async function sendCancelEmails({ toCustomer, customerName, customerId, subscriptionId }) {
-  // Cliente
   if (toCustomer) {
     const subject = 'Suscripcion cancelada - ' + BRAND;
     const body = `
@@ -561,8 +527,6 @@ async function sendCancelEmails({ toCustomer, customerName, customerId, subscrip
     });
     await sendEmail({ to: toCustomer, subject, html });
   }
-
-  // Admin
   if (CORPORATE_EMAIL) {
     const subject = 'Baja de suscripcion - ' + (subscriptionId || '');
     const body = `
@@ -587,19 +551,15 @@ async function sendCancelEmails({ toCustomer, customerName, customerId, subscrip
   }
 }
 
-// ---------------------------
-// CORS y parsers
-// ---------------------------
+// ---- CORS / logging ----
 const allowOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
-
 const allowDomains = (process.env.ALLOWED_DOMAINS || '')
   .split(',')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
-
 const originOk = (origin) => {
   if (!origin) return true;
   if (allowOrigins.includes(origin)) return true;
@@ -610,7 +570,6 @@ const originOk = (origin) => {
     return false;
   }
 };
-
 app.use(
   cors({
     origin: (origin, cb) => (originOk(origin) ? cb(null, true) : cb(new Error('Not allowed by CORS: ' + origin))),
@@ -620,115 +579,16 @@ app.use(
   })
 );
 app.use(morgan('tiny'));
-app.use(express.json());
 
-// ---------------------------
-// Endpoints publicos
-// ---------------------------
+// ***** MUY IMPORTANTE *****
+// 1) El webhook necesita RAW body. Montamos raw SOLO para /webhook (antes que json).
+app.use('/webhook', express.raw({ type: '*/*' }));
 
-// Ping de salud
+// ---- Rutas que no usan body aún ----
 app.get('/health', (req, res) => res.json({ ok: true, service: 'api', ts: new Date().toISOString() }));
 
-// Crear sesion de checkout (compra unica)
-app.post('/create-checkout-session', async (req, res) => {
-  try {
-    const { items = [], success_url, cancel_url } = req.body || {};
-    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items vacios' });
-
-    const line_items = items
-      .map((it) => {
-        if (it.price) return { price: it.price, quantity: it.quantity || 1 };
-        if (it.priceId) return { price: it.priceId, quantity: it.quantity || 1 };
-        return null;
-      })
-      .filter(Boolean);
-
-    if (!line_items.length) return res.status(400).json({ error: 'Sin price validos' });
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      line_items,
-      success_url: success_url || 'https://guarrosextremenos.com/success',
-      cancel_url: cancel_url || 'https://guarrosextremenos.com/cancel',
-      allow_promotion_codes: true,
-      billing_address_collection: 'auto',
-      customer_creation: 'if_required',
-    });
-
-    res.json({ url: session.url, id: session.id });
-  } catch (e) {
-    console.error('create-checkout-session error:', e);
-    res.status(500).json({ error: e.message || 'Error' });
-  }
-});
-
-// Crear sesion de suscripcion (dos planes posibles)
-app.post('/create-subscription-session', async (req, res) => {
-  try {
-    const { plan, customer_info = {}, success_url, cancel_url } = req.body || {};
-    const priceId =
-      plan === 'price_1000' || plan === SUB_1000_PRICE_ID
-        ? SUB_1000_PRICE_ID
-        : plan === 'price_500' || plan === SUB_500_PRICE_ID
-        ? SUB_500_PRICE_ID
-        : null;
-
-    if (!priceId) return res.status(400).json({ error: 'Plan no valido' });
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      line_items: [{ price: priceId, quantity: 1 }],
-      success_url: success_url || 'https://guarrosextremenos.com/success',
-      cancel_url: cancel_url || 'https://guarrosextremenos.com/cancel',
-      allow_promotion_codes: true,
-      billing_address_collection: 'required',
-      subscription_data: {
-        metadata: {
-          source: 'guarros-front',
-          ...(customer_info?.email ? { email: customer_info.email } : {}),
-          ...(customer_info?.name ? { name: customer_info.name } : {}),
-          ...(customer_info?.phone ? { phone: customer_info.phone } : {}),
-        },
-      },
-      customer_update: { address: 'auto', name: 'auto' },
-      metadata: {
-        source: 'guarros-front',
-        ...(customer_info?.email ? { email: customer_info.email } : {}),
-        ...(customer_info?.name ? { name: customer_info.name } : {}),
-        ...(customer_info?.phone ? { phone: customer_info.phone } : {}),
-      },
-    });
-
-    res.json({ url: session.url, id: session.id });
-  } catch (e) {
-    console.error('create-subscription-session error:', e);
-    res.status(500).json({ error: e.message || 'Error' });
-  }
-});
-
-// Enlace al Billing Portal (para "Gestionar suscripcion")
-app.get('/billing-portal/link', async (req, res) => {
-  try {
-    const { customer_id, return: ret } = req.query;
-    if (!customer_id) return res.status(400).send('customer_id requerido');
-
-    const portalSession = await stripe.billingPortal.sessions.create({
-      customer: customer_id,
-      return_url: ret || PORTAL_RETURN_URL,
-      ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {}),
-    });
-
-    res.redirect(portalSession.url);
-  } catch (e) {
-    console.error('billing-portal/link error:', e);
-    res.status(500).send('Error creating portal session.');
-  }
-});
-
-// ---------------------------
-// Webhook (RAW) — Stripe
-// ---------------------------
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// 2) Definimos el webhook (usa req.body RAW)
+app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
   try {
@@ -738,7 +598,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Idempotencia
+  // Idempotencia en DB (si existe)
   const seen = async (id) => {
     if (!pool) return true;
     const q = `INSERT INTO processed_events(event_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING event_id`;
@@ -754,7 +614,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
   console.log('[webhook] EVENT', { id: event.id, type: event.type, livemode: event.livemode, created: event.created });
 
-  // Helpers DB
+  // ---- Helpers DB (idénticos a tu versión) ----
   const logOrder = async (o) => {
     if (!pool) return;
     const text = `
@@ -873,10 +733,8 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object;
-
         const isSub = session.mode === 'subscription' || !!session.subscription;
 
-        // Items del checkout
         let items = [];
         try {
           const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] });
@@ -895,7 +753,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           ? { name: session.shipping_details?.name || null, ...session.shipping_details.address }
           : {};
 
-        // Log pedido + items
         await logOrder({
           sessionId: session.id,
           email,
@@ -911,7 +768,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         });
         await logOrderItems(session.id, items, currency);
 
-        // Alta/actualizacion de suscriptor si procede
         if (isSub && session.subscription) {
           try {
             const sub = await stripe.subscriptions.retrieve(session.subscription);
@@ -934,7 +790,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           }
         }
 
-        // Email admin
         try {
           await sendAdminEmail({
             session,
@@ -952,7 +807,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           console.error('Email admin ERROR:', e);
         }
 
-        // Email cliente (segun combine)
         if (!COMBINE_CONFIRMATION_AND_INVOICE) {
           try {
             await sendCustomerConfirmationOnly({
@@ -998,7 +852,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           }
         }
 
-        // line items de la invoice
         let items = [];
         try {
           const li = await stripe.invoices.listLineItems(inv.id, { limit: 100, expand: ['data.price.product'] });
@@ -1007,7 +860,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           console.warn('[invoice listLineItems warn]', e?.message || e);
         }
 
-        // Log de invoice de suscripcion (si aplica)
         if (inv.subscription && pool) {
           const text = `
             INSERT INTO subscription_invoices
@@ -1059,7 +911,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
         try {
-          // Resolver email/nombre
           let email = null;
           let name = '';
           try {
@@ -1087,9 +938,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
               }
             } catch {}
           }
-          // Marcar en DB
+
           await markCanceled(sub.id);
-          // Emails
+
           await sendCancelEmails({
             toCustomer: email,
             customerName: name,
@@ -1103,9 +954,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         break;
       }
 
-      default: {
-        // Otros eventos no criticos
-      }
+      default:
+        // ignore
+        break;
     }
 
     res.status(200).json({ received: true });
@@ -1115,11 +966,104 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   }
 });
 
-// ---------------------------
-// Endpoints de test rapidos
-// ---------------------------
+// 3) A PARTIR DE AQUI, ya podemos usar JSON parser para todo lo demas:
+app.use(express.json());
 
-// Test email (admin)
+// ---- Rutas normales (JSON) ----
+app.post('/create-checkout-session', async (req, res) => {
+  try {
+    const { items = [], success_url, cancel_url } = req.body || {};
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items vacios' });
+
+    const line_items = items
+      .map((it) => {
+        if (it.price) return { price: it.price, quantity: it.quantity || 1 };
+        if (it.priceId) return { price: it.priceId, quantity: it.quantity || 1 };
+        return null;
+      })
+      .filter(Boolean);
+
+    if (!line_items.length) return res.status(400).json({ error: 'Sin price validos' });
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items,
+      success_url: success_url || 'https://guarrosextremenos.com/success',
+      cancel_url: cancel_url || 'https://guarrosextremenos.com/cancel',
+      allow_promotion_codes: true,
+      billing_address_collection: 'auto',
+      customer_creation: 'if_required',
+    });
+
+    res.json({ url: session.url, id: session.id });
+  } catch (e) {
+    console.error('create-checkout-session error:', e);
+    res.status(500).json({ error: e.message || 'Error' });
+  }
+});
+
+app.post('/create-subscription-session', async (req, res) => {
+  try {
+    const { plan, customer_info = {}, success_url, cancel_url } = req.body || {};
+    const priceId =
+      plan === 'price_1000' || plan === SUB_1000_PRICE_ID
+        ? SUB_1000_PRICE_ID
+        : plan === 'price_500' || plan === SUB_500_PRICE_ID
+        ? SUB_500_PRICE_ID
+        : null;
+
+    if (!priceId) return res.status(400).json({ error: 'Plan no valido' });
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: success_url || 'https://guarrosextremenos.com/success',
+      cancel_url: cancel_url || 'https://guarrosextremenos.com/cancel',
+      allow_promotion_codes: true,
+      billing_address_collection: 'required',
+      subscription_data: {
+        metadata: {
+          source: 'guarros-front',
+          ...(customer_info?.email ? { email: customer_info.email } : {}),
+          ...(customer_info?.name ? { name: customer_info.name } : {}),
+          ...(customer_info?.phone ? { phone: customer_info.phone } : {}),
+        },
+      },
+      customer_update: { address: 'auto', name: 'auto' },
+      metadata: {
+        source: 'guarros-front',
+        ...(customer_info?.email ? { email: customer_info.email } : {}),
+        ...(customer_info?.name ? { name: customer_info.name } : {}),
+        ...(customer_info?.phone ? { phone: customer_info.phone } : {}),
+      },
+    });
+
+    res.json({ url: session.url, id: session.id });
+  } catch (e) {
+    console.error('create-subscription-session error:', e);
+    res.status(500).json({ error: e.message || 'Error' });
+  }
+});
+
+app.get('/billing-portal/link', async (req, res) => {
+  try {
+    const { customer_id, return: ret } = req.query;
+    if (!customer_id) return res.status(400).send('customer_id requerido');
+
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: customer_id,
+      return_url: ret || PORTAL_RETURN_URL,
+      ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {}),
+    });
+
+    res.redirect(portalSession.url);
+  } catch (e) {
+    console.error('billing-portal/link error:', e);
+    res.status(500).send('Error creating portal session.');
+  }
+});
+
+// --- Test tools ---
 app.get('/test-email', async (req, res) => {
   try {
     if (!CORPORATE_EMAIL) return res.status(400).json({ ok: false, error: 'CORPORATE_EMAIL no definido' });
@@ -1138,7 +1082,6 @@ app.get('/test-email', async (req, res) => {
   }
 });
 
-// Test conexion DB
 app.get('/test-db-ping', async (req, res) => {
   try {
     if (!pool) return res.status(400).json({ ok: false, error: 'DATABASE_URL no configurada' });
@@ -1149,11 +1092,6 @@ app.get('/test-db-ping', async (req, res) => {
   }
 });
 
-// Raiz
-app.get('/', (req, res) => res.status(404).send('Not found'));
-
-// --- Resolver precios de Stripe ---
-// POST /prices/resolve  { ids: ["price_x", "price_y", ...] }
 app.post('/prices/resolve', async (req, res) => {
   try {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
@@ -1166,7 +1104,7 @@ app.post('/prices/resolve', async (req, res) => {
         out[id] = {
           id: p.id,
           currency: p.currency?.toUpperCase() || 'EUR',
-          unit_amount: p.unit_amount,          // en centimos
+          unit_amount: p.unit_amount,
           recurring: !!p.recurring,
           product_name: p.product?.name || null,
         };
@@ -1181,7 +1119,6 @@ app.post('/prices/resolve', async (req, res) => {
   }
 });
 
-// GET /price/:id
 app.get('/price/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -1198,10 +1135,9 @@ app.get('/price/:id', async (req, res) => {
   }
 });
 
+app.get('/', (req, res) => res.status(404).send('Not found'));
 
-// ---------------------------
-// Arranque
-// ---------------------------
+// ---- Start ----
 app.listen(PORT, () => {
   console.log(`API listening on :${PORT}`);
 });
