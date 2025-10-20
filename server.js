@@ -1,4 +1,4 @@
-// server.js — Backend ESM completo y ordenado
+// server.js — Backend ESM completo y ordenado (ASCII-safe)
 // -------------------------------------------
 // Requisitos Node 18+ (ESM). Instala dependencias:
 // npm i express cors morgan stripe resend nodemailer pdfkit pg dotenv
@@ -16,7 +16,7 @@ import pg from 'pg';
 const { Pool } = pg;
 
 // ---------------------------
-// Configuración principal
+// Configuracion principal
 // ---------------------------
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -26,20 +26,20 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 // Marca
-const BRAND = process.env.BRAND_NAME || 'Guarros Extremeños';
+const BRAND = process.env.BRAND_NAME || 'Guarros Extremeños';
 const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
-const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || ''; // URL pública del logo horizontal
+const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || ''; // URL publica del logo horizontal
 
 // Front y CORS
 const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || 'https://guarros-extremenos-api.onrender.com';
 const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || 'https://guarrosextremenos.com/account';
 const BILLING_PORTAL_CONFIG = process.env.STRIPE_BILLING_PORTAL_CONFIG || null;
 
-// Planes de suscripción (dos niveles)
+// Planes de suscripcion (dos niveles)
 const SUB_500_PRICE_ID = process.env.SUB_500_PRICE_ID || process.env.VITE_SUB_500_PRICE_ID; // price_...
 const SUB_1000_PRICE_ID = process.env.SUB_1000_PRICE_ID || process.env.VITE_SUB_1000_PRICE_ID; // price_...
 
-// Envío de emails
+// Envio de emails
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
@@ -64,7 +64,7 @@ const COMPANY = {
   address: process.env.COMPANY_ADDRESS || '',
   city: process.env.COMPANY_CITY || '',
   postal: process.env.COMPANY_POSTAL || '',
-  country: process.env.COMPANY_COUNTRY || 'España',
+  country: process.env.COMPANY_COUNTRY || 'España',
   serie: process.env.RECEIPT_SERIE || 'WEB',
 };
 
@@ -142,7 +142,7 @@ ${body}
 </table>
 </body></html>`;
 
-// Botón “Gestionar suscripción”
+// Boton "Gestionar suscripcion"
 const manageButtonHTML = (customerId) => {
   if (!customerId) return '';
   const link = `${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(
@@ -150,13 +150,13 @@ const manageButtonHTML = (customerId) => {
   )}&return=${encodeURIComponent(PORTAL_RETURN_URL)}`;
   return `
   <div style="text-align:center;margin:16px 0 6px;">
-    <a href="${link}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripción</a>
+    <a href="${link}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripcion</a>
   </div>
   <p style="margin:6px 0 0; font:12px system-ui; color:#6b7280; text-align:center;">Puedes pausar o cancelar cuando quieras</p>`;
 };
 
 // ---------------------------
-// PDF de recibo “PAGADO”
+// PDF de recibo "PAGADO"
 // ---------------------------
 async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineItems = [], customer = {}, paidAt = new Date() }) {
   const doc = new PDFDocument({ size: 'A4', margins: { top: 56, bottom: 56, left: 56, right: 56 } });
@@ -184,7 +184,7 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineIte
     doc.font('Helvetica-Bold').fontSize(20).text(BRAND, { align: 'left' });
   }
 
-  // Título
+  // Titulo
   doc.moveDown(0.5);
   doc.font('Helvetica-Bold').fontSize(18).fillColor('#D62828').text('RECIBO DE PAGO', { align: 'right' });
 
@@ -310,7 +310,7 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineIte
   const colWidth = 300;
   const xRightCol = pageWidth - right - colWidth;
   doc.text(
-    'Este documento sirve como justificación de pago. Para información fiscal detallada, también se adjunta la factura oficial.',
+    'Este documento sirve como justificacion de pago. Para informacion fiscal detallada, tambien se adjunta la factura oficial.',
     xRightCol,
     doc.y,
     { width: colWidth }
@@ -350,15 +350,15 @@ async function sendEmail({ to, subject, html, attachments, bcc = [] }) {
 
 async function sendAdminEmail({ session, items = [], customerEmail, name, phone, amountTotal, currency, metadata = {}, shipping = {} }) {
   if (!CORPORATE_EMAIL) return;
-  const subject = `🧾 ${session?.mode === 'subscription' ? 'Suscripción' : 'Pedido'} — ${session?.id || ''}`;
+  const subject = (session?.mode === 'subscription' ? 'Suscripcion' : 'Pedido') + ' - ' + (session?.id || '');
 
   const body = `
 <tr><td style="padding:0 24px 8px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111">Nuevo ${session?.mode === 'subscription' ? 'ALTA DE SUSCRIPCIÓN' : 'PEDIDO'}</p>
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111">Nuevo ${session?.mode === 'subscription' ? 'ALTA DE SUSCRIPCION' : 'PEDIDO'}</p>
   <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
     <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
     <li><b>Email:</b> ${escapeHtml(customerEmail || '-')}</li>
-    <li><b>Teléfono:</b> ${escapeHtml(phone || '-')}</li>
+    <li><b>Telefono:</b> ${escapeHtml(phone || '-')}</li>
     <li><b>Session:</b> ${escapeHtml(session?.id || '-')}</li>
     <li><b>Modo:</b> ${escapeHtml(session?.mode || '-')}</li>
   </ul>
@@ -402,13 +402,11 @@ async function sendAdminEmail({ session, items = [], customerEmail, name, phone,
 
 async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, items, orderId, isSubscription, customerId }) {
   if (!to) return;
-  const subject = isSubscription
-    ? `✅ Suscripción activada ${orderId ? `#${orderId}` : ''} — ${BRAND}`
-    : `✅ Confirmación de pedido ${orderId ? `#${orderId}` : ''} — ${BRAND}`;
+  const subject = (isSubscription ? 'Suscripcion activada' : 'Confirmacion de pedido') + (orderId ? ' #' + orderId : '') + ' - ' + BRAND;
 
   const intro = isSubscription
-    ? `¡Gracias por suscribirte a ${BRAND}! Tu suscripción ha quedado activada correctamente.`
-    : `¡Gracias por tu compra en ${BRAND}! Tu pago se ha recibido correctamente.`;
+    ? `Gracias por suscribirte a ${BRAND}. Tu suscripcion ha quedado activada correctamente.`
+    : `Gracias por tu compra en ${BRAND}. Tu pago se ha recibido correctamente.`;
 
   const body = `
 <tr><td style="padding:0 24px 8px;">
@@ -444,8 +442,8 @@ async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, i
 ${isSubscription ? `<tr><td style="padding:0 24px 8px;">${manageButtonHTML(customerId)}</td></tr>` : ''}`;
 
   const html = emailShell({
-    title: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
-    header: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
+    title: isSubscription ? 'Suscripcion activada' : 'Confirmacion de pedido',
+    header: isSubscription ? 'Suscripcion activada' : 'Confirmacion de pedido',
     body,
     footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(
       BRAND
@@ -482,18 +480,19 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
       const r = await fetch(pdfUrl);
       if (r.ok) {
         const b = Buffer.from(await r.arrayBuffer());
-        attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf', content: b, contentType: 'application/pdf' });
+        // FIX: sin comilla suelta
+        attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf`, content: b, contentType: 'application/pdf' });
       }
     } catch (e) {
       console.warn('[combined] No se pudo descargar invoice_pdf:', e?.message || e);
     }
   }
 
-  const subject = isSubscription ? `✅ Suscripción activada — ${BRAND}` : `✅ Confirmación de pedido — ${BRAND}`;
+  const subject = (isSubscription ? 'Suscripcion activada' : 'Confirmacion de pedido') + ' - ' + BRAND;
 
   const intro = isSubscription
-    ? `¡Gracias por suscribirte a ${BRAND}! Tu suscripción ha quedado activada correctamente.`
-    : `¡Gracias por tu compra en ${BRAND}! Tu pago se ha recibido correctamente.`;
+    ? `Gracias por suscribirte a ${BRAND}. Tu suscripcion ha quedado activada correctamente.`
+    : `Gracias por tu compra en ${BRAND}. Tu pago se ha recibido correctamente.`;
 
   const body = `
 <tr><td style="padding:0 24px 8px;">
@@ -526,16 +525,11 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
     </tfoot>
   </table>
 </td></tr>
-<tr><td style="padding:12px 24px 6px;">
-  <p style="margin:0 0 6px; font:12px system-ui; color:#6b7280;">
-    Adjuntamos tu recibo PDF${ATTACH_STRIPE_INVOICE ? ' y la factura oficial de Stripe' : ''}.
-  </p>
-</td></tr>
 ${isSubscription ? `<tr><td style="padding:0 24px 8px;">${manageButtonHTML(customerId)}</td></tr>` : ''}`;
 
   const html = emailShell({
-    title: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
-    header: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido',
+    title: isSubscription ? 'Suscripcion activada' : 'Confirmacion de pedido',
+    header: isSubscription ? 'Suscripcion activada' : 'Confirmacion de pedido',
     body,
     footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(
       BRAND
@@ -548,18 +542,18 @@ ${isSubscription ? `<tr><td style="padding:0 24px 8px;">${manageButtonHTML(custo
 async function sendCancelEmails({ toCustomer, customerName, customerId, subscriptionId }) {
   // Cliente
   if (toCustomer) {
-    const subject = `❌ Suscripción cancelada — ${BRAND}`;
+    const subject = 'Suscripcion cancelada - ' + BRAND;
     const body = `
 <tr><td style="padding:0 24px 8px;">
   <p style="margin:0 0 12px; font:15px system-ui; color:#111;">${customerName ? `Hola ${escapeHtml(customerName)},` : 'Hola,'}</p>
-  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">Tu suscripción ha sido <strong>cancelada</strong>. No se generarán más cargos.</p>
+  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">Tu suscripcion ha sido cancelada. No se generaran mas cargos.</p>
   <p style="margin:0 0 8px; font:13px system-ui; color:#6b7280;">
-    ID cliente: ${escapeHtml(customerId || '-')}, ID suscripción: ${escapeHtml(subscriptionId || '-')}
+    ID cliente: ${escapeHtml(customerId || '-')}, ID suscripcion: ${escapeHtml(subscriptionId || '-')}
   </p>
 </td></tr>`;
     const html = emailShell({
-      title: 'Suscripción cancelada',
-      header: 'Suscripción cancelada',
+      title: 'Suscripcion cancelada',
+      header: 'Suscripcion cancelada',
       body,
       footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(
         BRAND
@@ -570,10 +564,10 @@ async function sendCancelEmails({ toCustomer, customerName, customerId, subscrip
 
   // Admin
   if (CORPORATE_EMAIL) {
-    const subject = `⚠️ Baja de suscripción — ${subscriptionId || ''}`;
+    const subject = 'Baja de suscripcion - ' + (subscriptionId || '');
     const body = `
 <tr><td style="padding:0 24px 8px;">
-  <p style="margin:0 0 10px; font:14px system-ui; color:#111;">Se ha cancelado una suscripción.</p>
+  <p style="margin:0 0 10px; font:14px system-ui; color:#111;">Se ha cancelado una suscripcion.</p>
   <ul style="margin:0; padding-left:16px; color:#111; font:14px system-ui;">
     <li><b>Cliente:</b> ${escapeHtml(customerName || '-')}</li>
     <li><b>Email:</b> ${escapeHtml(toCustomer || '-')}</li>
@@ -582,8 +576,8 @@ async function sendCancelEmails({ toCustomer, customerName, customerId, subscrip
   </ul>
 </td></tr>`;
     const html = emailShell({
-      title: 'Baja de suscripción',
-      header: 'Baja de suscripción',
+      title: 'Baja de suscripcion',
+      header: 'Baja de suscripcion',
       body,
       footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString(
         'es-ES'
@@ -629,25 +623,27 @@ app.use(morgan('tiny'));
 app.use(express.json());
 
 // ---------------------------
-// Endpoints públicos
+// Endpoints publicos
 // ---------------------------
 
 // Ping de salud
 app.get('/health', (req, res) => res.json({ ok: true, service: 'api', ts: new Date().toISOString() }));
 
-// Crear sesión de checkout (compra única)
+// Crear sesion de checkout (compra unica)
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const { items = [], success_url, cancel_url, customer_update } = req.body || {};
-    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items vacíos' });
+    const { items = [], success_url, cancel_url } = req.body || {};
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items vacios' });
 
-    const line_items = items.map((it) => {
-      if (it.price) return { price: it.price, quantity: it.quantity || 1 };
-      if (it.priceId) return { price: it.priceId, quantity: it.quantity || 1 };
-      return null;
-    }).filter(Boolean);
+    const line_items = items
+      .map((it) => {
+        if (it.price) return { price: it.price, quantity: it.quantity || 1 };
+        if (it.priceId) return { price: it.priceId, quantity: it.quantity || 1 };
+        return null;
+      })
+      .filter(Boolean);
 
-    if (!line_items.length) return res.status(400).json({ error: 'Sin price válidos' });
+    if (!line_items.length) return res.status(400).json({ error: 'Sin price validos' });
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -656,8 +652,7 @@ app.post('/create-checkout-session', async (req, res) => {
       cancel_url: cancel_url || 'https://guarrosextremenos.com/cancel',
       allow_promotion_codes: true,
       billing_address_collection: 'auto',
-      customer_creation: 'if_required', // solo permitido en mode=payment
-      // customer_update: { address: 'auto' } // ⚠️ No permitido en mode=payment en algunos contexts
+      customer_creation: 'if_required',
     });
 
     res.json({ url: session.url, id: session.id });
@@ -667,7 +662,7 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// Crear sesión de suscripción (dos planes posibles)
+// Crear sesion de suscripcion (dos planes posibles)
 app.post('/create-subscription-session', async (req, res) => {
   try {
     const { plan, customer_info = {}, success_url, cancel_url } = req.body || {};
@@ -678,7 +673,7 @@ app.post('/create-subscription-session', async (req, res) => {
         ? SUB_500_PRICE_ID
         : null;
 
-    if (!priceId) return res.status(400).json({ error: 'Plan no válido' });
+    if (!priceId) return res.status(400).json({ error: 'Plan no valido' });
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -695,7 +690,7 @@ app.post('/create-subscription-session', async (req, res) => {
           ...(customer_info?.phone ? { phone: customer_info.phone } : {}),
         },
       },
-      customer_update: { address: 'auto', name: 'auto' }, // permitido en suscripciones
+      customer_update: { address: 'auto', name: 'auto' },
       metadata: {
         source: 'guarros-front',
         ...(customer_info?.email ? { email: customer_info.email } : {}),
@@ -711,7 +706,7 @@ app.post('/create-subscription-session', async (req, res) => {
   }
 });
 
-// Enlace al Billing Portal (para “Gestionar suscripción”)
+// Enlace al Billing Portal (para "Gestionar suscripcion")
 app.get('/billing-portal/link', async (req, res) => {
   try {
     const { customer_id, return: ret } = req.query;
@@ -916,7 +911,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         });
         await logOrderItems(session.id, items, currency);
 
-        // Alta/actualización de suscriptor si procede
+        // Alta/actualizacion de suscriptor si procede
         if (isSub && session.subscription) {
           try {
             const sub = await stripe.subscriptions.retrieve(session.subscription);
@@ -935,7 +930,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
               country: cust?.address?.country || null,
             });
           } catch (e) {
-            console.error('[suscripción (alta) ERROR]', e);
+            console.error('[suscripcion (alta) ERROR]', e);
           }
         }
 
@@ -952,12 +947,12 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             metadata,
             shipping,
           });
-          console.log('📧 Email admin enviado OK');
+          console.log('Email admin enviado OK');
         } catch (e) {
-          console.error('📧 Email admin ERROR:', e);
+          console.error('Email admin ERROR:', e);
         }
 
-        // Email cliente (según combine)
+        // Email cliente (segun combine)
         if (!COMBINE_CONFIRMATION_AND_INVOICE) {
           try {
             await sendCustomerConfirmationOnly({
@@ -970,15 +965,15 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
               isSubscription: isSub,
               customerId: session.customer,
             });
-            console.log('📧 Email cliente enviado OK (confirmación solo)');
+            console.log('Email cliente enviado OK (confirmacion solo)');
           } catch (e) {
-            console.error('📧 Email cliente ERROR:', e);
+            console.error('Email cliente ERROR:', e);
           }
         } else {
-          console.log('[combine=true] El correo al cliente se envía con invoice.payment_succeeded');
+          console.log('[combine=true] El correo al cliente se envia con invoice.payment_succeeded');
         }
 
-        console.log('✅ checkout.session.completed', session.id);
+        console.log('OK checkout.session.completed', session.id);
         break;
       }
 
@@ -994,7 +989,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         const name = inv.customer_name || inv.customer_details?.name || '';
         let pdfUrl = inv.invoice_pdf;
         if (!pdfUrl) {
-          // reintento (a veces tarda en generarse)
           for (let i = 0; i < 3 && !pdfUrl; i++) {
             await new Promise((r) => setTimeout(r, 3000));
             try {
@@ -1013,7 +1007,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           console.warn('[invoice listLineItems warn]', e?.message || e);
         }
 
-        // Log de invoice de suscripción (si aplica)
+        // Log de invoice de suscripcion (si aplica)
         if (inv.subscription && pool) {
           const text = `
             INSERT INTO subscription_invoices
@@ -1052,13 +1046,13 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
               isSubscription: !!inv.subscription || items.some((x) => x?.price?.recurring),
               customerId: inv.customer,
             });
-            console.log('📧 Combinado enviado →', to);
+            console.log('Combinado enviado ->', to);
           } catch (e) {
-            console.error('📧 Combinado ERROR:', e);
+            console.error('Combinado ERROR:', e);
           }
         }
 
-        console.log('✅ invoice.payment_succeeded', inv.id);
+        console.log('OK invoice.payment_succeeded', inv.id);
         break;
       }
 
@@ -1102,7 +1096,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             customerId: sub.customer,
             subscriptionId: sub.id,
           });
-          console.log('✅ customer.subscription.deleted', sub.id);
+          console.log('OK customer.subscription.deleted', sub.id);
         } catch (e) {
           console.error('[cancel ERROR]', e?.message || e);
         }
@@ -1110,8 +1104,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       }
 
       default: {
-        // Otros eventos no críticos
-        // console.log('ℹ️ Evento ignorado:', event.type);
+        // Otros eventos no criticos
       }
     }
 
@@ -1123,7 +1116,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 });
 
 // ---------------------------
-// Endpoints de test rápidos
+// Endpoints de test rapidos
 // ---------------------------
 
 // Test email (admin)
@@ -1138,14 +1131,14 @@ app.get('/test-email', async (req, res) => {
       footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)}</p>`,
     });
 
-    await sendEmail({ to: CORPORATE_EMAIL, subject: `Test ${BRAND}`, html });
+    await sendEmail({ to: CORPORATE_EMAIL, subject: 'Test ' + BRAND, html });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message || 'error' });
   }
 });
 
-// Test conexión DB
+// Test conexion DB
 app.get('/test-db-ping', async (req, res) => {
   try {
     if (!pool) return res.status(400).json({ ok: false, error: 'DATABASE_URL no configurada' });
@@ -1156,10 +1149,10 @@ app.get('/test-db-ping', async (req, res) => {
   }
 });
 
-// Raíz
+// Raiz
 app.get('/', (req, res) => res.status(404).send('Not found'));
 
-// --- RESOLVER PRECIOS DE STRIPE ---
+// --- Resolver precios de Stripe ---
 // POST /prices/resolve  { ids: ["price_x", "price_y", ...] }
 app.post('/prices/resolve', async (req, res) => {
   try {
@@ -1173,7 +1166,7 @@ app.post('/prices/resolve', async (req, res) => {
         out[id] = {
           id: p.id,
           currency: p.currency?.toUpperCase() || 'EUR',
-          unit_amount: p.unit_amount,          // en céntimos
+          unit_amount: p.unit_amount,          // en centimos
           recurring: !!p.recurring,
           product_name: p.product?.name || null,
         };
