@@ -817,9 +817,9 @@ app.post('/webhook', async (req, res) => {
               subscription_id: sub.id,
               email: cust?.email || email || null,
               name: cust?.name || name || null,
-              plan: sub.items?.data?.[0]?.price?.id || null,
+              plan: sub.items?.data?.[0]?.price?.id || (sub.metadata?.subscription_grams ? `g${sub.metadata.subscription_grams}` : null),
               status: sub.status,
-              meta: sub.metadata || {},
+              meta: { ...sub.metadata },
               address: cust?.address?.line1 || null,
               city: cust?.address?.city || null,
               postal: cust?.address?.postal_code || null,
@@ -1056,7 +1056,7 @@ app.use(express.json());
 // ---- PAGO ÚNICO ----
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const { items = [], success_url, cancel_url } = req.body || {};
+    const { items = [], success_url, cancel_url, customer = {}, metadata = {} } = req.body || {};
     if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items vacíos' });
 
     const line_items = items
@@ -1075,8 +1075,21 @@ app.post('/create-checkout-session', async (req, res) => {
       success_url: success_url || `${FRONT_BASE}/success`,
       cancel_url: cancel_url || `${FRONT_BASE}/cancel`,
       allow_promotion_codes: true,
-      billing_address_collection: 'auto',
-      customer_creation: 'if_required',
+      billing_address_collection: 'required',
+      shipping_address_collection: { allowed_countries: ['ES', 'FR', 'DE', 'IT', 'PT', 'BE', 'NL', 'IE', 'GB'] },
+      phone_number_collection: { enabled: true },
+      customer_email: customer.email || undefined,
+      // No usamos customer_update aquí para evitar errores si no hay customer fijo
+      metadata: {
+        source: 'guarros-front',
+        ...metadata,
+        form_name: customer.name || '',
+        form_phone: customer.phone || '',
+        form_address: customer.address || '',
+        form_city: customer.city || '',
+        form_postal: customer.postal || '',
+        form_country: customer.country || 'ES',
+      },
     });
 
     res.json({ url: session.url, id: session.id });
@@ -1093,7 +1106,7 @@ app.post('/create-subscription-session', async (req, res) => {
     const {
       grams,
       currency = 'eur',
-      customer,                 // { email?, name?, phone? }
+      customer,                 // { email?, name?, phone?, address?, city?, postal?, country? }
       metadata = {},
       success_url,
       cancel_url,
@@ -1107,21 +1120,35 @@ app.post('/create-subscription-session', async (req, res) => {
     }
     const amount = SUB_PRICE_TABLE[g]; // céntimos
 
-    // Buscar/crear customer (opcional, si viene email)
+    // Intentar reusar customer existente si viene email (opcional)
     let customerId;
     if (customer?.email) {
       const found = await stripe.customers.list({ email: customer.email, limit: 1 });
-      customerId = found.data[0]?.id || (await stripe.customers.create({
-        email: customer.email,
-        name: customer.name,
-        phone: customer.phone,
-      })).id;
+      if (found.data[0]) {
+        customerId = found.data[0].id;
+      } else {
+        const c = await stripe.customers.create({
+          email: customer.email,
+          name: customer.name,
+          phone: customer.phone,
+          address: customer.address || customer.city || customer.postal || customer.country
+            ? {
+                line1: customer.address || '',
+                city: customer.city || '',
+                postal_code: customer.postal || '',
+                country: customer.country || 'ES',
+              }
+            : undefined,
+        });
+        customerId = c.id;
+      }
     }
 
     // price_data dinámico mensual
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer: customerId,
+      ...(customerId ? { customer: customerId } : {}),
+      customer_email: customer?.email || undefined,
       line_items: [{
         quantity: 1,
         price_data: {
@@ -1135,13 +1162,22 @@ app.post('/create-subscription-session', async (req, res) => {
         },
       }],
       allow_promotion_codes: true,
-      billing_address_collection: 'auto',
+      billing_address_collection: 'required',
+      shipping_address_collection: { allowed_countries: ['ES', 'FR', 'DE', 'IT', 'PT', 'BE', 'NL', 'IE', 'GB'] },
+      phone_number_collection: { enabled: true },
       success_url: success_url || `${FRONT_BASE}/success`,
       cancel_url: cancel_url || `${FRONT_BASE}/cancel`,
       metadata: {
         ...metadata,
+        source: 'guarros-front',
         subscription_grams: String(g),
         pricing_model: 'fixed_table_g',
+        form_name: customer?.name || '',
+        form_phone: customer?.phone || '',
+        form_address: customer?.address || '',
+        form_city: customer?.city || '',
+        form_postal: customer?.postal || '',
+        form_country: customer?.country || 'ES',
       },
     });
 
