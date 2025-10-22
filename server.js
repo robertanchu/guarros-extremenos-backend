@@ -1,4 +1,4 @@
-// server.js — pedidos y suscripciones con emails (alta, cobro, cancelación, cambios) y recibo PDF
+// server.js — pedidos y suscripciones con emails (alta, cobro, cancelación, cambios) + control de duplicados created/updated
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -12,7 +12,6 @@ const { Pool } = pg;
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
 // ===== Marca / Config =====
@@ -57,6 +56,7 @@ async function dbQuery(text, params) {
   catch (e) { console.error('[DB ERROR]', e?.message || e); return { rows: [], rowCount: 0, error: e }; }
 }
 
+// Tablas auxiliares
 (async () => {
   if (!pool) return;
   await dbQuery(`CREATE TABLE IF NOT EXISTS processed_events(
@@ -67,7 +67,15 @@ async function dbQuery(text, params) {
     invoice_id text PRIMARY KEY,
     sent_at timestamptz DEFAULT now()
   )`);
+  // Flags para evitar doble email en alta (created + updated)
+  await dbQuery(`CREATE TABLE IF NOT EXISTS sub_event_flags(
+    subscription_id text PRIMARY KEY,
+    created_notified_at timestamptz,
+    last_updated_notified_at timestamptz
+  )`);
 })();
+
+const SUB_CREATED_SUPPRESS_WINDOW_MIN = Number(process.env.SUB_CREATED_SUPPRESS_WINDOW_MIN || 0.5);
 
 // ===== Utils =====
 const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
@@ -315,7 +323,7 @@ async function sendAdminEmail({ session, items = [], customerEmail, name, phone,
   await sendEmail({ to: CORPORATE_EMAIL, subject, html });
 }
 
-// Email cliente (confirmación sin adjunto)
+// Email cliente simple
 async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, items, orderId, isSubscription, customerId, customer_details, shipping }) {
   if (!to) return;
   const subject = (isSubscription ? 'Confirmación suscripción' : 'Confirmación de pedido') + (orderId ? ' #' + orderId : '') + ' — ' + BRAND;
@@ -357,7 +365,7 @@ ${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a h
   await sendEmail({ to, subject, html, bcc });
 }
 
-// Email cliente (combinado con PDF propio y opcional factura Stripe)
+// Email combinado (PDF propio + opcional factura Stripe)
 async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, items, customer, pdfUrl, isSubscription, customerId }) {
   if (!to) return;
   const receiptBuf = await buildReceiptPDF({ invoiceNumber, total, currency, customer, items, paidAt: new Date() });
@@ -366,7 +374,7 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
     try {
       const r = await fetch(pdfUrl);
       if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf`, content: b, contentType: 'application/pdf' }); }
-    } catch { }
+    } catch {}
   }
   const subject = (isSubscription ? 'Confirmación suscripción' : 'Confirmación de pedido') + ' — ' + BRAND;
   const intro = isSubscription ? `Gracias por suscribirte a ${BRAND}. Tu suscripción ha quedado activada correctamente.` : `Gracias por tu compra en ${BRAND}. Tu pago se ha recibido correctamente.`;
@@ -406,7 +414,7 @@ ${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a h
   await sendEmail({ to, subject, html, attachments });
 }
 
-// ===== Email cancelación (cliente + admin) — SOLO en DELETED
+// ===== Emails cancelación (solo en DELETED)
 async function sendCancelEmails({ customerEmail, name, subId, customerAddress }) {
   const subject = `🛑 Suscripción cancelada — ${BRAND}`;
   const bodyCustomer = `
@@ -455,7 +463,7 @@ async function sendCancelEmails({ customerEmail, name, subId, customerAddress })
   }
 }
 
-// ===== Email por CAMBIOS en la suscripción (updated != canceled)
+// ===== Emails actualización (updated != canceled)
 function summarizeSubscriptionChanges(prev = {}, sub = {}) {
   const keys = Object.keys(prev || {});
   if (!keys.length) return 'Se han actualizado los detalles de tu suscripción.';
@@ -539,6 +547,36 @@ async function fetchCustomerBasics(customerId) {
   }
 }
 
+// ===== Flags de notificación de suscripciones =====
+async function markSubCreatedNotified(subId) {
+  if (!pool || !subId) return;
+  await dbQuery(
+    `INSERT INTO sub_event_flags(subscription_id, created_notified_at)
+     VALUES ($1, NOW())
+     ON CONFLICT (subscription_id) DO UPDATE SET created_notified_at = NOW()`,
+    [subId]
+  );
+}
+async function wasCreatedNotifiedRecently(subId, minutes = SUB_CREATED_SUPPRESS_WINDOW_MIN) {
+  if (!pool || !subId) return false;
+  const { rows } = await dbQuery(
+    `SELECT created_notified_at FROM sub_event_flags WHERE subscription_id=$1`,
+    [subId]
+  );
+  if (!rows?.length || !rows[0].created_notified_at) return false;
+  const ts = new Date(rows[0].created_notified_at).getTime();
+  return (Date.now() - ts) <= minutes * 60 * 1000;
+}
+async function markSubUpdatedNotified(subId) {
+  if (!pool || !subId) return;
+  await dbQuery(
+    `INSERT INTO sub_event_flags(subscription_id, last_updated_notified_at)
+     VALUES ($1, NOW())
+     ON CONFLICT (subscription_id) DO UPDATE SET last_updated_notified_at = NOW()`,
+    [subId]
+  );
+}
+
 // ===== CORS / logging =====
 const allowOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const allowDomains = (process.env.ALLOWED_DOMAINS || 'guarrosextremenos.com,vercel.app').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -557,7 +595,6 @@ app.use(morgan('tiny'));
 
 // ===== RAW body para webhook =====
 app.use('/webhook', express.raw({ type: '*/*' }));
-
 app.get('/health', (req, res) => res.json({ ok: true, service: 'api', ts: new Date().toISOString() }));
 
 // ===== Webhook =====
@@ -753,6 +790,111 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
+      case 'customer.subscription.created': {
+        // ➜ Alta: enviar correos (cliente + admin) y marcar flag para suprimir el "updated" inicial
+        const sub = event.data.object;
+        try {
+          const basics = await fetchCustomerBasics(sub.customer);
+          const name = basics.name;
+          const email = basics.email;
+          const address = basics.address;
+
+          // Admin
+          if (CORPORATE_EMAIL) {
+            const html = emailShell({
+              title: 'Nueva suscripción',
+              header: 'Alta de suscripción',
+              body: `<tr><td style="padding:0 24px 12px;">
+                <p style="margin:0 0 8px; font:15px system-ui; color:#111;">Nueva suscripción creada.</p>
+                <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
+                  <li><b>ID suscripción:</b> ${escapeHtml(sub.id)}</li>
+                  <li><b>Cliente:</b> ${escapeHtml(name || '-')} — ${escapeHtml(email || '-')}</li>
+                  <li><b>Estado:</b> ${escapeHtml(sub.status)}</li>
+                </ul>
+                <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
+                <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
+                <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ address, name, email })}</div>
+              </td></tr>`,
+              footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
+            });
+            await sendEmail({ to: CORPORATE_EMAIL, subject: `Alta suscripción — ${BRAND}`, html });
+          }
+
+          // Cliente (confirmación simple; el PDF combinado seguirá saliendo en invoice.payment_succeeded si está activado)
+          if (email) {
+            await sendCustomerConfirmationOnly({
+              to: email,
+              name,
+              amountTotal: null,
+              currency: 'EUR',
+              items: [],
+              orderId: sub.id,
+              isSubscription: true,
+              customerId: sub.customer,
+              customer_details: { name, email, address },
+              shipping: {},
+            });
+          }
+
+          await markSubCreatedNotified(sub.id);
+        } catch (e) { console.error('[created email ERROR]', e?.message || e); }
+
+        res.status(200).json({ received: true });
+        return;
+      }
+
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        const prev = event.data.previous_attributes || {};
+
+        // Si está cancelada, se gestiona en DELETED
+        if (sub?.status === 'canceled' || prev?.status === 'canceled') {
+          res.status(200).json({ received: true, skipped: 'canceled-handled-in-deleted' });
+          return;
+        }
+
+        // Suprimir el updated inmediatamente posterior al created
+        try {
+          const suppress = await wasCreatedNotifiedRecently(sub.id);
+          if (suppress) {
+            return res.status(200).json({ received: true, skipped: 'suppressed-updated-after-created' });
+          }
+        } catch {}
+
+        // Cambios reales: enviar emails de actualización
+        try {
+          const basics = await fetchCustomerBasics(sub.customer);
+          const summaryHtml = summarizeSubscriptionChanges(prev, sub);
+          await sendSubscriptionUpdatedEmails({
+            customerEmail: basics.email,
+            name: basics.name,
+            subId: sub.id,
+            customerAddress: basics.address,
+            summaryHtml,
+          });
+          await markSubUpdatedNotified(sub.id);
+        } catch (e) { console.error('[updated email ERROR]', e?.message || e); }
+
+        res.status(200).json({ received: true });
+        return;
+      }
+
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        try { await markCanceled(sub.id); } catch (e) { console.error('[cancel ERROR]', e?.message || e); }
+        try {
+          const basics = await fetchCustomerBasics(sub.customer);
+          await sendCancelEmails({
+            customerEmail: basics.email,
+            name: basics.name,
+            subId: sub.id,
+            customerAddress: basics.address,
+          });
+        } catch (e) { console.error('[cancel email ERROR]', e?.message || e); }
+        res.status(200).json({ received: true });
+        return;
+      }
+
       case 'invoice.payment_succeeded': {
         const inv = event.data.object;
 
@@ -794,51 +936,6 @@ app.post('/webhook', async (req, res) => {
             });
           } catch (e) { console.error('Combinado ERROR:', e); }
         }
-
-        res.status(200).json({ received: true });
-        return;
-      }
-
-      // SOLO aquí enviamos emails de cancelación
-      case 'customer.subscription.deleted': {
-        const sub = event.data.object;
-        try { await markCanceled(sub.id); } catch (e) { console.error('[cancel ERROR]', e?.message || e); }
-        try {
-          const basics = await fetchCustomerBasics(sub.customer);
-          await sendCancelEmails({
-            customerEmail: basics.email,
-            name: basics.name,
-            subId: sub.id,
-            customerAddress: basics.address,
-          });
-        } catch (e) { console.error('[cancel email ERROR]', e?.message || e); }
-        res.status(200).json({ received: true });
-        return;
-      }
-
-      // Cambios normales (NO cancelación)
-      case 'customer.subscription.updated': {
-        const sub = event.data.object;
-        const prev = event.data.previous_attributes || {};
-
-        // Si viene como cancelada (o marcada para cancelar) NO enviamos aquí; solo en DELETED
-        if (sub?.status === 'canceled' || prev?.status === 'canceled') {
-          res.status(200).json({ received: true, skipped: 'canceled-handled-in-deleted' });
-          return;
-        }
-
-        // Emails de "actualización correcta" (cliente + admin)
-        try {
-          const basics = await fetchCustomerBasics(sub.customer);
-          const summaryHtml = summarizeSubscriptionChanges(prev, sub);
-          await sendSubscriptionUpdatedEmails({
-            customerEmail: basics.email,
-            name: basics.name,
-            subId: sub.id,
-            customerAddress: basics.address,
-            summaryHtml,
-          });
-        } catch (e) { console.error('[updated email ERROR]', e?.message || e); }
 
         res.status(200).json({ received: true });
         return;
