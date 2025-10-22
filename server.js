@@ -1,4 +1,4 @@
-// server.js — suscripciones: sin duplicados y dirección robusta en factura
+// server.js — pedidos y suscripciones con emails (alta, cobro, cancelación) y recibo PDF
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -273,6 +273,7 @@ async function sendEmail({ to, subject, html, attachments, bcc = [] }) {
   console.warn('[email] No provider configured');
 }
 
+// Email admin (altas / pedidos)
 async function sendAdminEmail({ session, items = [], customerEmail, name, phone, amountTotal, currency, customer_details, shipping }) {
   if (!CORPORATE_EMAIL) return;
   const subject = (session?.mode === 'subscription' ? 'Suscripción' : 'Pedido') + ' - ' + (session?.id || '');
@@ -316,6 +317,7 @@ async function sendAdminEmail({ session, items = [], customerEmail, name, phone,
   await sendEmail({ to: CORPORATE_EMAIL, subject, html });
 }
 
+// Email cliente (confirmación sin adjunto)
 async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, items, orderId, isSubscription, customerId, customer_details, shipping }) {
   if (!to) return;
   const subject = (isSubscription ? 'Confirmación suscripción' : 'Confirmación de pedido') + (orderId ? ' #' + orderId : '') + ' — ' + BRAND;
@@ -357,6 +359,7 @@ ${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a h
   await sendEmail({ to, subject, html, bcc });
 }
 
+// Email cliente (combinado con PDF propio y opcional factura Stripe)
 async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, items, customer, pdfUrl, isSubscription, customerId }) {
   if (!to) return;
   const receiptBuf = await buildReceiptPDF({ invoiceNumber, total, currency, customer, items, paidAt: new Date() });
@@ -403,6 +406,71 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
 ${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a href="${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId || '')}&return=${encodeURIComponent(PORTAL_RETURN_URL)}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripción</a></td></tr>` : ''}`;
   const html = emailShell({ title: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido', header: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido', body, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>` });
   await sendEmail({ to, subject, html, attachments });
+}
+
+// ===== Email cancelación (cliente + admin)
+async function sendCancelEmails({ customerEmail, name, subId, customerAddress, isFromUpdated=false }) {
+  const subject = `🛑 Suscripción cancelada — ${BRAND}`;
+  const bodyCustomer = `
+<tr><td style="padding:0 24px 12px;">
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
+  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">Hemos procesado la cancelación de tu suscripción.</p>
+  <p style="margin:0 0 10px; font:13px system-ui; color:#6b7280;">ID suscripción: <b>${escapeHtml(subId || '-')}</b></p>
+  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
+  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tus datos</p>
+  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ address: customerAddress, name, email: customerEmail })}</div>
+</td></tr>`.trim();
+
+  const htmlCustomer = emailShell({
+    title: 'Suscripción cancelada',
+    header: 'Suscripción cancelada',
+    body: bodyCustomer,
+    footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">Si no reconoces esta acción, responde a este correo o escríbenos a ${escapeHtml(SUPPORT_EMAIL)}.</p>`
+  });
+
+  // Cliente
+  if (customerEmail) {
+    await sendEmail({ to: customerEmail, subject, html: htmlCustomer });
+  }
+
+  // Admin
+  if (CORPORATE_EMAIL) {
+    const bodyAdmin = `
+<tr><td style="padding:0 24px 12px;">
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">Se ha cancelado una suscripción${isFromUpdated ? ' (vía customer.subscription.updated)' : ''}.</p>
+  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
+    <li><b>ID suscripción:</b> ${escapeHtml(subId || '-')}</li>
+    <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
+    <li><b>Email:</b> ${escapeHtml(customerEmail || '-')}</li>
+  </ul>
+  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
+  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
+  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ address: customerAddress, name, email: customerEmail })}</div>
+</td></tr>`.trim();
+
+    const htmlAdmin = emailShell({
+      title: 'Suscripción cancelada',
+      header: 'Suscripción cancelada',
+      body: bodyAdmin,
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
+    });
+
+    await sendEmail({ to: CORPORATE_EMAIL, subject: `Cancelación suscripción — ${BRAND}`, html: htmlAdmin });
+  }
+}
+
+async function fetchCustomerBasics(customerId) {
+  if (!customerId) return { email: null, name: null, address: null };
+  try {
+    const cust = await stripe.customers.retrieve(customerId);
+    return {
+      email: cust?.email || null,
+      name: cust?.name || null,
+      address: cust?.address || null,
+    };
+  } catch {
+    return { email: null, name: null, address: null };
+  }
 }
 
 // ===== CORS / logging =====
@@ -683,6 +751,35 @@ app.post('/webhook', async (req, res) => {
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
         try { await markCanceled(sub.id); } catch (e) { console.error('[cancel ERROR]', e?.message || e); }
+        try {
+          const basics = await fetchCustomerBasics(sub.customer);
+          await sendCancelEmails({
+            customerEmail: basics.email,
+            name: basics.name,
+            subId: sub.id,
+            customerAddress: basics.address,
+          });
+        } catch (e) { console.error('[cancel email ERROR]', e?.message || e); }
+        res.status(200).json({ received: true });
+        return;
+      }
+
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        const prev = event.data.previous_attributes || {};
+        if (sub?.status === 'canceled' || prev?.status === 'canceled') {
+          try { await markCanceled(sub.id); } catch (e) { console.error('[cancel mark (updated) ERROR]', e?.message || e); }
+          try {
+            const basics = await fetchCustomerBasics(sub.customer);
+            await sendCancelEmails({
+              customerEmail: basics.email,
+              name: basics.name,
+              subId: sub.id,
+              customerAddress: basics.address,
+              isFromUpdated: true,
+            });
+          } catch (e) { console.error('[cancel (updated) email ERROR]', e?.message || e); }
+        }
         res.status(200).json({ received: true });
         return;
       }
