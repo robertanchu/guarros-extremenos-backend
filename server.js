@@ -1,4 +1,4 @@
-// server.js — pedidos + suscripciones + emails + PDF + webhooks Stripe
+// server.js — pedidos + suscripciones + emails + PDF + webhooks Stripe (no duplicados usuario en alta)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -685,7 +685,7 @@ app.post('/webhook', async (req, res) => {
           } catch (e) { console.error('[suscripción alta ERROR]', e); }
         }
 
-        // 🔴 CAMBIO CLAVE: correo admin SOLO para one-off aquí.
+        // Admin: solo ONE-OFF aquí (para suscripciones lo enviamos en subscription.created)
         if (!isSub) {
           try {
             await sendAdminEmail({
@@ -697,7 +697,9 @@ app.post('/webhook', async (req, res) => {
           } catch (e) { console.error('Email admin ERROR:', e); }
         }
 
+        // Cliente:
         if (!isSub) {
+          // One-off: confirmación aquí (y si COMBINE=true, se enviará además combinado en invoice.payment_succeeded)
           try {
             if (COMBINE_CONFIRMATION_AND_INVOICE) {
               await sendCustomerCombined({
@@ -719,16 +721,7 @@ app.post('/webhook', async (req, res) => {
             }
           } catch (e) { console.error('Email cliente ONE-OFF ERROR:', e); }
         } else {
-          if (!COMBINE_CONFIRMATION_AND_INVOICE) {
-            try {
-              await sendCustomerConfirmationOnly({
-                to: email, name, amountTotal, currency, items, orderId: session.id,
-                isSubscription: true, customerId: session.customer,
-                customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
-                shipping: session.shipping_details || {},
-              });
-            } catch (e) { console.error('Email cliente SUBS (confirmación) ERROR:', e); }
-          }
+          // Suscripción: NUNCA enviar aquí al cliente (evita duplicados).
         }
 
         res.status(200).json({ received: true });
@@ -760,7 +753,7 @@ app.post('/webhook', async (req, res) => {
             });
           } catch (e) { console.error('[suscripción upsert ERROR]', e?.message || e); }
 
-          // Admin (solo aquí para suscripciones → evita duplicados)
+          // Admin (solo aquí para suscripciones)
           if (CORPORATE_EMAIL) {
             const html = emailShell({
               header: 'Alta de suscripción',
@@ -780,21 +773,25 @@ app.post('/webhook', async (req, res) => {
             await sendEmail({ to: CORPORATE_EMAIL, subject: `Alta suscripción — ${BRAND}`, html });
           }
 
-          // Cliente
-          if (email) {
-            await sendCustomerConfirmationOnly({
-              to: email,
-              name,
-              amountTotal: null,
-              currency: 'EUR',
-              items: [],
-              orderId: sub.id,
-              isSubscription: true,
-              customerId: sub.customer,
-              customer_details: { name, email, address },
-              shipping: {},
-            });
+          // Cliente:
+          if (!COMBINE_CONFIRMATION_AND_INVOICE) {
+            // Solo si NO combinamos, enviamos aquí la confirmación al cliente
+            if (email) {
+              await sendCustomerConfirmationOnly({
+                to: email,
+                name,
+                amountTotal: null,
+                currency: 'EUR',
+                items: [],
+                orderId: sub.id,
+                isSubscription: true,
+                customerId: sub.customer,
+                customer_details: { name, email, address },
+                shipping: {},
+              });
+            }
           }
+          // Si COMBINE=true, no enviamos aquí; lo hará invoice.payment_succeeded con el PDF.
 
         } catch (e) { console.error('[created email ERROR]', e?.message || e); }
 
