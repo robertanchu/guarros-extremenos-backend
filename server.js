@@ -1,4 +1,4 @@
-// server.js — pedidos + suscripciones + emails + PDF + webhooks Stripe (creado / borrado / updated con guardas)
+// server.js — pedidos + suscripciones + emails + PDF + webhooks Stripe
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -18,15 +18,14 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-
 
 // ===== Marca / Config =====
 const BRAND = process.env.BRAND_NAME || 'Guarros Extremeños';
-const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828'; // rojo marca
+const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
 const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || 'https://guarros-extremenos-api.onrender.com';
 const FRONT_BASE = (process.env.FRONT_BASE || 'https://guarrosextremenos.com').replace(/\/+$/, '');
 const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || `${FRONT_BASE}/account`;
 const BILLING_PORTAL_CONFIG = process.env.STRIPE_BILLING_PORTAL_CONFIG || null;
 
-// IMPORTANTE: solo mandamos correos de customer.updated
-// si el cliente YA existe en la tabla subscribers (o sea, tras created)
+// customer.updated solo si ya existe suscriptor en BD
 const SEND_CUSTOMER_UPDATED_ONLY_IF_KNOWN = true;
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
@@ -143,7 +142,7 @@ const extractInvoiceCustomer = (inv) => {
   return { name, email, phone, address };
 };
 
-// ===== Email layout (todo usa BRAND_PRIMARY, nada de rosas) =====
+// ===== Email layout =====
 function emailShell({ header, body, footer }) {
   return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
   <body style="margin:0;padding:0;background:#f3f4f6;">
@@ -449,7 +448,7 @@ async function sendCancelEmails({ customerEmail, name, subId, customerAddress })
   }
 }
 
-// ===== Emails actualización de cliente (customer.updated) =====
+// ===== Emails actualización de cliente =====
 function summarizeCustomerChanges(prev = {}, cust = {}) {
   const lines = [];
   if ('name' in prev)        lines.push(`• Nombre: ${escapeHtml(prev.name ?? '-')} → ${escapeHtml(cust.name ?? '-')} `);
@@ -479,7 +478,6 @@ async function sendCustomerUpdatedEmails({ cust, summaryHtml }) {
   const email = cust?.email || '';
   const address = cust?.address || null;
 
-  // Cliente
   if (email) {
     const htmlCustomer = emailShell({
       header: 'Datos de cliente actualizados',
@@ -491,12 +489,11 @@ async function sendCustomerUpdatedEmails({ cust, summaryHtml }) {
   <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tus datos actuales</p>
   <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ name, email, address })}</div>
 </td></tr>`,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">Si no reconoces esta acción, responde a este correo o escríbenos a ${escapeHtml(SUPPORT_EMAIL)}.</p>`
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">Si no reconoces esta acción, respóndenos o escribe a ${escapeHtml(SUPPORT_EMAIL)}.</p>`
     });
     await sendEmail({ to: email, subject: `✅ Datos actualizados — ${BRAND}`, html: htmlCustomer });
   }
 
-  // Admin
   if (CORPORATE_EMAIL) {
     const htmlAdmin = emailShell({
       header: 'Cliente actualizado',
@@ -688,14 +685,17 @@ app.post('/webhook', async (req, res) => {
           } catch (e) { console.error('[suscripción alta ERROR]', e); }
         }
 
-        try {
-          await sendAdminEmail({
-            session, items, customerEmail: email, name, phone,
-            amountTotal, currency,
-            customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
-            shipping: session.shipping_details || {},
-          });
-        } catch (e) { console.error('Email admin ERROR:', e); }
+        // 🔴 CAMBIO CLAVE: correo admin SOLO para one-off aquí.
+        if (!isSub) {
+          try {
+            await sendAdminEmail({
+              session, items, customerEmail: email, name, phone,
+              amountTotal, currency,
+              customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
+              shipping: session.shipping_details || {},
+            });
+          } catch (e) { console.error('Email admin ERROR:', e); }
+        }
 
         if (!isSub) {
           try {
@@ -743,7 +743,7 @@ app.post('/webhook', async (req, res) => {
           const email = cust?.email || null;
           const address = cust?.address || null;
 
-          // upsert suscriptor primero (para que a partir de ahora customer.updated sí dispare emails)
+          // upsert suscriptor (para que desde ahora customer.updated sí dispare emails)
           try {
             await upsertSubscriber({
               customer_id: sub.customer,
@@ -760,7 +760,7 @@ app.post('/webhook', async (req, res) => {
             });
           } catch (e) { console.error('[suscripción upsert ERROR]', e?.message || e); }
 
-          // Admin
+          // Admin (solo aquí para suscripciones → evita duplicados)
           if (CORPORATE_EMAIL) {
             const html = emailShell({
               header: 'Alta de suscripción',
@@ -803,7 +803,7 @@ app.post('/webhook', async (req, res) => {
       }
 
       case 'customer.subscription.updated': {
-        // Ignorado: los cambios relevantes de datos del cliente se gestionan con customer.updated
+        // Ignoramos; los cambios de datos se gestionan en customer.updated
         return res.status(200).json({ received: true, note: 'subscription.updated ignored' });
       }
 
@@ -829,7 +829,6 @@ app.post('/webhook', async (req, res) => {
           try {
             const known = await subscriberExists(cust.id);
             if (!known) {
-              // Ignora updates que pueden venir ANTES del created (o de clientes sin suscripción activa/registrada)
               return res.status(200).json({ received: true, skipped: 'customer.updated ignored (no subscriber yet)' });
             }
           } catch (e) { console.error('[customer.updated check ERROR]', e?.message || e); }
