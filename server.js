@@ -1,4 +1,4 @@
-// server.js — ESM, estrategia "Stripe-first data"
+// server.js — suscripciones: sin duplicados y dirección robusta en factura
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -18,7 +18,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-
 // ===== Marca / Config =====
 const BRAND = process.env.BRAND_NAME || 'Guarros Extremeños';
 const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
-const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || ''; // URL absoluta del logo
+const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || 'https://guarros-extremenos-api.onrender.com';
 const FRONT_BASE = (process.env.FRONT_BASE || 'https://guarrosextremenos.com').replace(/\/+$/, '');
 const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || `${FRONT_BASE}/account`;
@@ -39,7 +39,7 @@ const COMBINE_CONFIRMATION_AND_INVOICE = String(process.env.COMBINE_CONFIRMATION
 const ATTACH_STRIPE_INVOICE = String(process.env.ATTACH_STRIPE_INVOICE || 'false') === 'true';
 const CUSTOMER_BCC_CORPORATE = String(process.env.CUSTOMER_BCC_CORPORATE || 'false') === 'true';
 
-// ===== Suscripciones por gramos (centimos) =====
+// ===== Tabla de precios de suscripción (centimos) =====
 const SUB_PRICE_TABLE = Object.freeze({
   100: 4600, 200: 5800, 300: 6900, 400: 8000, 500: 9100, 600: 10300,
   700: 11400, 800: 12500, 900: 13600, 1000: 14800, 1500: 20400, 2000: 26000,
@@ -56,6 +56,19 @@ async function dbQuery(text, params) {
   try { return await pool.query(text, params); }
   catch (e) { console.error('[DB ERROR]', e?.message || e); return { rows: [], rowCount: 0, error: e }; }
 }
+
+// Crea tablas de idempotencia si no existen
+(async () => {
+  if (!pool) return;
+  await dbQuery(`CREATE TABLE IF NOT EXISTS processed_events(
+    event_id text PRIMARY KEY,
+    created_at timestamptz DEFAULT now()
+  )`);
+  await dbQuery(`CREATE TABLE IF NOT EXISTS mailed_invoices(
+    invoice_id text PRIMARY KEY,
+    sent_at timestamptz DEFAULT now()
+  )`);
+})();
 
 // ===== Utils =====
 const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
@@ -74,33 +87,61 @@ const toAbsoluteUrl = (u) => {
 const preferShippingThenBilling = (session) => {
   const billing = session?.customer_details || {};
   const shipping = session?.shipping_details || {};
-  // address elegido
   const address = shipping?.address || billing?.address || null;
-  // nombre & teléfono
   const name = shipping?.name || billing?.name || null;
-  const phone = billing?.phone || null; // Stripe pone phone en billing
+  const phone = billing?.phone || null;
   const email = billing?.email || session?.customer_email || null;
   return { name, email, phone, address };
 };
-const fmtAddressHTML = (cust = {}, fallbackShipping = {}) => {
-  const addr = cust?.address || fallbackShipping?.address || {};
+
+const fmtAddressHTML = (cust = {}, fallback = {}) => {
+  const addr =
+    cust?.address ||
+    fallback?.address ||
+    null;
   const lines = [
-    cust?.name || fallbackShipping?.name,
+    cust?.name || fallback?.name,
     cust?.email,
     cust?.phone,
-    addr.line1,
-    addr.line2,
-    [addr.postal_code, addr.city].filter(Boolean).join(' '),
-    addr.state,
-    addr.country,
+    addr?.line1,
+    addr?.line2,
+    [addr?.postal_code, addr?.city].filter(Boolean).join(' '),
+    addr?.state,
+    addr?.country
   ].filter(Boolean);
   if (!lines.length) return '<em>-</em>';
   return lines.map(escapeHtml).join('<br/>');
 };
 
-// ===== Email layout / tablas =====
+const extractInvoiceCustomer = (inv) => {
+  // Robusto: distintos campos según versión/flujo
+  const name =
+    inv?.customer_details?.name ??
+    inv?.customer_name ??
+    inv?.customer_shipping?.name ??
+    null;
+
+  const email =
+    inv?.customer_details?.email ??
+    inv?.customer_email ??
+    null;
+
+  const phone =
+    inv?.customer_details?.phone ??
+    null;
+
+  const address =
+    inv?.customer_details?.address ??
+    inv?.customer_address ??
+    inv?.customer_shipping?.address ??
+    null;
+
+  return { name, email, phone, address };
+};
+
+// ===== Email layout =====
 function emailShell({ title, header, body, footer }) {
-  return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>${escapeHtml(title)}</title></head>
+  return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
   <body style="margin:0;padding:0;background:#f3f4f6;">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:24px 0;">
     <tr><td>
@@ -116,6 +157,7 @@ function emailShell({ title, header, body, footer }) {
   </table>
   </body></html>`;
 }
+
 const lineItemsHTML = (items = [], currency = 'EUR') =>
   (items || []).length
     ? items.map(li => {
@@ -129,13 +171,12 @@ const lineItemsHTML = (items = [], currency = 'EUR') =>
     }).join('')
     : `<tr><td colspan="3" style="padding:8px 0;color:#6b7280">Sin productos</td></tr>`;
 
-// ===== PDF (recibo con cliente + líneas) =====
+// ===== PDF =====
 async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', customer = {}, items = [], paidAt = new Date() }) {
   const doc = new PDFDocument({ size: 'A4', margins: { top: 56, bottom: 56, left: 56, right: 56 } });
   const bufs = [];
   const done = new Promise((res, rej) => { doc.on('data', b => bufs.push(b)); doc.on('end', () => res(Buffer.concat(bufs))); doc.on('error', rej); });
 
-  // Encabezado: logo + título a la derecha
   try {
     if (BRAND_LOGO_URL) {
       const r = await fetch(BRAND_LOGO_URL);
@@ -147,13 +188,12 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', custome
   doc.font('Helvetica-Bold').fontSize(18).fillColor(BRAND_PRIMARY).text('RECIBO DE PAGO', 56, 56, { align: 'right' });
   doc.moveDown(3.2);
 
-  // Datos recibo
   doc.font('Helvetica').fontSize(10).fillColor('#111');
   const paidFmt = new Intl.DateTimeFormat('es-ES', { dateStyle: 'medium', timeStyle: 'short' }).format(paidAt);
   const invText = [`Nº Recibo: ${invoiceNumber || 's/n'}`, `Fecha de pago: ${paidFmt}`, `Estado: PAGADO`].join('\n');
-  doc.text(invText, 56, doc.y, { width: 200 });
+  doc.text(invText, 56, 56 + 70, { width: 200 });
 
-  // Bloque cliente (derecha)
+  // Cliente (derecha)
   const addr = customer?.address || {};
   const custLines = [
     customer?.name,
@@ -207,7 +247,7 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', custome
   doc.text(fmt(grand || total || 0, currency), 396, doc.y, { width: 140, align: 'right' });
   doc.moveDown(1.2);
 
-  // Nota (derecha)
+  // Nota
   doc.font('Helvetica').fontSize(9).fillColor('#6b7280').text(
     'Este documento sirve como justificación de pago. Para información fiscal consulte la factura de Stripe adjunta (si procede).',
     56, doc.y, { width: 480, align: 'right' }
@@ -217,7 +257,7 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', custome
   return await done;
 }
 
-// ===== Email helpers =====
+// ===== Email =====
 async function sendSMTP({ from, to, subject, html, attachments, bcc = [] }) {
   const transporter = nodemailer.createTransport({ host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, auth: { user: SMTP_USER, pass: SMTP_PASS } });
   await transporter.verify();
@@ -324,10 +364,7 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
   if (ATTACH_STRIPE_INVOICE && pdfUrl) {
     try {
       const r = await fetch(pdfUrl);
-      if (r.ok) {
-        const b = Buffer.from(await r.arrayBuffer());
-        attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf`, content: b, contentType: 'application/pdf' });
-      }
+      if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf`, content: b, contentType: 'application/pdf' }); }
     } catch { }
   }
   const subject = (isSubscription ? 'Confirmación suscripción' : 'Confirmación de pedido') + ' — ' + BRAND;
@@ -400,7 +437,7 @@ app.post('/webhook', async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Idempotencia ligera
+  // Idempotencia por evento
   const seen = async (id) => {
     if (!pool) return true;
     const q = `INSERT INTO processed_events(event_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING event_id`;
@@ -410,6 +447,12 @@ app.post('/webhook', async (req, res) => {
   catch (e) { console.error('[webhook] dedup error:', e?.message || e); }
 
   console.log('[webhook] EVENT', { id: event.id, type: event.type, livemode: event.livemode, created: event.created });
+
+  const markInvoiceMailedOnce = async (invoiceId) => {
+    if (!pool || !invoiceId) return true;
+    const r = await dbQuery(`INSERT INTO mailed_invoices(invoice_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING invoice_id`, [invoiceId]);
+    return r?.rowCount === 1; // true => primera vez; false => ya enviado
+  };
 
   const logOrder = async (o) => {
     if (!pool) return;
@@ -483,7 +526,7 @@ app.post('/webhook', async (req, res) => {
         const session = event.data.object;
         const isSub = session.mode === 'subscription' || !!session.subscription;
 
-        // Preferimos shipping; si no hay, usamos billing
+        // Persona/dirección prioritizando envío
         const person = preferShippingThenBilling(session);
 
         const currency = (session.currency || 'eur').toUpperCase();
@@ -496,7 +539,7 @@ app.post('/webhook', async (req, res) => {
           ? { name: session.shipping_details?.name || null, ...session.shipping_details.address }
           : null;
 
-        // Línea(s)
+        // Líneas
         let items = [];
         try {
           const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] });
@@ -509,16 +552,11 @@ app.post('/webhook', async (req, res) => {
           amountTotal, currency,
           items, metadata, shipping,
           status: session.payment_status || session.status || 'unknown',
-          customer_details: {
-            name: person.name,
-            email: person.email,
-            phone: person.phone,
-            address: person.address || null
-          },
+          customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
         });
         await logOrderItems(session.id, items, currency);
 
-        // Si es suscripción, actualizamos ficha
+        // Alta suscriptor (si aplica)
         if (isSub && session.subscription) {
           try {
             const sub = await stripe.subscriptions.retrieve(session.subscription);
@@ -539,77 +577,54 @@ app.post('/webhook', async (req, res) => {
           } catch (e) { console.error('[suscripción alta ERROR]', e); }
         }
 
-        // Email admin
+        // Admin siempre
         try {
           await sendAdminEmail({
-            session,
-            items,
-            customerEmail: email,
-            name,
-            phone,
-            amountTotal,
-            currency,
-            customer_details: {
-              name: person.name, email: person.email, phone: person.phone, address: person.address || null
-            },
+            session, items, customerEmail: email, name, phone,
+            amountTotal, currency,
+            customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
             shipping: session.shipping_details || {},
           });
         } catch (e) { console.error('Email admin ERROR:', e); }
 
-        // --------- CAMBIO CLAVE ----------
-        // ONE-OFF: enviar SIEMPRE al completar checkout (aunque COMBINE=true)
+        // Cliente:
         if (!isSub) {
+          // One-off: siempre aquí
           try {
             if (COMBINE_CONFIRMATION_AND_INVOICE) {
-              // Enviamos "combinado" pero con nuestro PDF (no hay invoice de Stripe en one-off)
               await sendCustomerCombined({
-                to: email,
-                name,
-                invoiceNumber: session.id,
-                total: amountTotal,
-                currency,
+                to: email, name,
+                invoiceNumber: session.id, total: amountTotal, currency,
                 items,
                 customer: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
-                pdfUrl: null, // no hay invoice de Stripe
+                pdfUrl: null,
                 isSubscription: false,
                 customerId: session.customer,
               });
             } else {
-              // Solo confirmación
               await sendCustomerConfirmationOnly({
-                to: email,
-                name,
-                amountTotal,
-                currency,
-                items,
-                orderId: session.id,
-                isSubscription: false,
-                customerId: session.customer,
+                to: email, name, amountTotal, currency, items, orderId: session.id,
+                isSubscription: false, customerId: session.customer,
                 customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
                 shipping: session.shipping_details || {},
               });
             }
           } catch (e) { console.error('Email cliente ONE-OFF ERROR:', e); }
         } else {
-          // Suscripción: si COMBINE=false, confirmamos ya; si true, esperamos a invoice.payment_succeeded
+          // Suscripción:
+          //   COMBINE=true => NO enviar aquí (solo en invoice.payment_succeeded)
+          //   COMBINE=false => enviar confirmación aquí
           if (!COMBINE_CONFIRMATION_AND_INVOICE) {
             try {
               await sendCustomerConfirmationOnly({
-                to: email,
-                name,
-                amountTotal,
-                currency,
-                items,
-                orderId: session.id,
-                isSubscription: true,
-                customerId: session.customer,
+                to: email, name, amountTotal, currency, items, orderId: session.id,
+                isSubscription: true, customerId: session.customer,
                 customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
                 shipping: session.shipping_details || {},
               });
             } catch (e) { console.error('Email cliente SUBS (confirmación) ERROR:', e); }
           }
         }
-        // ----------------------------------
 
         res.status(200).json({ received: true });
         return;
@@ -618,26 +633,32 @@ app.post('/webhook', async (req, res) => {
       case 'invoice.payment_succeeded': {
         const inv = event.data.object;
 
-        // Solo relevante para suscripciones o si quieres duplicar envío en one-off (ya no lo necesitamos)
-        let to = inv.customer_email || inv.customer_details?.email || null;
-        if (!to && inv.customer) { try { const cust = await stripe.customers.retrieve(inv.customer); to = cust?.email || to; } catch { } }
-        const name = inv.customer_name || inv.customer_details?.name || '';
+        // Idempotencia por factura: si ya enviamos, salimos
+        const firstTime = await markInvoiceMailedOnce(inv.id);
+        if (!firstTime) { return res.status(200).json({ received: true, mailed: 'skipped-duplicate' }); }
 
+        // Cliente/dirección robusto
+        const customerForPdf = extractInvoiceCustomer(inv);
+        let to = customerForPdf.email;
+        if (!to && inv.customer) {
+          try { const cust = await stripe.customers.retrieve(inv.customer); to = cust?.email || to; } catch {}
+        }
+        const name = customerForPdf.name || '';
+
+        // Adjuntar PDF de Stripe (opcional)
         let pdfUrl = inv.invoice_pdf;
         if (!pdfUrl) {
-          // Reintentos suaves para que Stripe genere invoice_pdf
           for (let i = 0; i < 3 && !pdfUrl; i++) {
             await new Promise(r => setTimeout(r, 3000));
             try { const inv2 = await stripe.invoices.retrieve(inv.id); pdfUrl = inv2.invoice_pdf || null; } catch { }
           }
         }
 
-        // Líneas de la factura
+        // Líneas
         let items = [];
         try { const li = await stripe.invoices.listLineItems(inv.id, { limit: 100, expand: ['data.price.product'] }); items = li?.data || []; }
         catch (e) { console.warn('[invoice listLineItems warn]', e?.message || e); }
 
-        // Si COMBINE=true: mandar combinado (confirmación + nuestro PDF + (opcional) invoice Stripe)
         if (COMBINE_CONFIRMATION_AND_INVOICE) {
           try {
             await sendCustomerCombined({
@@ -647,7 +668,7 @@ app.post('/webhook', async (req, res) => {
               total: (inv.amount_paid ?? inv.amount_due ?? 0) / 100,
               currency: (inv.currency || 'eur').toUpperCase(),
               items,
-              customer: inv.customer_details || {},
+              customer: customerForPdf,
               pdfUrl,
               isSubscription: !!inv.subscription || items.some(x => x?.price?.recurring),
               customerId: inv.customer,
@@ -661,10 +682,7 @@ app.post('/webhook', async (req, res) => {
 
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
-        try {
-          await markCanceled(sub.id);
-          // Aquí puedes enviar emails de cancelación si quieres
-        } catch (e) { console.error('[cancel ERROR]', e?.message || e); }
+        try { await markCanceled(sub.id); } catch (e) { console.error('[cancel ERROR]', e?.message || e); }
         res.status(200).json({ received: true });
         return;
       }
@@ -678,10 +696,10 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ===== JSON normal tras /webhook =====
+// ===== JSON normal después de /webhook =====
 app.use(express.json());
 
-// ===== Crear sesión de pago (no pedimos datos; Stripe los recopila) =====
+// ===== Checkout one-off =====
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { items = [], success_url, cancel_url, metadata = {} } = req.body || {};
@@ -717,7 +735,6 @@ app.post('/create-checkout-session', async (req, res) => {
       billing_address_collection: 'required',
       shipping_address_collection: { allowed_countries: ['ES', 'FR', 'DE', 'IT', 'PT', 'BE', 'NL', 'IE', 'GB'] },
       phone_number_collection: { enabled: true },
-      // ¡No pasamos customer ni customer_email!
       metadata: { source: 'guarros-front', ...metadata },
     });
 
@@ -728,7 +745,7 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// ===== Crear sesión de suscripción (Stripe recoge datos) =====
+// ===== Checkout suscripción =====
 app.options('/create-subscription-session', cors());
 app.post('/create-subscription-session', async (req, res) => {
   try {
@@ -781,7 +798,7 @@ app.get('/billing-portal/link', async (req, res) => {
   }
 });
 
-// Test email
+// ===== Test email =====
 app.get('/test-email', async (req, res) => {
   try {
     if (!CORPORATE_EMAIL) return res.status(400).json({ ok: false, error: 'CORPORATE_EMAIL no definido' });
