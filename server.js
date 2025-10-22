@@ -1,4 +1,4 @@
-// server.js — pedidos y suscripciones con emails (alta, cobro, cancelación, cambios) + control de duplicados created/updated
+// server.js — pedidos + suscripciones con emails, PDF y manejo de eventos (created/deleted/updated)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -12,6 +12,8 @@ const { Pool } = pg;
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+
+// ===== Stripe =====
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
 // ===== Marca / Config =====
@@ -39,6 +41,7 @@ const ATTACH_STRIPE_INVOICE = String(process.env.ATTACH_STRIPE_INVOICE || 'false
 const CUSTOMER_BCC_CORPORATE = String(process.env.CUSTOMER_BCC_CORPORATE || 'false') === 'true';
 
 // ===== Tabla de precios de suscripción (centimos) =====
+// (100…2000 g) — centralizado para el checkout de suscripciones
 const SUB_PRICE_TABLE = Object.freeze({
   100: 4600, 200: 5800, 300: 6900, 400: 8000, 500: 9100, 600: 10300,
   700: 11400, 800: 12500, 900: 13600, 1000: 14800, 1500: 20400, 2000: 26000,
@@ -56,7 +59,7 @@ async function dbQuery(text, params) {
   catch (e) { console.error('[DB ERROR]', e?.message || e); return { rows: [], rowCount: 0, error: e }; }
 }
 
-// Tablas auxiliares
+// Tablas auxiliares mínimas
 (async () => {
   if (!pool) return;
   await dbQuery(`CREATE TABLE IF NOT EXISTS processed_events(
@@ -67,22 +70,17 @@ async function dbQuery(text, params) {
     invoice_id text PRIMARY KEY,
     sent_at timestamptz DEFAULT now()
   )`);
-  // Flags para evitar doble email en alta (created + updated)
-  await dbQuery(`CREATE TABLE IF NOT EXISTS sub_event_flags(
-    subscription_id text PRIMARY KEY,
-    created_notified_at timestamptz,
-    last_updated_notified_at timestamptz
-  )`);
 })();
 
-const SUB_CREATED_SUPPRESS_WINDOW_MIN = Number(process.env.SUB_CREATED_SUPPRESS_WINDOW_MIN || 0.5);
-
 // ===== Utils =====
-const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+
 const fmt = (amount = 0, currency = 'EUR') => {
   try { return new Intl.NumberFormat('es-ES', { style: 'currency', currency }).format(Number(amount)); }
   catch { return `${Number(amount).toFixed(2)} ${currency}`; }
 };
+
 const toAbsoluteUrl = (u) => {
   if (!u) return null;
   try {
@@ -91,6 +89,7 @@ const toAbsoluteUrl = (u) => {
     return `${FRONT_BASE}${clean}`;
   } catch { return null; }
 };
+
 const preferShippingThenBilling = (session) => {
   const billing = session?.customer_details || {};
   const shipping = session?.shipping_details || {};
@@ -149,7 +148,7 @@ const extractInvoiceCustomer = (inv) => {
 function emailShell({ title, header, body, footer }) {
   return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
   <body style="margin:0;padding:0;background:#f3f4f6;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:24px 0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f6; padding:24px 0;">
     <tr><td>
       <table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)">
         <tr><td style="padding:24px;text-align:center;">
@@ -253,7 +252,7 @@ async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', custome
   doc.text(fmt(grand || total || 0, currency), 396, doc.y, { width: 140, align: 'right' });
   doc.moveDown(1.2);
 
-  // Nota (alineada a la derecha)
+  // Nota
   doc.font('Helvetica').fontSize(9).fillColor('#6b7280').text(
     'Este documento sirve como justificación de pago. Para información fiscal consulte la factura de Stripe adjunta (si procede).',
     56, doc.y, { width: 480, align: 'right' }
@@ -279,7 +278,6 @@ async function sendEmail({ to, subject, html, attachments, bcc = [] }) {
   console.warn('[email] No provider configured');
 }
 
-// Email admin (altas / pedidos)
 async function sendAdminEmail({ session, items = [], customerEmail, name, phone, amountTotal, currency, customer_details, shipping }) {
   if (!CORPORATE_EMAIL) return;
   const subject = (session?.mode === 'subscription' ? 'Suscripción' : 'Pedido') + ' - ' + (session?.id || '');
@@ -323,7 +321,6 @@ async function sendAdminEmail({ session, items = [], customerEmail, name, phone,
   await sendEmail({ to: CORPORATE_EMAIL, subject, html });
 }
 
-// Email cliente simple
 async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, items, orderId, isSubscription, customerId, customer_details, shipping }) {
   if (!to) return;
   const subject = (isSubscription ? 'Confirmación suscripción' : 'Confirmación de pedido') + (orderId ? ' #' + orderId : '') + ' — ' + BRAND;
@@ -365,7 +362,6 @@ ${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a h
   await sendEmail({ to, subject, html, bcc });
 }
 
-// Email combinado (PDF propio + opcional factura Stripe)
 async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, items, customer, pdfUrl, isSubscription, customerId }) {
   if (!to) return;
   const receiptBuf = await buildReceiptPDF({ invoiceNumber, total, currency, customer, items, paidAt: new Date() });
@@ -414,7 +410,7 @@ ${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a h
   await sendEmail({ to, subject, html, attachments });
 }
 
-// ===== Emails cancelación (solo en DELETED)
+// ===== Emails cancelación =====
 async function sendCancelEmails({ customerEmail, name, subId, customerAddress }) {
   const subject = `🛑 Suscripción cancelada — ${BRAND}`;
   const bodyCustomer = `
@@ -434,9 +430,7 @@ async function sendCancelEmails({ customerEmail, name, subId, customerAddress })
     footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">Si no reconoces esta acción, responde a este correo o escríbenos a ${escapeHtml(SUPPORT_EMAIL)}.</p>`
   });
 
-  if (customerEmail) {
-    await sendEmail({ to: customerEmail, subject, html: htmlCustomer });
-  }
+  if (customerEmail) await sendEmail({ to: customerEmail, subject, html: htmlCustomer });
 
   if (CORPORATE_EMAIL) {
     const bodyAdmin = `
@@ -463,118 +457,72 @@ async function sendCancelEmails({ customerEmail, name, subId, customerAddress })
   }
 }
 
-// ===== Emails actualización (updated != canceled)
-function summarizeSubscriptionChanges(prev = {}, sub = {}) {
-  const keys = Object.keys(prev || {});
-  if (!keys.length) return 'Se han actualizado los detalles de tu suscripción.';
+// ===== Emails actualización de cliente (customer.updated) =====
+function summarizeCustomerChanges(prev = {}, cust = {}) {
   const lines = [];
-
-  if ('items' in prev) {
-    try {
-      const oldPrice = prev.items?.data?.[0]?.price?.id || prev.items?.data?.[0]?.plan?.id;
-      const newPrice = sub.items?.data?.[0]?.price?.id || sub.items?.data?.[0]?.plan?.id;
-      if (oldPrice || newPrice) lines.push(`• Plan: ${escapeHtml(oldPrice || '-') } → ${escapeHtml(newPrice || '-')}`);
-    } catch {}
+  if ('name' in prev)        lines.push(`• Nombre: ${escapeHtml(prev.name ?? '-')} → ${escapeHtml(cust.name ?? '-')} `);
+  if ('email' in prev)       lines.push(`• Email: ${escapeHtml(prev.email ?? '-')} → ${escapeHtml(cust.email ?? '-')} `);
+  if ('phone' in prev)       lines.push(`• Teléfono: ${escapeHtml(prev.phone ?? '-')} → ${escapeHtml(cust.phone ?? '-')} `);
+  if ('address' in prev) {
+    const before = prev.address || {};
+    const after  = cust.address || {};
+    const addrStr = (a) => [a.line1, a.line2, [a.postal_code, a.city].filter(Boolean).join(' '), a.state, a.country].filter(Boolean).join(', ');
+    lines.push(`• Dirección: ${escapeHtml(addrStr(before) || '-')} → ${escapeHtml(addrStr(after) || '-')}`);
   }
-  if ('default_payment_method' in prev) lines.push('• Método de pago actualizado.');
-  if ('metadata' in prev) lines.push('• Metadatos actualizados.');
-  if ('pause_collection' in prev) lines.push('• Pausa de cobros actualizada.');
-  if ('cancel_at' in prev || 'cancel_at_period_end' in prev) lines.push('• Programación de cancelación modificada.');
-  if ('trial_end' in prev) lines.push('• Fin de prueba actualizado.');
-  if ('status' in prev && sub.status !== 'canceled') lines.push(`• Estado: ${escapeHtml(prev.status)} → ${escapeHtml(sub.status)}`);
-
-  if (!lines.length) return 'Se han actualizado los detalles de tu suscripción.';
+  if (prev?.invoice_settings?.default_payment_method !== undefined) {
+    lines.push('• Método de pago por defecto actualizado.');
+  }
+  if (!lines.length) return 'Se han actualizado tus datos de cliente.';
   return lines.join('<br/>');
 }
 
-async function sendSubscriptionUpdatedEmails({ customerEmail, name, subId, customerAddress, summaryHtml }) {
-  const header = 'Suscripción actualizada';
-  const subject = `🔄 Suscripción actualizada — ${BRAND}`;
+async function sendCustomerUpdatedEmails({ cust, summaryHtml }) {
+  const name = cust?.name || '';
+  const email = cust?.email || '';
+  const address = cust?.address || null;
 
-  const bodyCommon = `
-<p style="margin:0 0 10px; font:14px system-ui; color:#374151;">${summaryHtml}</p>
-<p style="margin:0 0 10px; font:13px system-ui; color:#6b7280;">ID suscripción: <b>${escapeHtml(subId || '-')}</b></p>`.trim();
-
-  const bodyCustomer = `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
-  ${bodyCommon}
-  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tus datos</p>
-  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ address: customerAddress, name, email: customerEmail })}</div>
-</td></tr>`.trim();
-
-  const htmlCustomer = emailShell({
-    title: header,
-    header,
-    body: bodyCustomer,
-    footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">Si no reconoces esta acción, responde a este correo o escríbenos a ${escapeHtml(SUPPORT_EMAIL)}.</p>`
-  });
-
-  if (customerEmail) {
-    await sendEmail({ to: customerEmail, subject, html: htmlCustomer });
-  }
-
-  if (CORPORATE_EMAIL) {
-    const htmlAdmin = emailShell({
-      title: header,
-      header,
+  // Cliente
+  if (email) {
+    const htmlCustomer = emailShell({
+      title: 'Datos de cliente actualizados',
+      header: 'Datos de cliente actualizados',
       body: `
 <tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">Un cliente ha actualizado su suscripción.</p>
-  ${bodyCommon}
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
+  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">${summaryHtml}</p>
   <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
-  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ address: customerAddress, name, email: customerEmail })}</div>
+  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tus datos actuales</p>
+  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ name, email, address })}</div>
+</td></tr>`,
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">Si no reconoces esta acción, responde a este correo o escríbenos a ${escapeHtml(SUPPORT_EMAIL)}.</p>`
+    });
+    await sendEmail({ to: email, subject: `✅ Datos actualizados — ${BRAND}`, html: htmlCustomer });
+  }
+
+  // Admin
+  if (CORPORATE_EMAIL) {
+    const htmlAdmin = emailShell({
+      title: 'Cliente actualizado',
+      header: 'Cliente actualizado',
+      body: `
+<tr><td style="padding:0 24px 12px;">
+  <p style="margin:0 0 8px; font:15px system-ui; color:#111;">Un cliente ha actualizado sus datos.</p>
+  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
+    <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
+    <li><b>Email:</b> ${escapeHtml(email || '-')}</li>
+    <li><b>ID cliente:</b> ${escapeHtml(cust?.id || '-')}</li>
+  </ul>
+  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
+  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Resumen de cambios</p>
+  <div style="font:13px system-ui; color:#374151">${summaryHtml}</div>
+  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
+  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Datos actuales</p>
+  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ name, email, address })}</div>
 </td></tr>`,
       footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
     });
-    await sendEmail({ to: CORPORATE_EMAIL, subject: `Actualización de suscripción — ${BRAND}`, html: htmlAdmin });
+    await sendEmail({ to: CORPORATE_EMAIL, subject: `Cliente actualizado — ${BRAND}`, html: htmlAdmin });
   }
-}
-
-async function fetchCustomerBasics(customerId) {
-  if (!customerId) return { email: null, name: null, address: null };
-  try {
-    const cust = await stripe.customers.retrieve(customerId);
-    return {
-      email: cust?.email || null,
-      name: cust?.name || null,
-      address: cust?.address || null,
-    };
-  } catch {
-    return { email: null, name: null, address: null };
-  }
-}
-
-// ===== Flags de notificación de suscripciones =====
-async function markSubCreatedNotified(subId) {
-  if (!pool || !subId) return;
-  await dbQuery(
-    `INSERT INTO sub_event_flags(subscription_id, created_notified_at)
-     VALUES ($1, NOW())
-     ON CONFLICT (subscription_id) DO UPDATE SET created_notified_at = NOW()`,
-    [subId]
-  );
-}
-async function wasCreatedNotifiedRecently(subId, minutes = SUB_CREATED_SUPPRESS_WINDOW_MIN) {
-  if (!pool || !subId) return false;
-  const { rows } = await dbQuery(
-    `SELECT created_notified_at FROM sub_event_flags WHERE subscription_id=$1`,
-    [subId]
-  );
-  if (!rows?.length || !rows[0].created_notified_at) return false;
-  const ts = new Date(rows[0].created_notified_at).getTime();
-  return (Date.now() - ts) <= minutes * 60 * 1000;
-}
-async function markSubUpdatedNotified(subId) {
-  if (!pool || !subId) return;
-  await dbQuery(
-    `INSERT INTO sub_event_flags(subscription_id, last_updated_notified_at)
-     VALUES ($1, NOW())
-     ON CONFLICT (subscription_id) DO UPDATE SET last_updated_notified_at = NOW()`,
-    [subId]
-  );
 }
 
 // ===== CORS / logging =====
@@ -608,10 +556,12 @@ app.post('/webhook', async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // dedupe
   const seen = async (id) => {
     if (!pool) return true;
-    const q = `INSERT INTO processed_events(event_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING event_id`;
-    const r = await dbQuery(q, [id]); if (r?.error) return true; return r.rowCount === 1;
+    const r = await dbQuery(`INSERT INTO processed_events(event_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING event_id`, [id]);
+    if (r?.error) return true;
+    return r.rowCount === 1;
   };
   try { const fresh = await seen(event.id); if (!fresh) return res.status(200).json({ ok: true, dedup: true }); }
   catch (e) { console.error('[webhook] dedup error:', e?.message || e); }
@@ -791,13 +741,12 @@ app.post('/webhook', async (req, res) => {
       }
 
       case 'customer.subscription.created': {
-        // ➜ Alta: enviar correos (cliente + admin) y marcar flag para suprimir el "updated" inicial
         const sub = event.data.object;
         try {
-          const basics = await fetchCustomerBasics(sub.customer);
-          const name = basics.name;
-          const email = basics.email;
-          const address = basics.address;
+          const cust = await stripe.customers.retrieve(sub.customer);
+          const name = cust?.name || null;
+          const email = cust?.email || null;
+          const address = cust?.address || null;
 
           // Admin
           if (CORPORATE_EMAIL) {
@@ -813,14 +762,14 @@ app.post('/webhook', async (req, res) => {
                 </ul>
                 <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
                 <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
-                <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ address, name, email })}</div>
+                <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ name, email, address })}</div>
               </td></tr>`,
               footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
             });
             await sendEmail({ to: CORPORATE_EMAIL, subject: `Alta suscripción — ${BRAND}`, html });
           }
 
-          // Cliente (confirmación simple; el PDF combinado seguirá saliendo en invoice.payment_succeeded si está activado)
+          // Cliente
           if (email) {
             await sendCustomerConfirmationOnly({
               to: email,
@@ -836,7 +785,23 @@ app.post('/webhook', async (req, res) => {
             });
           }
 
-          await markSubCreatedNotified(sub.id);
+          // upsert suscriptor
+          try {
+            await upsertSubscriber({
+              customer_id: sub.customer,
+              subscription_id: sub.id,
+              email,
+              name,
+              plan: sub.items?.data?.[0]?.price?.id || (sub.metadata?.subscription_grams ? `g${sub.metadata.subscription_grams}` : null),
+              status: sub.status,
+              meta: { ...sub.metadata },
+              address: address?.line1 || null,
+              city: address?.city || null,
+              postal: address?.postal_code || null,
+              country: address?.country || null,
+            });
+          } catch (e) { console.error('[suscripción upsert ERROR]', e?.message || e); }
+
         } catch (e) { console.error('[created email ERROR]', e?.message || e); }
 
         res.status(200).json({ received: true });
@@ -844,55 +809,37 @@ app.post('/webhook', async (req, res) => {
       }
 
       case 'customer.subscription.updated': {
-        const sub = event.data.object;
-        const prev = event.data.previous_attributes || {};
-
-        // Si está cancelada, se gestiona en DELETED
-        if (sub?.status === 'canceled' || prev?.status === 'canceled') {
-          res.status(200).json({ received: true, skipped: 'canceled-handled-in-deleted' });
-          return;
-        }
-
-        // Suprimir el updated inmediatamente posterior al created
-        try {
-          const suppress = await wasCreatedNotifiedRecently(sub.id);
-          if (suppress) {
-            return res.status(200).json({ received: true, skipped: 'suppressed-updated-after-created' });
-          }
-        } catch {}
-
-        // Cambios reales: enviar emails de actualización
-        try {
-          const basics = await fetchCustomerBasics(sub.customer);
-          const summaryHtml = summarizeSubscriptionChanges(prev, sub);
-          await sendSubscriptionUpdatedEmails({
-            customerEmail: basics.email,
-            name: basics.name,
-            subId: sub.id,
-            customerAddress: basics.address,
-            summaryHtml,
-          });
-          await markSubUpdatedNotified(sub.id);
-        } catch (e) { console.error('[updated email ERROR]', e?.message || e); }
-
-        res.status(200).json({ received: true });
-        return;
+        // Ya no enviamos nada aquí (los cambios de datos del cliente los cubrimos en 'customer.updated')
+        // Podrías registrar algo si quieres.
+        return res.status(200).json({ received: true, note: 'subscription.updated ignored (handled by customer.updated for data changes)' });
       }
 
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
-        try { await markCanceled(sub.id); } catch (e) { console.error('[cancel ERROR]', e?.message || e); }
+        try { await markCanceled(sub.id); } catch (e) { console.error('[cancel mark ERROR]', e?.message || e); }
         try {
-          const basics = await fetchCustomerBasics(sub.customer);
+          const cust = await stripe.customers.retrieve(sub.customer);
           await sendCancelEmails({
-            customerEmail: basics.email,
-            name: basics.name,
+            customerEmail: cust?.email || null,
+            name: cust?.name || null,
             subId: sub.id,
-            customerAddress: basics.address,
+            customerAddress: cust?.address || null,
           });
         } catch (e) { console.error('[cancel email ERROR]', e?.message || e); }
         res.status(200).json({ received: true });
         return;
+      }
+
+      case 'customer.updated': {
+        const cust = event.data.object;
+        const prev = event.data.previous_attributes || {};
+        try {
+          const summaryHtml = summarizeCustomerChanges(prev, cust);
+          await sendCustomerUpdatedEmails({ cust, summaryHtml });
+        } catch (e) {
+          console.error('[customer.updated email ERROR]', e?.message || e);
+        }
+        return res.status(200).json({ received: true });
       }
 
       case 'invoice.payment_succeeded': {
