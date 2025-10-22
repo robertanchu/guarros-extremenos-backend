@@ -157,7 +157,7 @@ ${body}
 </table>
 </body></html>`;
 
-// ----- PDF Recibo (igual que antes, omitido por brevedad si no lo necesitas cambiar) -----
+// ----- PDF Recibo -----
 async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', lineItems = [], customer = {}, paidAt = new Date() }) {
   const doc = new PDFDocument({ size: 'A4', margins: { top: 56, bottom: 56, left: 56, right: 56 } });
   const bufs = [];
@@ -852,19 +852,30 @@ app.use(express.json());
 async function ensureCustomer(c) {
   if (!c?.email) return null;
   const found = await stripe.customers.list({ email: c.email, limit: 1 });
-  if (found.data[0]) return found.data[0].id;
+
+  const addr = (c.address || c.city || c.postal || c.country || c.province || c.state)
+    ? {
+        line1: c.address || '',
+        city: c.city || '',
+        postal_code: c.postal || '',
+        country: c.country || 'ES',
+        state: c.province || c.state || '',
+      }
+    : undefined;
+
+  if (found.data[0]) {
+    await stripe.customers.update(found.data[0].id, {
+      name: c.name || undefined,
+      phone: c.phone || undefined,
+      address: addr,
+    });
+    return found.data[0].id;
+  }
   const created = await stripe.customers.create({
     email: c.email,
     name: c.name || undefined,
     phone: c.phone || undefined,
-    address: (c.address || c.city || c.postal || c.country)
-      ? {
-          line1: c.address || '',
-          city: c.city || '',
-          postal_code: c.postal || '',
-          country: c.country || 'ES',
-        }
-      : undefined,
+    address: addr,
   });
   return created.id;
 }
@@ -878,8 +889,7 @@ app.post('/create-checkout-session', async (req, res) => {
     // 1) Reusar/crear customer si tenemos email
     const customerId = await ensureCustomer(customer);
 
-    // 2) Construir line_items usando price_data (para que se vea el nombre exacto que pasas)
-    //    Reutilizamos el unit_amount/currency del priceId de Stripe para coherencia.
+    // 2) Construir line_items con price_data para mostrar nombre exacto
     const line_items = [];
     for (const it of items) {
       const priceId = it.price || it.priceId;
@@ -908,8 +918,7 @@ app.post('/create-checkout-session', async (req, res) => {
       billing_address_collection: 'required',
       shipping_address_collection: { allowed_countries: ['ES', 'FR', 'DE', 'IT', 'PT', 'BE', 'NL', 'IE', 'GB'] },
       phone_number_collection: { enabled: true },
-      ...(customerId ? { customer: customerId } : {}),
-      // IMPORTANTE: si usamos customer, NO enviar customer_email
+      ...(customerId ? { customer: customerId, customer_update: { address: 'auto', name: 'auto' } } : {}),
       metadata: {
         source: 'guarros-front',
         ...metadata,
@@ -919,6 +928,7 @@ app.post('/create-checkout-session', async (req, res) => {
         form_city: customer.city || '',
         form_postal: customer.postal || '',
         form_country: customer.country || 'ES',
+        form_province: customer.province || customer.state || '',
       },
     });
 
@@ -929,7 +939,7 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// ----- Suscripcion (gramos fijos, evitar customer + customer_email) -----
+// ----- Suscripcion (gramos fijos) -----
 app.options('/create-subscription-session', cors());
 app.post('/create-subscription-session', async (req, res) => {
   try {
@@ -945,8 +955,7 @@ app.post('/create-subscription-session', async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      ...(customerId ? { customer: customerId } : {}),
-      // si hay customer, NO pasar customer_email
+      ...(customerId ? { customer: customerId, customer_update: { address: 'auto', name: 'auto' } } : {}),
       line_items: [
         {
           quantity: 1,
@@ -978,6 +987,7 @@ app.post('/create-subscription-session', async (req, res) => {
         form_city: customer?.city || '',
         form_postal: customer?.postal || '',
         form_country: customer?.country || 'ES',
+        form_province: customer?.province || customer?.state || '',
       },
     });
 
