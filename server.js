@@ -20,7 +20,7 @@ const BRAND = process.env.BRAND_NAME || 'Guarros Extremeños';
 const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#D62828';
 const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || 'https://guarros-extremenos-api.onrender.com';
-const FRONT_BASE = process.env.FRONT_BASE || 'https://guarrosextremenos.com';
+const FRONT_BASE = (process.env.FRONT_BASE || 'https://guarrosextremenos.com').replace(/\/+$/,'');
 const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || `${FRONT_BASE}/account`;
 const BILLING_PORTAL_CONFIG = process.env.STRIPE_BILLING_PORTAL_CONFIG || null;
 
@@ -61,7 +61,7 @@ async function dbQuery(text, params) {
 const escapeHtml = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
 const fmt = (amount=0,currency='EUR') => { try { return new Intl.NumberFormat('es-ES',{style:'currency',currency}).format(Number(amount)); } catch { return `${Number(amount).toFixed(2)} ${currency}`; } };
 
-// Provincias normalizadas → state (libre, pero dejamos las canónicas)
+// Provincias canónicas ES
 const ES_PROVINCES = new Set([
   "Álava","Albacete","Alicante","Almería","Asturias","Ávila","Badajoz","Baleares","Barcelona","Burgos","Cáceres","Cádiz","Cantabria","Castellón","Ciudad Real","Córdoba","Cuenca","Girona","Granada","Guadalajara","Gipuzkoa","Huelva","Huesca","Jaén","La Rioja","Las Palmas","León","Lleida","Lugo","Madrid","Málaga","Murcia","Navarra","Ourense","Palencia","Pontevedra","Salamanca","Santa Cruz de Tenerife","Segovia","Sevilla","Soria","Tarragona","Teruel","Toledo","Valencia","Valladolid","Bizkaia","Zamora","Zaragoza","Ceuta","Melilla"
 ]);
@@ -69,13 +69,22 @@ const normalizeProvince = (p) => {
   if (!p) return '';
   const cand = String(p).trim();
   if (ES_PROVINCES.has(cand)) return cand;
-  // intentos de normalización simple
   const plain = cand.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   for (const prov of ES_PROVINCES) {
     const pv = prov.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
     if (pv.toLowerCase() === plain.toLowerCase()) return prov;
   }
-  return cand; // caer a libre
+  return cand;
+};
+
+// Asegurar URL absoluta para imágenes de Stripe
+const toAbsoluteUrl = (u) => {
+  if (!u) return null;
+  try {
+    if (/^https?:\/\//i.test(u)) return u;
+    const clean = String(u).startsWith('/') ? u : `/${u}`;
+    return `${FRONT_BASE}${clean}`;
+  } catch { return null; }
 };
 
 // ---- Email layout
@@ -95,19 +104,20 @@ ${body}
 </table>
 </body></html>`;
 
-// ---- PDF recibo (simplificado)
+// ---- PDF recibo (muy simplificado aquí; mantén tu versión completa si ya la tenías)
 async function buildReceiptPDF({ invoiceNumber, total, currency='EUR', customer={}, paidAt=new Date() }) {
   const doc = new PDFDocument({ size:'A4', margins:{ top:56,bottom:56,left:56,right:56 }});
   const bufs=[]; const done=new Promise((res,rej)=>{doc.on('data',b=>bufs.push(b));doc.on('end',()=>res(Buffer.concat(bufs)));doc.on('error',rej);});
   try {
     if (BRAND_LOGO_URL) {
-      const r = await fetch(BRAND_LOGO_URL); if (r.ok) { const buf = Buffer.from(await r.arrayBuffer()); doc.image(buf,{ fit:[140,60], align:'left' }); }
+      const r = await fetch(BRAND_LOGO_URL);
+      if (r.ok) { const buf = Buffer.from(await r.arrayBuffer()); doc.image(buf,{ fit:[140,60], align:'left' }); }
       else { doc.font('Helvetica-Bold').fontSize(20).text(BRAND,{align:'left'}); }
     } else { doc.font('Helvetica-Bold').fontSize(20).text(BRAND,{align:'left'}); }
   } catch { doc.font('Helvetica-Bold').fontSize(20).text(BRAND,{align:'left'}); }
 
   doc.moveDown(0.5);
-  doc.font('Helvetica-Bold').fontSize(18).fillColor('#D62828').text('RECIBO DE PAGO', { align:'right' });
+  doc.font('Helvetica-Bold').fontSize(18).fillColor(BRAND_PRIMARY).text('RECIBO DE PAGO', { align:'right' });
 
   doc.moveDown(0.5);
   doc.font('Helvetica').fontSize(10).fillColor('#111');
@@ -116,19 +126,20 @@ async function buildReceiptPDF({ invoiceNumber, total, currency='EUR', customer=
   const paidFmt = new Intl.DateTimeFormat('es-ES',{dateStyle:'medium', timeStyle:'short'}).format(paidAt);
   const invText = [`Nº Recibo: ${invoiceNumber || 's/n'}`, `Fecha de pago: ${paidFmt}`, `Estado: PAGADO`].join('\n');
   doc.text(invText, leftX, topY, { width: 260 });
+
   doc.end();
   return await done;
 }
 
-// ---- Email senders
+// ---- Email helpers
 async function sendSMTP({ from, to, subject, html, attachments, bcc=[] }) {
   const transporter = nodemailer.createTransport({ host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, auth: { user: SMTP_USER, pass: SMTP_PASS } });
   await transporter.verify();
   return transporter.sendMail({ from, to, subject, html, attachments, ...(bcc.length?{bcc}: {}) });
 }
 async function sendEmail({ to, subject, html, attachments, bcc=[] }) {
-  if (process.env.RESEND_API_KEY) {
-    const resend = new Resend(process.env.RESEND_API_KEY);
+  if (RESEND_API_KEY) {
+    const resend = new Resend(RESEND_API_KEY);
     await resend.emails.send({ from: CUSTOMER_FROM, to, subject, html, attachments, ...(bcc.length?{bcc}: {}) });
     return;
   }
@@ -151,15 +162,15 @@ const lineItemsHTML = (items=[], currency='EUR') =>
 
 async function sendAdminEmail({ session, items=[], customerEmail, name, phone, amountTotal, currency }) {
   if (!CORPORATE_EMAIL) return;
-  const subject = (session?.mode === 'subscription' ? 'Suscripcion' : 'Pedido') + ' - ' + (session?.id || '');
+  const subject = (session?.mode === 'subscription' ? 'Suscripción' : 'Pedido') + ' - ' + (session?.id || '');
   const body = `
 <tr><td style="padding:0 24px 8px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111">Nuevo ${session?.mode === 'subscription' ? 'ALTA DE SUSCRIPCION' : 'PEDIDO'}</p>
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111">Nuevo ${session?.mode === 'subscription' ? 'ALTA DE SUSCRIPCIÓN' : 'PEDIDO'}</p>
   <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
     <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
     <li><b>Email:</b> ${escapeHtml(customerEmail || '-')}</li>
-    <li><b>Telefono:</b> ${escapeHtml(phone || '-')}</li>
-    <li><b>Sesion:</b> ${escapeHtml(session?.id || '-')}</li>
+    <li><b>Teléfono:</b> ${escapeHtml(phone || '-')}</li>
+    <li><b>Sesión:</b> ${escapeHtml(session?.id || '-')}</li>
     <li><b>Modo:</b> ${escapeHtml(session?.mode || '-')}</li>
   </ul>
 </td></tr>
@@ -190,8 +201,8 @@ async function sendAdminEmail({ session, items=[], customerEmail, name, phone, a
 
 async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, items, orderId, isSubscription, customerId }) {
   if (!to) return;
-  const subject = (isSubscription ? 'Suscripcion activada' : 'Confirmacion de pedido') + (orderId ? ' #'+orderId : '') + ' - ' + BRAND;
-  const intro = isSubscription ? `Gracias por suscribirte a ${BRAND}. Tu suscripcion ha quedado activada correctamente.` : `Gracias por tu compra en ${BRAND}. Tu pago se ha recibido correctamente.`;
+  const subject = (isSubscription ? 'Suscripción activada' : 'Confirmación de pedido') + (orderId ? ' #'+orderId : '') + ' — ' + BRAND;
+  const intro = isSubscription ? `Gracias por suscribirte a ${BRAND}. Tu suscripción ha quedado activada correctamente.` : `Gracias por tu compra en ${BRAND}. Tu pago se ha recibido correctamente.`;
   const body = `
 <tr><td style="padding:0 24px 8px;">
   <p style="margin:0 0 12px; font:15px system-ui; color:#111;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
@@ -218,8 +229,8 @@ async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, i
     </tfoot>
   </table>
 </td></tr>
-${isSubscription ? `<tr><td style="padding:0 24px 8px; text-align:center;"><a href="${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId||'')}&return=${encodeURIComponent(PORTAL_RETURN_URL)}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripcion</a></td></tr>` : ''}`;
-  const html = emailShell({ title: isSubscription?'Suscripcion activada':'Confirmacion de pedido', header: isSubscription?'Suscripcion activada':'Confirmacion de pedido', body, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>` });
+${isSubscription ? `<tr><td style="padding:0 24px 8px; text-align:center;"><a href="${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId||'')}&return=${encodeURIComponent(PORTAL_RETURN_URL)}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripción</a></td></tr>` : ''}`;
+  const html = emailShell({ title: isSubscription?'Suscripción activada':'Confirmación de pedido', header: isSubscription?'Suscripción activada':'Confirmación de pedido', body, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>` });
   const bcc = CUSTOMER_BCC_CORPORATE && CORPORATE_EMAIL ? [CORPORATE_EMAIL] : [];
   await sendEmail({ to, subject, html, bcc });
 }
@@ -231,8 +242,8 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
   if (ATTACH_STRIPE_INVOICE && pdfUrl) {
     try { const r = await fetch(pdfUrl); if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); attachments.push({ filename:`stripe-invoice-${invoiceNumber||'pago'}.pdf`, content:b, contentType:'application/pdf' }); } } catch {}
   }
-  const subject = (isSubscription ? 'Suscripcion activada' : 'Confirmacion de pedido') + ' - ' + BRAND;
-  const intro = isSubscription ? `Gracias por suscribirte a ${BRAND}. Tu suscripcion ha quedado activada correctamente.` : `Gracias por tu compra en ${BRAND}. Tu pago se ha recibido correctamente.`;
+  const subject = (isSubscription ? 'Suscripción activada' : 'Confirmación de pedido') + ' — ' + BRAND;
+  const intro = isSubscription ? `Gracias por suscribirte a ${BRAND}. Tu suscripción ha quedado activada correctamente.` : `Gracias por tu compra en ${BRAND}. Tu pago se ha recibido correctamente.`;
   const body = `
 <tr><td style="padding:0 24px 8px;">
   <p style="margin:0 0 12px; font:15px system-ui; color:#111;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
@@ -259,14 +270,14 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
     </tfoot>
   </table>
 </td></tr>
-${isSubscription ? `<tr><td style="padding:0 24px 8px; text-align:center;"><a href="${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId||'')}&return=${encodeURIComponent(PORTAL_RETURN_URL)}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripcion</a></td></tr>` : ''}`;
-  const html = emailShell({ title: isSubscription?'Suscripcion activada':'Confirmacion de pedido', header: isSubscription?'Suscripcion activada':'Confirmacion de pedido', body, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>` });
+${isSubscription ? `<tr><td style="padding:0 24px 8px; text-align:center;"><a href="${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId||'')}&return=${encodeURIComponent(PORTAL_RETURN_URL)}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripción</a></td></tr>` : ''}`;
+  const html = emailShell({ title: isSubscription?'Suscripción activada':'Confirmación de pedido', header: isSubscription?'Suscripción activada':'Confirmación de pedido', body, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>` });
   await sendEmail({ to, subject, html, attachments });
 }
 
 // ---- CORS / logging
 const allowOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
-const allowDomains = (process.env.ALLOWED_DOMAINS || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+const allowDomains = (process.env.ALLOWED_DOMAINS || 'guarrosextremenos.com,vercel.app').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
 const originOk = (origin) => {
   if (!origin) return true;
   if (allowOrigins.includes(origin)) return true;
@@ -423,7 +434,7 @@ app.post('/webhook', async (req, res) => {
               postal: cust?.address?.postal_code || null,
               country: cust?.address?.country || null,
             });
-          } catch (e) { console.error('[suscripcion alta ERROR]', e); }
+          } catch (e) { console.error('[suscripción alta ERROR]', e); }
         }
 
         try {
@@ -433,7 +444,7 @@ app.post('/webhook', async (req, res) => {
         if (!isSub) {
           if (COMBINE_CONFIRMATION_AND_INVOICE) {
             try { await sendCustomerCombined({ to: email, name, invoiceNumber: session.id, total: amountTotal, currency, items, customer: session.customer_details || {}, pdfUrl: null, isSubscription: false, customerId: session.customer }); }
-            catch (e) { console.error('Combinado (pago unico) ERROR:', e); }
+            catch (e) { console.error('Combinado (pago único) ERROR:', e); }
           } else {
             try { await sendCustomerConfirmationOnly({ to: email, name, amountTotal, currency, items, orderId: session.id, isSubscription: false, customerId: session.customer }); }
             catch (e) { console.error('Email cliente ERROR:', e); }
@@ -441,7 +452,7 @@ app.post('/webhook', async (req, res) => {
         } else {
           if (!COMBINE_CONFIRMATION_AND_INVOICE) {
             try { await sendCustomerConfirmationOnly({ to: email, name, amountTotal, currency, items, orderId: session.id, isSubscription: true, customerId: session.customer }); }
-            catch (e) { console.error('Email cliente (suscripcion) ERROR:', e); }
+            catch (e) { console.error('Email cliente (suscripción) ERROR:', e); }
           }
         }
 
@@ -507,20 +518,19 @@ app.post('/webhook', async (req, res) => {
 // JSON normal tras /webhook
 app.use(express.json());
 
-// ---- ensureCustomer (usa province → state)
+// ---- ensureCustomer: **siempre** establece address con province→state
 async function ensureCustomer(c) {
   if (!c?.email) return null;
-  const found = await stripe.customers.list({ email: c.email, limit: 1 });
 
-  const addrNeeded = (c.address || c.city || c.postal || c.country || c.province);
-  const address = addrNeeded ? {
+  const address = {
     line1: c.address || '',
     city: c.city || '',
     postal_code: c.postal || '',
     country: c.country || 'ES',
     state: normalizeProvince(c.province || c.state || ''),
-  } : undefined;
+  };
 
+  const found = await stripe.customers.list({ email: c.email, limit: 1 });
   if (found.data[0]) {
     await stripe.customers.update(found.data[0].id, {
       name: c.name || undefined,
@@ -542,29 +552,34 @@ async function ensureCustomer(c) {
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { items = [], success_url, cancel_url, customer = {}, metadata = {} } = req.body || {};
-    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items vacios' });
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items vacíos' });
 
     const customerId = await ensureCustomer(customer);
 
-    // Construir line_items con product_data.name para mostrar el nombre exacto
+    // Construir line_items con product_data y URL absolutas de imagen
     const line_items = [];
     for (const it of items) {
       const priceId = it.price || it.priceId;
       if (!priceId) continue;
+
       const price = await stripe.prices.retrieve(String(priceId), { expand: ['product'] });
+
+      const imgAbs = toAbsoluteUrl(it.image);
+      const product_data = { name: String(it.title || it.name || price.product?.name || 'Producto') };
+      if (imgAbs) {
+        try { new URL(imgAbs); product_data.images = [imgAbs]; } catch {/* si inválida, omitimos */}
+      }
+
       line_items.push({
         quantity: it.quantity || 1,
         price_data: {
           currency: (price.currency || 'eur').toLowerCase(),
           unit_amount: price.unit_amount,
-          product_data: {
-            name: String(it.title || it.name || price.product?.name || 'Producto'),
-            ...(it.image ? { images: [it.image] } : {}),
-          },
+          product_data,
         },
       });
     }
-    if (!line_items.length) return res.status(400).json({ error: 'Sin price validos' });
+    if (!line_items.length) return res.status(400).json({ error: 'Sin price válidos' });
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -602,7 +617,7 @@ app.post('/create-subscription-session', async (req, res) => {
   try {
     const { grams, currency='eur', customer, metadata={}, success_url, cancel_url } = req.body || {};
     const g = Number(grams);
-    if (!g || !ALLOWED_SUB_GRAMS.includes(g)) return res.status(400).json({ error: 'Cantidad invalida. Debe ser una de: '+ALLOWED_SUB_GRAMS.join(', ') });
+    if (!g || !ALLOWED_SUB_GRAMS.includes(g)) return res.status(400).json({ error: 'Cantidad inválida. Debe ser una de: '+ALLOWED_SUB_GRAMS.join(', ') });
     const amount = SUB_PRICE_TABLE[g];
 
     const customerId = await ensureCustomer(customer);
@@ -617,7 +632,7 @@ app.post('/create-subscription-session', async (req, res) => {
           unit_amount: amount,
           recurring: { interval: 'month' },
           product_data: {
-            name: `Suscripcion Jamon Canalla — ${g} g/mes`,
+            name: `Suscripción Jamón Canalla — ${g} g/mes`,
             metadata: { grams: String(g), display_price: (amount/100).toFixed(2) + ' EUR' },
           },
         },
@@ -662,8 +677,7 @@ app.get('/billing-portal/link', async (req, res) => {
   }
 });
 
-// Tests
-app.get('/health', (req,res)=>res.json({ok:true}));
+// Test email
 app.get('/test-email', async (req, res) => {
   try {
     if (!CORPORATE_EMAIL) return res.status(400).json({ ok:false, error:'CORPORATE_EMAIL no definido' });
