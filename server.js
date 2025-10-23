@@ -898,6 +898,51 @@ app.post('/webhook', async (req, res) => {
 // ===== JSON normal después de /webhook =====
 app.use(express.json());
 
+// ===============================================
+// ===== AÑADIR ESTE BLOQUE DE CÓDIGO AQUÍ =====
+// ===============================================
+app.post('/prices/resolve', async (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || !ids.length) {
+    return res.status(400).json({ error: 'Se requiere un array de ids.' });
+  }
+
+  try {
+    // Usamos Promise.allSettled para que si un ID de precio falla, los demás continúen
+    const results = await Promise.allSettled(
+      ids.map(id => stripe.prices.retrieve(String(id), { expand: ['product'] }))
+    );
+
+    const pricesMap = {};
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        const price = result.value;
+        // Este formato (product_name) coincide con lo que tu frontend espera
+        pricesMap[price.id] = {
+          id: price.id,
+          unit_amount: price.unit_amount,
+          currency: price.currency,
+          product_name: price.product?.name || null, 
+        };
+      } else {
+        // Si un precio falla (ej. ID incorrecto), simplemente no lo devolvemos
+        console.warn(`[prices/resolve] No se pudo encontrar el price: ${ids[index]}`, result.reason?.message);
+      }
+    });
+
+    // Devolvemos el objeto { prices: { price_id_1: {...}, price_id_2: {...} } }
+    // que es exactamente lo que la función `upsertMany` del frontend espera
+    res.json({ prices: pricesMap });
+
+  } catch (e) {
+    console.error('[prices/resolve] Error fatal:', e);
+    res.status(500).json({ error: e.message || 'Error resolviendo precios' });
+  }
+});
+// ===============================================
+// ===== FIN DEL BLOQUE AÑADIDO ==================
+// ===============================================
+
 // ===== Checkout one-off =====
 app.post('/create-checkout-session', async (req, res) => {
   try {
