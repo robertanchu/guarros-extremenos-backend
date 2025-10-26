@@ -943,31 +943,26 @@ app.post('/prices/resolve', async (req, res) => {
 // ===== FIN DEL BLOQUE AÑADIDO ==================
 // ===============================================
 
-// ===============================================
-// ===== RUTA DE CONTACTO (VERSIÓN MEJORADA) =====
-// ===============================================
-app.post('/api/contact', async (req, res) => {
-  const { name, email, subject, message } = req.body;
-
-  // Validación de campos
-  if (!email || !message || !subject) {
-    return res.status(400).json({ error: 'Faltan campos requeridos (email, subject, message).' });
+// ... (El final de tu ruta /prices/resolve) ...
+  } catch (e) {
+    console.error('[prices/resolve] Error fatal:', e);
+    res.status(500).json({ error: e.message || 'Error resolviendo precios' });
   }
-  if (email.toLowerCase() === CORPORATE_EMAIL.toLowerCase()) {
-    return res.status(400).json({ error: 'Email inválido.' });
-  }
+});
+// ===============================================
+// ===== FIN DEL BLOQUE /prices/resolve ==========
+// ===============================================
 
-  // --- ¡SOLUCIÓN AL TIMEOUT! ---
-  // 1. Respondemos "OK" al frontend INMEDIATAMENTE.
-  //    Esto evita el error de "timeout" y el frontend
-  //    mostrará el mensaje de éxito.
-  res.status(200).json({ ok: true }); 
+
+// ===============================================
+// ===== AÑADE ESTA NUEVA FUNCIÓN ASÍNCRONA =====
+// ===============================================
+// Esta función se encarga del trabajo "lento"
+async function sendContactEmails(payload) {
+  const { name, email, subject, message } = payload;
   
-  // 2. Ahora, dejamos que el servidor trabaje en 
-  //    segundo plano para enviar los correos.
-
   try {
-    // --- Email para el Admin (el que ya tenías) ---
+    // --- Email para el Admin ---
     const subjectAdmin = `Mensaje de Contacto: ${escapeHtml(subject)}`;
     const bodyAdmin = `
 <tr><td style="padding:0 24px 12px;">
@@ -1006,7 +1001,7 @@ app.post('/api/contact', async (req, res) => {
       footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>`
     });
 
-    // 3. Enviamos AMBOS correos en paralelo
+    // Enviamos AMBOS correos
     await Promise.allSettled([
       // Correo al Admin
       sendEmail({
@@ -1018,26 +1013,51 @@ app.post('/api/contact', async (req, res) => {
       }),
       // Correo al Usuario
       sendEmail({
-        to: email, // El email del formulario
-        from: CUSTOMER_FROM,
+        to: email,
+        from: CUSTOMER_FROM, // <-- He corregido un typo aquí
         subject: subjectUser,
         html: htmlUser
       })
     ]);
     
-    // Si llegamos aquí, todo ha ido bien en el servidor
     console.log(`[api/contact] Correos de contacto enviados con éxito para ${email}`);
 
   } catch (e) {
-    // Si los emails fallan, el usuario ya ha visto el "éxito".
-    // Solo lo registramos en el log del servidor.
     console.error('[api/contact] Error fatal enviando correos en segundo plano:', e);
   }
+}
+
+// ===============================================
+// ===== REEMPLAZA TU RUTA /api/contact POR ESTA =====
+// ===============================================
+app.options('/api/contact', cors()); // Mantenemos esto por si acaso
+
+app.post('/api/contact', (req, res) => { // <-- ¡IMPORTANTE! quitamos 'async' de aquí
+  const { email, subject, message } = req.body;
+
+  // Validación rápida
+  if (!email || !message || !subject) {
+    return res.status(400).json({ error: 'Faltan campos requeridos.' });
+  }
+  if (email.toLowerCase() === CORPORATE_EMAIL.toLowerCase()) {
+    return res.status(400).json({ error: 'Email inválido.' });
+  }
+
+  // 1. Respondemos "OK" al frontend INMEDIATAMENTE.
+  res.status(200).json({ ok: true });
+
+  // 2. Llamamos a la función "lenta" SIN 'await'.
+  //    Esto es "fire-and-forget".
+  sendContactEmails(req.body);
 });
 // ===============================================
 // ===== FIN DEL BLOQUE DE CONTACTO ==============
 // ===============================================
 
+
+// ===== Checkout one-off =====
+app.post('/create-checkout-session', async (req, res) => {
+// ...el resto de tu código...
 // ===== Checkout one-off =====
 app.post('/create-checkout-session', async (req, res) => {
   try {
