@@ -1019,7 +1019,7 @@ app.post('/api/contact', async (req, res) => {
       // Correo al Usuario
       sendEmail({
         to: email, // El email del formulario
-        from: CUSTOMOR_FROM,
+        from: CUSTOMER_FROM,
         subject: subjectUser,
         html: htmlUser
       })
