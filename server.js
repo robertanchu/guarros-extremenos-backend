@@ -943,6 +943,66 @@ app.post('/prices/resolve', async (req, res) => {
 // ===== FIN DEL BLOQUE AÑADIDO ==================
 // ===============================================
 
+// ===============================================
+// ===== AÑADIR ESTE BLOQUE PARA EL CONTACTO =====
+// ===============================================
+app.post('/api/contact', async (req, res) => {
+  const { name, email, subject, message } = req.body;
+
+  // Validación de campos
+  if (!email || !message || !subject) {
+    return res.status(400).json({ error: 'Faltan campos requeridos (email, subject, message).' });
+  }
+
+  // Evitar bucles de spam si alguien pone el email corporativo
+  if (email.toLowerCase() === CORPORATE_EMAIL.toLowerCase()) {
+    return res.status(400).json({ error: 'Email inválido.' });
+  }
+
+  try {
+    const subjectAdmin = `Mensaje de Contacto: ${escapeHtml(subject)}`;
+    
+    // Construimos un cuerpo de email HTML usando tus funciones existentes
+    const bodyAdmin = `
+<tr><td style="padding:0 24px 12px;">
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">Has recibido un nuevo mensaje desde el formulario de contacto:</p>
+  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui; list-style-type: none; padding-left: 0;">
+    <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
+    <li><b>Email:</b> ${escapeHtml(email)}</li>
+    <li><b>Asunto:</b> ${escapeHtml(subject)}</li>
+  </ul>
+  <div style="height:1px;background:#e5e7eb;margin:12px 0;"></div>
+  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Mensaje:</p>
+  <div style="font:14px system-ui; color:#374151; white-space: pre-wrap; line-height: 1.6;">${escapeHtml(message)}</div>
+</td></tr>`.trim();
+
+    const htmlAdmin = emailShell({
+      header: 'Nuevo Mensaje de Contacto',
+      body: bodyAdmin,
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
+    });
+
+    // Usamos tu función 'sendEmail' existente
+    // ¡Importante! Usamos 'replyTo' para que puedas "Responder" al cliente
+    await sendEmail({
+      to: CORPORATE_EMAIL, // Envía a tu email corporativo
+      from: CUSTOMER_FROM, // Desde la dirección de no-reply
+      replyTo: email, // Permite responder directamente al email del cliente
+      subject: subjectAdmin,
+      html: htmlAdmin
+    });
+
+    res.status(200).json({ ok: true });
+
+  } catch (e) {
+    console.error('[api/contact] Error fatal:', e);
+    res.status(500).json({ error: e.message || 'Error enviando el correo' });
+  }
+});
+// ===============================================
+// ===== FIN DEL BLOQUE AÑADIDO ==================
+// ===============================================
+
 // ===== Checkout one-off =====
 app.post('/create-checkout-session', async (req, res) => {
   try {
