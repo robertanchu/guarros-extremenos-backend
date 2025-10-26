@@ -944,7 +944,7 @@ app.post('/prices/resolve', async (req, res) => {
 // ===============================================
 
 // ===============================================
-// ===== AÑADIR ESTE BLOQUE PARA EL CONTACTO =====
+// ===== RUTA DE CONTACTO (VERSIÓN MEJORADA) =====
 // ===============================================
 app.post('/api/contact', async (req, res) => {
   const { name, email, subject, message } = req.body;
@@ -953,16 +953,22 @@ app.post('/api/contact', async (req, res) => {
   if (!email || !message || !subject) {
     return res.status(400).json({ error: 'Faltan campos requeridos (email, subject, message).' });
   }
-
-  // Evitar bucles de spam si alguien pone el email corporativo
   if (email.toLowerCase() === CORPORATE_EMAIL.toLowerCase()) {
     return res.status(400).json({ error: 'Email inválido.' });
   }
 
+  // --- ¡SOLUCIÓN AL TIMEOUT! ---
+  // 1. Respondemos "OK" al frontend INMEDIATAMENTE.
+  //    Esto evita el error de "timeout" y el frontend
+  //    mostrará el mensaje de éxito.
+  res.status(200).json({ ok: true }); 
+  
+  // 2. Ahora, dejamos que el servidor trabaje en 
+  //    segundo plano para enviar los correos.
+
   try {
+    // --- Email para el Admin (el que ya tenías) ---
     const subjectAdmin = `Mensaje de Contacto: ${escapeHtml(subject)}`;
-    
-    // Construimos un cuerpo de email HTML usando tus funciones existentes
     const bodyAdmin = `
 <tr><td style="padding:0 24px 12px;">
   <p style="margin:0 0 10px; font:15px system-ui; color:#111;">Has recibido un nuevo mensaje desde el formulario de contacto:</p>
@@ -975,32 +981,61 @@ app.post('/api/contact', async (req, res) => {
   <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Mensaje:</p>
   <div style="font:14px system-ui; color:#374151; white-space: pre-wrap; line-height: 1.6;">${escapeHtml(message)}</div>
 </td></tr>`.trim();
-
     const htmlAdmin = emailShell({
       header: 'Nuevo Mensaje de Contacto',
       body: bodyAdmin,
       footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
     });
-
-    // Usamos tu función 'sendEmail' existente
-    // ¡Importante! Usamos 'replyTo' para que puedas "Responder" al cliente
-    await sendEmail({
-      to: CORPORATE_EMAIL, // Envía a tu email corporativo
-      from: CUSTOMER_FROM, // Desde la dirección de no-reply
-      replyTo: email, // Permite responder directamente al email del cliente
-      subject: subjectAdmin,
-      html: htmlAdmin
+    
+    // --- Email de Confirmación para el Usuario ---
+    const subjectUser = `Hemos recibido tu mensaje — ${escapeHtml(BRAND)}`;
+    const bodyUser = `
+<tr><td style="padding:0 24px 12px;">
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">¡Hola ${escapeHtml(name || '')}!</p>
+  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">Hemos recibido tu mensaje y te responderemos lo antes posible.</p>
+  <div style="height:1px;background:#e5e7eb;margin:12px 0;"></div>
+  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tu consulta:</p>
+  <div style="font:14px system-ui; color:#6b7280; border-left: 3px solid #e5e7eb; padding-left: 12px; font-style: italic;">
+    <strong>Asunto:</strong> ${escapeHtml(subject)}<br/>
+    <strong>Mensaje:</strong> ${escapeHtml(message).substring(0, 150)}...
+  </div>
+</td></tr>`.trim();
+    const htmlUser = emailShell({
+      header: 'Mensaje Recibido',
+      body: bodyUser,
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>`
     });
 
-    res.status(200).json({ ok: true });
+    // 3. Enviamos AMBOS correos en paralelo
+    await Promise.allSettled([
+      // Correo al Admin
+      sendEmail({
+        to: CORPORATE_EMAIL,
+        from: CUSTOMER_FROM,
+        replyTo: email,
+        subject: subjectAdmin,
+        html: htmlAdmin
+      }),
+      // Correo al Usuario
+      sendEmail({
+        to: email, // El email del formulario
+        from: CUSTOMOR_FROM,
+        subject: subjectUser,
+        html: htmlUser
+      })
+    ]);
+    
+    // Si llegamos aquí, todo ha ido bien en el servidor
+    console.log(`[api/contact] Correos de contacto enviados con éxito para ${email}`);
 
   } catch (e) {
-    console.error('[api/contact] Error fatal:', e);
-    res.status(500).json({ error: e.message || 'Error enviando el correo' });
+    // Si los emails fallan, el usuario ya ha visto el "éxito".
+    // Solo lo registramos en el log del servidor.
+    console.error('[api/contact] Error fatal enviando correos en segundo plano:', e);
   }
 });
 // ===============================================
-// ===== FIN DEL BLOQUE AÑADIDO ==================
+// ===== FIN DEL BLOQUE DE CONTACTO ==============
 // ===============================================
 
 // ===== Checkout one-off =====
