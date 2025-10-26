@@ -518,6 +518,83 @@ async function sendCustomerUpdatedEmails({ cust, summaryHtml }) {
   }
 }
 
+// ========================================================
+// ===== 1. NUEVA FUNCIÓN AÑADIDA PARA ENVIAR CORREOS =====
+// ========================================================
+// Esta función se encarga del trabajo "lento"
+async function sendContactEmails(payload) {
+  const { name, email, subject, message } = payload;
+  
+  try {
+    // --- Email para el Admin ---
+    const subjectAdmin = `Mensaje de Contacto: ${escapeHtml(subject)}`;
+    const bodyAdmin = `
+<tr><td style="padding:0 24px 12px;">
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">Has recibido un nuevo mensaje desde el formulario de contacto:</p>
+  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui; list-style-type: none; padding-left: 0;">
+    <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
+    <li><b>Email:</b> ${escapeHtml(email)}</li>
+    <li><b>Asunto:</b> ${escapeHtml(subject)}</li>
+  </ul>
+  <div style="height:1px;background:#e5e7eb;margin:12px 0;"></div>
+  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Mensaje:</p>
+  <div style="font:14px system-ui; color:#374151; white-space: pre-wrap; line-height: 1.6;">${escapeHtml(message)}</div>
+</td></tr>`.trim();
+    const htmlAdmin = emailShell({
+      header: 'Nuevo Mensaje de Contacto',
+      body: bodyAdmin,
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
+    });
+    
+    // --- Email de Confirmación para el Usuario ---
+    const subjectUser = `Hemos recibido tu mensaje — ${escapeHtml(BRAND)}`;
+    const bodyUser = `
+<tr><td style="padding:0 24px 12px;">
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">¡Hola ${escapeHtml(name || '')}!</p>
+  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">Hemos recibido tu mensaje y te responderemos lo antes posible.</p>
+  <div style="height:1px;background:#e5e7eb;margin:12px 0;"></div>
+  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tu consulta:</p>
+  <div style="font:14px system-ui; color:#6b7280; border-left: 3px solid #e5e7eb; padding-left: 12px; font-style: italic;">
+    <strong>Asunto:</strong> ${escapeHtml(subject)}<br/>
+    <strong>Mensaje:</strong> ${escapeHtml(message).substring(0, 150)}...
+  </div>
+</td></tr>`.trim();
+    const htmlUser = emailShell({
+      header: 'Mensaje Recibido',
+      body: bodyUser,
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>`
+    });
+
+    // Enviamos AMBOS correos
+    await Promise.allSettled([
+      // Correo al Admin
+      sendEmail({
+        to: CORPORATE_EMAIL,
+        from: CUSTOMER_FROM,
+        replyTo: email,
+        subject: subjectAdmin,
+        html: htmlAdmin
+      }),
+      // Correo al Usuario
+      sendEmail({
+        to: email,
+        from: CUSTOMER_FROM,
+        subject: subjectUser,
+        html: htmlUser
+      })
+    ]);
+    
+    console.log(`[api/contact] Correos de contacto enviados con éxito para ${email}`);
+
+  } catch (e) {
+    console.error('[api/contact] Error fatal enviando correos en segundo plano:', e);
+  }
+}
+// ========================================================
+// ===== FIN DE LA NUEVA FUNCIÓN ==========================
+// ========================================================
+
+
 // ===== CORS / logging =====
 const allowOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const allowDomains = (process.env.ALLOWED_DOMAINS || 'guarrosextremenos.com,vercel.app').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -899,7 +976,7 @@ app.post('/webhook', async (req, res) => {
 app.use(express.json());
 
 // ===============================================
-// ===== AÑADIR ESTE BLOQUE DE CÓDIGO AQUÍ =====
+// ===== RUTA /prices/resolve (ya la tenías) =====
 // ===============================================
 app.post('/prices/resolve', async (req, res) => {
   const { ids } = req.body;
@@ -908,7 +985,6 @@ app.post('/prices/resolve', async (req, res) => {
   }
 
   try {
-    // Usamos Promise.allSettled para que si un ID de precio falla, los demás continúen
     const results = await Promise.allSettled(
       ids.map(id => stripe.prices.retrieve(String(id), { expand: ['product'] }))
     );
@@ -917,7 +993,6 @@ app.post('/prices/resolve', async (req, res) => {
     results.forEach((result, index) => {
       if (result.status === 'fulfilled') {
         const price = result.value;
-        // Este formato (product_name) coincide con lo que tu frontend espera
         pricesMap[price.id] = {
           id: price.id,
           unit_amount: price.unit_amount,
@@ -925,13 +1000,10 @@ app.post('/prices/resolve', async (req, res) => {
           product_name: price.product?.name || null, 
         };
       } else {
-        // Si un precio falla (ej. ID incorrecto), simplemente no lo devolvemos
         console.warn(`[prices/resolve] No se pudo encontrar el price: ${ids[index]}`, result.reason?.message);
       }
     });
 
-    // Devolvemos el objeto { prices: { price_id_1: {...}, price_id_2: {...} } }
-    // que es exactamente lo que la función `upsertMany` del frontend espera
     res.json({ prices: pricesMap });
 
   } catch (e) {
@@ -939,100 +1011,13 @@ app.post('/prices/resolve', async (req, res) => {
     res.status(500).json({ error: e.message || 'Error resolviendo precios' });
   }
 });
-// ===============================================
-// ===== FIN DEL BLOQUE AÑADIDO ==================
-// ===============================================
-
-// ... (El final de tu ruta /prices/resolve) ...
-  } catch (e) {
-    console.error('[prices/resolve] Error fatal:', e);
-    res.status(500).json({ error: e.message || 'Error resolviendo precios' });
-  }
-});
-// ===============================================
-// ===== FIN DEL BLOQUE /prices/resolve ==========
-// ===============================================
-
 
 // ===============================================
-// ===== AÑADE ESTA NUEVA FUNCIÓN ASÍNCRONA =====
+// ===== 2. NUEVA RUTA DE CONTACTO AÑADIDA =====
 // ===============================================
-// Esta función se encarga del trabajo "lento"
-async function sendContactEmails(payload) {
-  const { name, email, subject, message } = payload;
-  
-  try {
-    // --- Email para el Admin ---
-    const subjectAdmin = `Mensaje de Contacto: ${escapeHtml(subject)}`;
-    const bodyAdmin = `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">Has recibido un nuevo mensaje desde el formulario de contacto:</p>
-  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui; list-style-type: none; padding-left: 0;">
-    <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
-    <li><b>Email:</b> ${escapeHtml(email)}</li>
-    <li><b>Asunto:</b> ${escapeHtml(subject)}</li>
-  </ul>
-  <div style="height:1px;background:#e5e7eb;margin:12px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Mensaje:</p>
-  <div style="font:14px system-ui; color:#374151; white-space: pre-wrap; line-height: 1.6;">${escapeHtml(message)}</div>
-</td></tr>`.trim();
-    const htmlAdmin = emailShell({
-      header: 'Nuevo Mensaje de Contacto',
-      body: bodyAdmin,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
-    });
-    
-    // --- Email de Confirmación para el Usuario ---
-    const subjectUser = `Hemos recibido tu mensaje — ${escapeHtml(BRAND)}`;
-    const bodyUser = `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">¡Hola ${escapeHtml(name || '')}!</p>
-  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">Hemos recibido tu mensaje y te responderemos lo antes posible.</p>
-  <div style="height:1px;background:#e5e7eb;margin:12px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tu consulta:</p>
-  <div style="font:14px system-ui; color:#6b7280; border-left: 3px solid #e5e7eb; padding-left: 12px; font-style: italic;">
-    <strong>Asunto:</strong> ${escapeHtml(subject)}<br/>
-    <strong>Mensaje:</strong> ${escapeHtml(message).substring(0, 150)}...
-  </div>
-</td></tr>`.trim();
-    const htmlUser = emailShell({
-      header: 'Mensaje Recibido',
-      body: bodyUser,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>`
-    });
+app.options('/api/contact', cors()); // Para la comprobación pre-flight de CORS
 
-    // Enviamos AMBOS correos
-    await Promise.allSettled([
-      // Correo al Admin
-      sendEmail({
-        to: CORPORATE_EMAIL,
-        from: CUSTOMER_FROM,
-        replyTo: email,
-        subject: subjectAdmin,
-        html: htmlAdmin
-      }),
-      // Correo al Usuario
-      sendEmail({
-        to: email,
-        from: CUSTOMER_FROM, // <-- He corregido un typo aquí
-        subject: subjectUser,
-        html: htmlUser
-      })
-    ]);
-    
-    console.log(`[api/contact] Correos de contacto enviados con éxito para ${email}`);
-
-  } catch (e) {
-    console.error('[api/contact] Error fatal enviando correos en segundo plano:', e);
-  }
-}
-
-// ===============================================
-// ===== REEMPLAZA TU RUTA /api/contact POR ESTA =====
-// ===============================================
-app.options('/api/contact', cors()); // Mantenemos esto por si acaso
-
-app.post('/api/contact', (req, res) => { // <-- ¡IMPORTANTE! quitamos 'async' de aquí
+app.post('/api/contact', (req, res) => { // ¡Quitado 'async' para respuesta rápida!
   const { email, subject, message } = req.body;
 
   // Validación rápida
@@ -1047,17 +1032,15 @@ app.post('/api/contact', (req, res) => { // <-- ¡IMPORTANTE! quitamos 'async' d
   res.status(200).json({ ok: true });
 
   // 2. Llamamos a la función "lenta" SIN 'await'.
-  //    Esto es "fire-and-forget".
+  //    Esto es "fire-and-forget". El servidor
+  //    sigue trabajando en segundo plano.
   sendContactEmails(req.body);
 });
 // ===============================================
-// ===== FIN DEL BLOQUE DE CONTACTO ==============
+// ===== FIN DE LA RUTA DE CONTACTO ==============
 // ===============================================
 
 
-// ===== Checkout one-off =====
-app.post('/create-checkout-session', async (req, res) => {
-// ...el resto de tu código...
 // ===== Checkout one-off =====
 app.post('/create-checkout-session', async (req, res) => {
   try {
