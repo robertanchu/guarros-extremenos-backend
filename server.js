@@ -643,16 +643,21 @@ app.post('/webhook', async (req, res) => {
     return r?.rowCount === 1;
   };
 
+// ===== REEMPLAZA ESTA FUNCIÓN COMPLETA =====
   const logOrder = async (o) => {
     if (!pool) return;
     const text = `
-      INSERT INTO orders (session_id, email, name, phone, total, currency, items, metadata, shipping, status, customer_details, created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW())
+      INSERT INTO orders (
+        session_id, email, name, phone, total, currency, items, metadata, shipping, status, customer_details,
+        address, city, postal, country, created_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, NOW())
       ON CONFLICT (session_id) DO UPDATE SET
         email=EXCLUDED.email, name=EXCLUDED.name, phone=EXCLUDED.phone,
         total=EXCLUDED.total, currency=EXCLUDED.currency, items=EXCLUDED.items,
         metadata=EXCLUDED.metadata, shipping=EXCLUDED.shipping, status=EXCLUDED.status,
-        customer_details=EXCLUDED.customer_details
+        customer_details=EXCLUDED.customer_details,
+        address=EXCLUDED.address, city=EXCLUDED.city, postal=EXCLUDED.postal, country=EXCLUDED.country
     `;
     const vals = [
       o.sessionId, o.email || null, o.name || null, o.phone || null,
@@ -660,6 +665,8 @@ app.post('/webhook', async (req, res) => {
       JSON.stringify(o.items || []), JSON.stringify(o.metadata || {}),
       JSON.stringify(o.shipping || {}), o.status || 'paid',
       JSON.stringify(o.customer_details || {}),
+      // Campos de dirección añadidos
+      o.address || null, o.city || null, o.postal || null, o.country || null
     ];
     await dbQuery(text, vals);
   };
@@ -711,6 +718,7 @@ app.post('/webhook', async (req, res) => {
 
   try {
     switch (event.type) {
+      // ===== REEMPLAZA ESTE BLOQUE 'CASE' COMPLETO =====
       case 'checkout.session.completed': {
         const session = event.data.object;
         const isSub = session.mode === 'subscription' || !!session.subscription;
@@ -732,6 +740,7 @@ app.post('/webhook', async (req, res) => {
           items = li?.data || [];
         } catch (e) { console.warn('[listLineItems warn]', e?.message || e); }
 
+        // --- LLAMADA A logOrder MODIFICADA ---
         await logOrder({
           sessionId: session.id,
           email, name, phone,
@@ -739,6 +748,11 @@ app.post('/webhook', async (req, res) => {
           items, metadata, shipping,
           status: session.payment_status || session.status || 'unknown',
           customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
+          // Campos de dirección añadidos
+          address: person.address?.line1 || null,
+          city: person.address?.city || null,
+          postal: person.address?.postal_code || null,
+          country: person.address?.country || null
         });
         await logOrderItems(session.id, items, currency);
 
@@ -751,6 +765,8 @@ app.post('/webhook', async (req, res) => {
               subscription_id: sub.id,
               email: cust?.email || email || null,
               name: cust?.name || name || null,
+              // Añadimos el teléfono que faltaba aquí también
+              phone: cust?.phone || phone || null, 
               plan: sub.items?.data?.[0]?.price?.id || (sub.metadata?.subscription_grams ? `g${sub.metadata.subscription_grams}` : null),
               status: sub.status,
               meta: { ...sub.metadata },
@@ -805,6 +821,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
+// ===== REEMPLAZA ESTE BLOQUE 'CASE' COMPLETO =====
       case 'customer.subscription.created': {
         const sub = event.data.object;
         try {
@@ -812,14 +829,18 @@ app.post('/webhook', async (req, res) => {
           const name = cust?.name || null;
           const email = cust?.email || null;
           const address = cust?.address || null;
+          // Añadimos el teléfono que faltaba
+          const phone = cust?.phone || null; 
 
           // upsert suscriptor (para que desde ahora customer.updated sí dispare emails)
           try {
+            // --- LLAMADA A upsertSubscriber MODIFICADA ---
             await upsertSubscriber({
               customer_id: sub.customer,
               subscription_id: sub.id,
               email,
               name,
+              phone, // <-- CAMPO DE TELÉFONO AÑADIDO
               plan: sub.items?.data?.[0]?.price?.id || (sub.metadata?.subscription_grams ? `g${sub.metadata.subscription_grams}` : null),
               status: sub.status,
               meta: { ...sub.metadata },
@@ -839,11 +860,11 @@ app.post('/webhook', async (req, res) => {
                 <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
                   <li><b>ID suscripción:</b> ${escapeHtml(sub.id)}</li>
                   <li><b>Cliente:</b> ${escapeHtml(name || '-')} — ${escapeHtml(email || '-')}</li>
-                  <li><b>Estado:</b> ${escapeHtml(sub.status)}</li>
+                  <li><b>Teléfono:</b> ${escapeHtml(phone || '-')}</li> <li><b>Estado:</b> ${escapeHtml(sub.status)}</li>
                 </ul>
                 <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
                 <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
-                <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ name, email, address })}</div>
+                <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ name, email, phone, address })}</div>
               </td></tr>`,
               footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
             });
@@ -863,7 +884,7 @@ app.post('/webhook', async (req, res) => {
                 orderId: sub.id,
                 isSubscription: true,
                 customerId: sub.customer,
-                customer_details: { name, email, address },
+                customer_details: { name, email, phone, address }, // Pasamos el teléfono
                 shipping: {},
               });
             }
