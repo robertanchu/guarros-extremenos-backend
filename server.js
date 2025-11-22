@@ -8,6 +8,7 @@ import { Resend } from 'resend';
 import nodemailer from 'nodemailer';
 import PDFDocument from 'pdfkit';
 import pg from 'pg';
+import rateLimit from 'express-rate-limit';
 const { Pool } = pg;
 
 const app = express();
@@ -43,6 +44,12 @@ const COMBINE_CONFIRMATION_AND_INVOICE = String(process.env.COMBINE_CONFIRMATION
 const ATTACH_STRIPE_INVOICE = String(process.env.ATTACH_STRIPE_INVOICE || 'false') === 'true';
 const CUSTOMER_BCC_CORPORATE = String(process.env.CUSTOMER_BCC_CORPORATE || 'false') === 'true';
 
+const contactLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 5, // max 5 correos por IP
+  message: { error: 'Demasiados intentos, por favor espera un poco.' }
+});
+
 // ===== Tabla de precios de suscripción (centimos) =====
 const SUB_PRICE_TABLE = Object.freeze({
   100: 4600, 200: 5800, 300: 6900, 400: 8000, 500: 9100, 600: 10300,
@@ -50,19 +57,47 @@ const SUB_PRICE_TABLE = Object.freeze({
 });
 const ALLOWED_SUB_GRAMS = Object.keys(SUB_PRICE_TABLE).map(Number);
 
-// ===== DB =====
+// ... (imports anteriores)
+
+// ===== DB (CORREGIDO) =====
 const pool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { require: true, rejectUnauthorized: false }, max: 5 })
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { require: true, rejectUnauthorized: false },
+      max: 5
+    })
   : null;
 
-async function dbQuery(text, params) {
-  if (!pool) return { rows: [], rowCount: 0 };
-  try { return await pool.query(text, params); }
-  catch (e) { console.error('[DB ERROR]', e?.message || e); return { rows: [], rowCount: 0, error: e }; }
+// Verificación crítica al iniciar el servidor
+if (!pool) {
+  console.error('\n🚨🚨🚨 [ERROR FATAL] NO SE DETECTÓ DATABASE_URL 🚨🚨🚨');
+  console.error('La aplicación NO guardará pedidos ni usuarios. Revisa tu archivo .env\n');
+} else {
+  console.log('✅ Conexión a Base de Datos configurada');
 }
 
+async function dbQuery(text, params) {
+  // 1. Si no hay pool, lanzamos error FATAL para que el proceso se entere
+  if (!pool) {
+    const errorMsg = 'Intento de consulta a DB sin conexión activa (DATABASE_URL faltante).';
+    console.error(`[DB CRITICAL] ${errorMsg}`);
+    throw new Error(errorMsg); 
+  }
+
+  try {
+    // 2. Ejecutamos la consulta real
+    return await pool.query(text, params);
+  } catch (e) {
+    // 3. Si la consulta falla (ej: error de sintaxis o conexión caída), lo logueamos y re-lanzamos
+    console.error('[DB QUERY ERROR]', e.message, '\nQuery:', text);
+    throw e; // Importante: Lanzar el error para que el Webhook de Stripe sepa que falló y reintente
+  }
+}
+
+// ... (resto del código: creación de tablas, etc.)
 (async () => {
   if (!pool) return;
+  // Tablas de control
   await dbQuery(`CREATE TABLE IF NOT EXISTS processed_events(
     event_id text PRIMARY KEY,
     created_at timestamptz DEFAULT now()
@@ -70,6 +105,57 @@ async function dbQuery(text, params) {
   await dbQuery(`CREATE TABLE IF NOT EXISTS mailed_invoices(
     invoice_id text PRIMARY KEY,
     sent_at timestamptz DEFAULT now()
+  )`);
+
+  // --- FALTABAN ESTAS TABLAS ---
+  await dbQuery(`CREATE TABLE IF NOT EXISTS orders(
+    session_id text PRIMARY KEY,
+    email text,
+    name text,
+    phone text,
+    total numeric,
+    currency text,
+    items jsonb,
+    metadata jsonb,
+    shipping jsonb,
+    status text,
+    customer_details jsonb,
+    address text,
+    city text,
+    postal text,
+    country text,
+    created_at timestamptz DEFAULT now()
+  )`);
+
+  await dbQuery(`CREATE TABLE IF NOT EXISTS order_items(
+    id SERIAL PRIMARY KEY,
+    session_id text REFERENCES orders(session_id),
+    description text,
+    product_id text,
+    price_id text,
+    quantity int,
+    unit_amount_cents int,
+    amount_total_cents int,
+    currency text,
+    raw jsonb
+  )`);
+
+  await dbQuery(`CREATE TABLE IF NOT EXISTS subscribers(
+    customer_id text PRIMARY KEY,
+    subscription_id text,
+    email text,
+    plan text,
+    status text,
+    name text,
+    phone text,
+    address text,
+    city text,
+    postal text,
+    country text,
+    meta jsonb,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    canceled_at timestamptz
   )`);
 })();
 
@@ -1038,7 +1124,7 @@ app.post('/prices/resolve', async (req, res) => {
 // ===============================================
 app.options('/api/contact', cors()); // Para la comprobación pre-flight de CORS
 
-app.post('/api/contact', (req, res) => { // ¡Quitado 'async' para respuesta rápida!
+app.post('/api/contact', contactLimiter, (req, res) => { // ¡Quitado 'async' para respuesta rápida!
   const { email, subject, message } = req.body;
 
   // Validación rápida
@@ -1163,7 +1249,7 @@ app.get('/billing-portal/link', async (req, res) => {
 
 
 // ===== Recuperar acceso a suscripción (Magic Link) =====
-app.post('/api/recover-subscription', async (req, res) => {
+app.post('/api/recover-subscription', contactLimiter, async (req, res) => {
   const { email } = req.body;
   
   if (!email) return res.status(400).json({ error: 'Email requerido' });
