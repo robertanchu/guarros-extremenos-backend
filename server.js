@@ -1161,6 +1161,70 @@ app.get('/billing-portal/link', async (req, res) => {
   }
 });
 
+
+// ===== Recuperar acceso a suscripción (Magic Link) =====
+app.post('/api/recover-subscription', async (req, res) => {
+  const { email } = req.body;
+  
+  if (!email) return res.status(400).json({ error: 'Email requerido' });
+
+  try {
+    // 1. Buscar cliente en Stripe por email
+    const customers = await stripe.customers.list({ email, limit: 1 });
+    const customer = customers.data[0];
+
+    // Si no existe, respondemos OK genérico para no revelar usuarios (seguridad),
+    // o puedes devolver error 404 si prefieres mejor UX sobre seguridad estricta.
+    if (!customer) {
+      // Simular retardo para evitar "timing attacks"
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return res.json({ ok: true, message: 'Si el email existe, se ha enviado el enlace.' });
+    }
+
+    // 2. Generar enlace al portal
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: customer.id,
+      return_url: PORTAL_RETURN_URL,
+      ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {}),
+    });
+
+    // 3. Enviar email con el enlace
+    const html = emailShell({
+      header: 'Gestión de tu suscripción',
+      body: `
+        <tr><td style="padding:0 24px 12px;">
+          <p style="margin:0 0 12px; font:15px system-ui; color:#111;">Hola,</p>
+          <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
+            Has solicitado acceso para gestionar tu suscripción en ${escapeHtml(BRAND)}.
+            Haz clic en el botón de abajo para ver tus facturas, cambiar tu método de pago o cancelar.
+          </p>
+        </td></tr>
+        <tr><td style="padding:0 24px 24px; text-align:center;">
+          <a href="${portalSession.url}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:12px 24px;border-radius:10px;letter-spacing:.5px;font-family:system-ui;">
+            Acceder a mi cuenta
+          </a>
+        </td></tr>
+        <tr><td style="padding:0 24px 12px;">
+          <p style="margin:0; font:13px system-ui; color:#6b7280;">Este enlace caduca en unos minutos por seguridad.</p>
+        </td></tr>
+      `,
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}</p>`
+    });
+
+    await sendEmail({
+      to: email,
+      subject: `Gestión de suscripción — ${BRAND}`,
+      html
+    });
+
+    res.json({ ok: true });
+
+  } catch (e) {
+    console.error('[recover-subscription] error:', e);
+    res.status(500).json({ error: 'Error procesando la solicitud.' });
+  }
+});
+
 // ===== Test email =====
 app.get('/test-email', async (req, res) => {
   try {
