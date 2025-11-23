@@ -52,8 +52,18 @@ const contactLimiter = rateLimit({
 
 // ===== Tabla de precios de suscripción (centimos) =====
 const SUB_PRICE_TABLE = Object.freeze({
-  100: 4600, 200: 5800, 300: 6900, 400: 8000, 500: 9100, 600: 10300,
-  700: 11400, 800: 12500, 900: 13600, 1000: 14800, 1500: 20400, 2000: 26000,
+	100: 4600, 
+	200: 5800, 
+	300: 6900, 
+	400: 8000, 
+	500: 9100, 
+	600: 10300,
+	700: 11400, 
+	800: 12500, 
+	900: 13600, 
+	1000: 14800, 
+	1500: 20400, 
+	2000: 26000,
 });
 const ALLOWED_SUB_GRAMS = Object.keys(SUB_PRICE_TABLE).map(Number);
 
@@ -1322,5 +1332,17 @@ app.get('/test-email', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.status(404).send('Not found'));
+
+
+// ===== Configuración pública =====
+app.get('/api/config/prices', (req, res) => {
+  // Devolvemos la tabla de precios (en céntimos, tal cual la tiene el backend)
+  // Esto permite que el frontend pueda consultarla si quisieras implementar
+  // una sincronización 100% dinámica en el futuro.
+  res.json({
+    subscription: SUB_PRICE_TABLE,
+    allowedGrams: ALLOWED_SUB_GRAMS
+  });
+});
 
 app.listen(PORT, () => { console.log(`API listening on :${PORT}`); });
