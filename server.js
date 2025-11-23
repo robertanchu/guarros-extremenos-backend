@@ -1258,50 +1258,82 @@ app.get('/billing-portal/link', async (req, res) => {
 });
 
 
-// ===== Recuperar acceso a suscripción (Magic Link) =====
+// ===== Recuperar acceso a suscripción (Magic Link Multi-cuenta) =====
 app.post('/api/recover-subscription', contactLimiter, async (req, res) => {
   const { email } = req.body;
   
   if (!email) return res.status(400).json({ error: 'Email requerido' });
 
   try {
-    // 1. Buscar cliente en Stripe por email
-    const customers = await stripe.customers.list({ email, limit: 1 });
-    const customer = customers.data[0];
+    // 1. Buscar TODOS los clientes con ese email (ponemos límite 5 por seguridad)
+    // Stripe ordena por fecha de creación (el más nuevo primero) por defecto.
+    const customers = await stripe.customers.list({ email, limit: 5 });
 
-    // Si no existe, respondemos OK genérico para no revelar usuarios (seguridad),
-    // o puedes devolver error 404 si prefieres mejor UX sobre seguridad estricta.
-    if (!customer) {
-      // Simular retardo para evitar "timing attacks"
+    // Si no existe ninguno, simulamos espera y respondemos OK (seguridad)
+    if (!customers.data.length) {
       await new Promise(resolve => setTimeout(resolve, 1000));
       return res.json({ ok: true, message: 'Si el email existe, se ha enviado el enlace.' });
     }
 
-    // 2. Generar enlace al portal
-    const portalSession = await stripe.billingPortal.sessions.create({
-      customer: customer.id,
-      return_url: PORTAL_RETURN_URL,
-      ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {}),
-    });
+    // 2. Generar un enlace (Session) para CADA cliente encontrado
+    // Usamos Promise.all para generarlos en paralelo
+    const linksData = await Promise.all(customers.data.map(async (cust) => {
+      try {
+        const session = await stripe.billingPortal.sessions.create({
+          customer: cust.id,
+          return_url: PORTAL_RETURN_URL,
+          ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {}),
+        });
 
-    // 3. Enviar email con el enlace
+        // Intentamos sacar información útil para identificar la cuenta
+        const date = new Date(cust.created * 1000).toLocaleDateString('es-ES');
+        const address = cust.shipping?.address || cust.address;
+        const addressStr = address 
+          ? `${address.line1 || ''} ${address.city ? `(${address.city})` : ''}`.trim() 
+          : 'Sin dirección guardada';
+
+        return {
+          url: session.url,
+          label: `Alta: ${date} — ${addressStr || 'Dirección desconocida'}`
+        };
+      } catch (err) {
+        // Si falla uno (ej: cliente borrado), lo ignoramos
+        return null;
+      }
+    }));
+
+    // Filtramos nulos por si alguno falló
+    const validLinks = linksData.filter(Boolean);
+
+    if (!validLinks.length) {
+       return res.status(500).json({ error: 'No se pudieron generar enlaces' });
+    }
+
+    // 3. Construir el HTML con una lista de botones
+    const buttonsHtml = validLinks.map(link => `
+      <div style="margin-bottom: 16px; background: #f9fafb; padding: 12px; border-radius: 8px; border: 1px solid #e5e7eb;">
+        <p style="margin: 0 0 8px; font-size: 13px; color: #555; font-weight: 600;">
+          ${escapeHtml(link.label)}
+        </p>
+        <a href="${link.url}" style="display:block; text-decoration:none; color:#fff; background:${BRAND_PRIMARY}; padding:10px 16px; border-radius:6px; text-align:center; font-weight:bold; font-size:14px;">
+          Gestionar esta cuenta
+        </a>
+      </div>
+    `).join('');
+
+    // 4. Enviar email
     const html = emailShell({
-      header: 'Gestión de tu suscripción',
+      header: 'Tus suscripciones',
       body: `
         <tr><td style="padding:0 24px 12px;">
           <p style="margin:0 0 12px; font:15px system-ui; color:#111;">Hola,</p>
-          <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
-            Has solicitado acceso para gestionar tu suscripción en ${escapeHtml(BRAND)}.
-            Haz clic en el botón de abajo para ver tus facturas, cambiar tu método de pago o cancelar.
+          <p style="margin:0 0 16px; font:14px system-ui; color:#374151;">
+            Hemos encontrado varias cuentas asociadas a tu email. Si tienes suscripciones con diferentes direcciones, selecciona abajo la que quieras gestionar:
           </p>
-        </td></tr>
-        <tr><td style="padding:0 24px 24px; text-align:center;">
-          <a href="${portalSession.url}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:12px 24px;border-radius:10px;letter-spacing:.5px;font-family:system-ui;">
-            Acceder a mi cuenta
-          </a>
+          ${buttonsHtml}
         </td></tr>
         <tr><td style="padding:0 24px 12px;">
-          <p style="margin:0; font:13px system-ui; color:#6b7280;">Este enlace caduca en unos minutos por seguridad.</p>
+          <p style="margin:0; font:12px system-ui; color:#9ca3af;">Por seguridad, estos enlaces caducan en unos minutos.</p>
         </td></tr>
       `,
       footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}</p>`
@@ -1309,7 +1341,7 @@ app.post('/api/recover-subscription', contactLimiter, async (req, res) => {
 
     await sendEmail({
       to: email,
-      subject: `Gestión de suscripción — ${BRAND}`,
+      subject: `Gestión de suscripciones — ${BRAND}`,
       html
     });
 
