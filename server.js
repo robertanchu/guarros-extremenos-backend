@@ -1,4 +1,4 @@
-// server.js — pedidos + suscripciones + emails + PDF + webhooks Stripe (no duplicados usuario en alta)
+// server.js — Backend v3 (Final con corrección Proxy + Filtro Activas + Config dinámica)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -9,9 +9,15 @@ import nodemailer from 'nodemailer';
 import PDFDocument from 'pdfkit';
 import pg from 'pg';
 import rateLimit from 'express-rate-limit';
+
 const { Pool } = pg;
 
 const app = express();
+
+// 🟢 1. CORRECCIÓN IMPORTANTE PARA RENDER:
+// Esto arregla el error "ERR_ERL_UNEXPECTED_X_FORWARDED_FOR" confiando en el proxy de Render
+app.set('trust proxy', 1);
+
 const PORT = process.env.PORT || 10000;
 
 // ===== Stripe =====
@@ -44,32 +50,34 @@ const COMBINE_CONFIRMATION_AND_INVOICE = String(process.env.COMBINE_CONFIRMATION
 const ATTACH_STRIPE_INVOICE = String(process.env.ATTACH_STRIPE_INVOICE || 'false') === 'true';
 const CUSTOMER_BCC_CORPORATE = String(process.env.CUSTOMER_BCC_CORPORATE || 'false') === 'true';
 
+// ===== Rate Limiter (Anti-Spam) =====
 const contactLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutos
   max: 5, // max 5 correos por IP
-  message: { error: 'Demasiados intentos, por favor espera un poco.' }
+  message: { error: 'Demasiados intentos, por favor espera un poco.' },
+  // standardHeaders y legacyHeaders ayudan a que los proxies entiendan los limites
+  standardHeaders: true, 
+  legacyHeaders: false,
 });
 
 // ===== Tabla de precios de suscripción (centimos) =====
 const SUB_PRICE_TABLE = Object.freeze({
-	100: 4600, 
-	200: 5800, 
-	300: 6900, 
-	400: 8000, 
-	500: 9100, 
-	600: 10300,
-	700: 11400, 
-	800: 12500, 
-	900: 13600, 
-	1000: 14800, 
-	1500: 20400, 
-	2000: 26000,
+  100: 4600, 
+  200: 5800, 
+  300: 6900, 
+  400: 8000, 
+  500: 9100, 
+  600: 10300,
+  700: 11400, 
+  800: 12500, 
+  900: 13600, 
+  1000: 14800, 
+  1500: 20400, 
+  2000: 26000,
 });
 const ALLOWED_SUB_GRAMS = Object.keys(SUB_PRICE_TABLE).map(Number);
 
-// ... (imports anteriores)
-
-// ===== DB (CORREGIDO) =====
+// ===== DB =====
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
@@ -104,10 +112,8 @@ async function dbQuery(text, params) {
   }
 }
 
-// ... (resto del código: creación de tablas, etc.)
 (async () => {
   if (!pool) return;
-  // Tablas de control
   await dbQuery(`CREATE TABLE IF NOT EXISTS processed_events(
     event_id text PRIMARY KEY,
     created_at timestamptz DEFAULT now()
@@ -116,8 +122,6 @@ async function dbQuery(text, params) {
     invoice_id text PRIMARY KEY,
     sent_at timestamptz DEFAULT now()
   )`);
-
-  // --- FALTABAN ESTAS TABLAS ---
   await dbQuery(`CREATE TABLE IF NOT EXISTS orders(
     session_id text PRIMARY KEY,
     email text,
@@ -136,7 +140,6 @@ async function dbQuery(text, params) {
     country text,
     created_at timestamptz DEFAULT now()
   )`);
-
   await dbQuery(`CREATE TABLE IF NOT EXISTS order_items(
     id SERIAL PRIMARY KEY,
     session_id text REFERENCES orders(session_id),
@@ -149,7 +152,6 @@ async function dbQuery(text, params) {
     currency text,
     raw jsonb
   )`);
-
   await dbQuery(`CREATE TABLE IF NOT EXISTS subscribers(
     customer_id text PRIMARY KEY,
     subscription_id text,
@@ -614,15 +616,10 @@ async function sendCustomerUpdatedEmails({ cust, summaryHtml }) {
   }
 }
 
-// ========================================================
-// ===== 1. NUEVA FUNCIÓN AÑADIDA PARA ENVIAR CORREOS =====
-// ========================================================
-// Esta función se encarga del trabajo "lento"
 async function sendContactEmails(payload) {
   const { name, email, subject, message } = payload;
   
   try {
-    // --- Email para el Admin ---
     const subjectAdmin = `Mensaje de Contacto: ${escapeHtml(subject)}`;
     const bodyAdmin = `
 <tr><td style="padding:0 24px 12px;">
@@ -642,7 +639,6 @@ async function sendContactEmails(payload) {
       footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
     });
     
-    // --- Email de Confirmación para el Usuario ---
     const subjectUser = `Hemos recibido tu mensaje — ${escapeHtml(BRAND)}`;
     const bodyUser = `
 <tr><td style="padding:0 24px 12px;">
@@ -661,23 +657,9 @@ async function sendContactEmails(payload) {
       footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>`
     });
 
-    // Enviamos AMBOS correos
     await Promise.allSettled([
-      // Correo al Admin
-      sendEmail({
-        to: CORPORATE_EMAIL,
-        from: CUSTOMER_FROM,
-        replyTo: email,
-        subject: subjectAdmin,
-        html: htmlAdmin
-      }),
-      // Correo al Usuario
-      sendEmail({
-        to: email,
-        from: CUSTOMER_FROM,
-        subject: subjectUser,
-        html: htmlUser
-      })
+      sendEmail({ to: CORPORATE_EMAIL, from: CUSTOMER_FROM, replyTo: email, subject: subjectAdmin, html: htmlAdmin }),
+      sendEmail({ to: email, from: CUSTOMER_FROM, subject: subjectUser, html: htmlUser })
     ]);
     
     console.log(`[api/contact] Correos de contacto enviados con éxito para ${email}`);
@@ -686,10 +668,6 @@ async function sendContactEmails(payload) {
     console.error('[api/contact] Error fatal enviando correos en segundo plano:', e);
   }
 }
-// ========================================================
-// ===== FIN DE LA NUEVA FUNCIÓN ==========================
-// ========================================================
-
 
 // ===== CORS / logging =====
 const allowOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -707,7 +685,6 @@ app.use(cors({
 }));
 app.use(morgan('tiny'));
 
-// ===== RAW body para webhook =====
 app.use('/webhook', express.raw({ type: '*/*' }));
 app.get('/health', (req, res) => res.json({ ok: true, service: 'api', ts: new Date().toISOString() }));
 
@@ -739,7 +716,6 @@ app.post('/webhook', async (req, res) => {
     return r?.rowCount === 1;
   };
 
-// ===== REEMPLAZA ESTA FUNCIÓN COMPLETA =====
   const logOrder = async (o) => {
     if (!pool) return;
     const text = `
@@ -761,7 +737,6 @@ app.post('/webhook', async (req, res) => {
       JSON.stringify(o.items || []), JSON.stringify(o.metadata || {}),
       JSON.stringify(o.shipping || {}), o.status || 'paid',
       JSON.stringify(o.customer_details || {}),
-      // Campos de dirección añadidos
       o.address || null, o.city || null, o.postal || null, o.country || null
     ];
     await dbQuery(text, vals);
@@ -814,11 +789,9 @@ app.post('/webhook', async (req, res) => {
 
   try {
     switch (event.type) {
-      // ===== REEMPLAZA ESTE BLOQUE 'CASE' COMPLETO =====
       case 'checkout.session.completed': {
         const session = event.data.object;
         const isSub = session.mode === 'subscription' || !!session.subscription;
-
         const person = preferShippingThenBilling(session);
         const currency = (session.currency || 'eur').toUpperCase();
         const amountTotal = (session.amount_total ?? 0) / 100;
@@ -836,15 +809,11 @@ app.post('/webhook', async (req, res) => {
           items = li?.data || [];
         } catch (e) { console.warn('[listLineItems warn]', e?.message || e); }
 
-        // --- LLAMADA A logOrder MODIFICADA ---
         await logOrder({
           sessionId: session.id,
-          email, name, phone,
-          amountTotal, currency,
-          items, metadata, shipping,
+          email, name, phone, amountTotal, currency, items, metadata, shipping,
           status: session.payment_status || session.status || 'unknown',
           customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
-          // Campos de dirección añadidos
           address: person.address?.line1 || null,
           city: person.address?.city || null,
           postal: person.address?.postal_code || null,
@@ -861,7 +830,6 @@ app.post('/webhook', async (req, res) => {
               subscription_id: sub.id,
               email: cust?.email || email || null,
               name: cust?.name || name || null,
-              // Añadimos el teléfono que faltaba aquí también
               phone: cust?.phone || phone || null, 
               plan: sub.items?.data?.[0]?.price?.id || (sub.metadata?.subscription_grams ? `g${sub.metadata.subscription_grams}` : null),
               status: sub.status,
@@ -874,7 +842,6 @@ app.post('/webhook', async (req, res) => {
           } catch (e) { console.error('[suscripción alta ERROR]', e); }
         }
 
-        // Admin: solo ONE-OFF aquí (para suscripciones lo enviamos en subscription.created)
         if (!isSub) {
           try {
             await sendAdminEmail({
@@ -886,9 +853,7 @@ app.post('/webhook', async (req, res) => {
           } catch (e) { console.error('Email admin ERROR:', e); }
         }
 
-        // Cliente:
         if (!isSub) {
-          // One-off: confirmación aquí (y si COMBINE=true, se enviará además combinado en invoice.payment_succeeded)
           try {
             if (COMBINE_CONFIRMATION_AND_INVOICE) {
               await sendCustomerCombined({
@@ -909,15 +874,11 @@ app.post('/webhook', async (req, res) => {
               });
             }
           } catch (e) { console.error('Email cliente ONE-OFF ERROR:', e); }
-        } else {
-          // Suscripción: NUNCA enviar aquí al cliente (evita duplicados).
         }
-
         res.status(200).json({ received: true });
         return;
       }
 
-// ===== REEMPLAZA ESTE BLOQUE 'CASE' COMPLETO =====
       case 'customer.subscription.created': {
         const sub = event.data.object;
         try {
@@ -925,18 +886,13 @@ app.post('/webhook', async (req, res) => {
           const name = cust?.name || null;
           const email = cust?.email || null;
           const address = cust?.address || null;
-          // Añadimos el teléfono que faltaba
           const phone = cust?.phone || null; 
 
-          // upsert suscriptor (para que desde ahora customer.updated sí dispare emails)
           try {
-            // --- LLAMADA A upsertSubscriber MODIFICADA ---
             await upsertSubscriber({
               customer_id: sub.customer,
               subscription_id: sub.id,
-              email,
-              name,
-              phone, // <-- CAMPO DE TELÉFONO AÑADIDO
+              email, name, phone,
               plan: sub.items?.data?.[0]?.price?.id || (sub.metadata?.subscription_grams ? `g${sub.metadata.subscription_grams}` : null),
               status: sub.status,
               meta: { ...sub.metadata },
@@ -947,7 +903,6 @@ app.post('/webhook', async (req, res) => {
             });
           } catch (e) { console.error('[suscripción upsert ERROR]', e?.message || e); }
 
-          // Admin (solo aquí para suscripciones)
           if (CORPORATE_EMAIL) {
             const html = emailShell({
               header: 'Alta de suscripción',
@@ -967,26 +922,15 @@ app.post('/webhook', async (req, res) => {
             await sendEmail({ to: CORPORATE_EMAIL, subject: `Alta suscripción — ${BRAND}`, html });
           }
 
-          // Cliente:
-          if (!COMBINE_CONFIRMATION_AND_INVOICE) {
-            // Solo si NO combinamos, enviamos aquí la confirmación al cliente
-            if (email) {
+          if (!COMBINE_CONFIRMATION_AND_INVOICE && email) {
               await sendCustomerConfirmationOnly({
-                to: email,
-                name,
-                amountTotal: null,
-                currency: 'EUR',
-                items: [],
-                orderId: sub.id,
-                isSubscription: true,
+                to: email, name, amountTotal: null, currency: 'EUR',
+                items: [], orderId: sub.id, isSubscription: true,
                 customerId: sub.customer,
-                customer_details: { name, email, phone, address }, // Pasamos el teléfono
+                customer_details: { name, email, phone, address },
                 shipping: {},
               });
-            }
           }
-          // Si COMBINE=true, no enviamos aquí; lo hará invoice.payment_succeeded con el PDF.
-
         } catch (e) { console.error('[created email ERROR]', e?.message || e); }
 
         res.status(200).json({ received: true });
@@ -994,7 +938,6 @@ app.post('/webhook', async (req, res) => {
       }
 
       case 'customer.subscription.updated': {
-        // Ignoramos; los cambios de datos se gestionan en customer.updated
         return res.status(200).json({ received: true, note: 'subscription.updated ignored' });
       }
 
@@ -1036,7 +979,6 @@ app.post('/webhook', async (req, res) => {
 
       case 'invoice.payment_succeeded': {
         const inv = event.data.object;
-
         const firstTime = await markInvoiceMailedOnce(inv.id);
         if (!firstTime) { return res.status(200).json({ received: true, mailed: 'skipped-duplicate' }); }
 
@@ -1062,20 +1004,16 @@ app.post('/webhook', async (req, res) => {
         if (COMBINE_CONFIRMATION_AND_INVOICE) {
           try {
             await sendCustomerCombined({
-              to,
-              name,
+              to, name,
               invoiceNumber: inv.number || inv.id,
               total: (inv.amount_paid ?? inv.amount_due ?? 0) / 100,
               currency: (inv.currency || 'eur').toUpperCase(),
-              items,
-              customer: customerForPdf,
-              pdfUrl,
+              items, customer: customerForPdf, pdfUrl,
               isSubscription: !!inv.subscription || items.some(x => x?.price?.recurring),
               customerId: inv.customer,
             });
           } catch (e) { console.error('Combinado ERROR:', e); }
         }
-
         res.status(200).json({ received: true });
         return;
       }
@@ -1089,23 +1027,28 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ===== JSON normal después de /webhook =====
 app.use(express.json());
 
-// ===============================================
-// ===== RUTA /prices/resolve (ya la tenías) =====
-// ===============================================
+// ===== RUTAS PÚBLICAS =====
+
+// 1. Configuración (Precios dinámicos)
+app.get('/api/config', (req, res) => {
+  res.json({
+    subscriptionTable: SUB_PRICE_TABLE, 
+    allowedGrams: ALLOWED_SUB_GRAMS,
+  });
+});
+
+// 2. Resolver Precios (Carrito)
 app.post('/prices/resolve', async (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids) || !ids.length) {
     return res.status(400).json({ error: 'Se requiere un array de ids.' });
   }
-
   try {
     const results = await Promise.allSettled(
       ids.map(id => stripe.prices.retrieve(String(id), { expand: ['product'] }))
     );
-
     const pricesMap = {};
     results.forEach((result, index) => {
       if (result.status === 'fulfilled') {
@@ -1120,45 +1063,125 @@ app.post('/prices/resolve', async (req, res) => {
         console.warn(`[prices/resolve] No se pudo encontrar el price: ${ids[index]}`, result.reason?.message);
       }
     });
-
     res.json({ prices: pricesMap });
-
   } catch (e) {
     console.error('[prices/resolve] Error fatal:', e);
     res.status(500).json({ error: e.message || 'Error resolviendo precios' });
   }
 });
 
-// ===============================================
-// ===== 2. NUEVA RUTA DE CONTACTO AÑADIDA =====
-// ===============================================
-app.options('/api/contact', cors()); // Para la comprobación pre-flight de CORS
+// 3. Recuperar Suscripción (Magic Link Filtrado: Solo Activas)
+app.post('/api/recover-subscription', contactLimiter, async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email requerido' });
 
-app.post('/api/contact', contactLimiter, (req, res) => { // ¡Quitado 'async' para respuesta rápida!
+  try {
+    // Buscar clientes expandiendo suscripciones
+    const customers = await stripe.customers.list({ 
+      email, 
+      limit: 5, 
+      expand: ['data.subscriptions'] 
+    });
+
+    if (!customers.data.length) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return res.json({ ok: true, message: 'Si el email existe...' });
+    }
+
+    // Generar enlaces SOLO para clientes con suscripciones VIVAS
+    const linksData = await Promise.all(customers.data.map(async (cust) => {
+      // Filtramos: ¿Tiene alguna suscripción que NO esté cancelada?
+      const hasActiveSub = cust.subscriptions?.data?.some(sub => 
+        ['active', 'trialing', 'past_due'].includes(sub.status)
+      );
+
+      // Si todas sus suscripciones están canceladas o no tiene, lo saltamos
+      if (!hasActiveSub) return null;
+
+      try {
+        const session = await stripe.billingPortal.sessions.create({
+          customer: cust.id,
+          return_url: PORTAL_RETURN_URL,
+          ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {}),
+        });
+
+        const date = new Date(cust.created * 1000).toLocaleDateString('es-ES');
+        const address = cust.shipping?.address || cust.address;
+        const addressStr = address 
+          ? `${address.line1 || ''} ${address.city ? `(${address.city})` : ''}`.trim() 
+          : 'Sin dirección';
+
+        const mainSub = cust.subscriptions.data.find(s => ['active', 'trialing', 'past_due'].includes(s.status));
+        const priceLabel = (mainSub?.plan?.amount / 100) + ' €';
+
+        return {
+          url: session.url,
+          label: `Suscripción activa (${priceLabel}) — ${addressStr}`
+        };
+      } catch (err) {
+        return null;
+      }
+    }));
+
+    const validLinks = linksData.filter(Boolean);
+
+    if (!validLinks.length) {
+      return res.json({ ok: true });
+    }
+
+    // Construir HTML
+    const buttonsHtml = validLinks.map(link => `
+      <div style="margin-bottom: 16px; background: #f9fafb; padding: 12px; border-radius: 8px; border: 1px solid #e5e7eb;">
+        <p style="margin: 0 0 8px; font-size: 13px; color: #555; font-weight: 600;">
+          ${escapeHtml(link.label)}
+        </p>
+        <a href="${link.url}" style="display:block; text-decoration:none; color:#fff; background:${BRAND_PRIMARY}; padding:10px 16px; border-radius:6px; text-align:center; font-weight:bold; font-size:14px;">
+          Gestionar esta suscripción
+        </a>
+      </div>
+    `).join('');
+
+    // Enviar email
+    const html = emailShell({
+      header: 'Acceso a tu suscripción',
+      body: `
+        <tr><td style="padding:0 24px 12px;">
+          <p style="margin:0 0 12px; font:15px system-ui; color:#111;">Hola,</p>
+          <p style="margin:0 0 16px; font:14px system-ui; color:#374151;">
+            Aquí tienes el acceso a tus suscripciones <b>activas</b>. Haz clic abajo para gestionar la que necesites:
+          </p>
+          ${buttonsHtml}
+        </td></tr>
+        <tr><td style="padding:0 24px 12px;">
+          <p style="margin:0; font:12px system-ui; color:#9ca3af;">Este enlace es temporal y seguro.</p>
+        </td></tr>
+      `,
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}</p>`
+    });
+
+    await sendEmail({ to: email, subject: `Gestión de suscripciones — ${BRAND}`, html });
+    res.json({ ok: true });
+
+  } catch (e) {
+    console.error('[recover-subscription] error:', e);
+    res.status(500).json({ error: 'Error procesando la solicitud.' });
+  }
+});
+
+// 4. Contacto
+app.post('/api/contact', contactLimiter, (req, res) => {
   const { email, subject, message } = req.body;
-
-  // Validación rápida
   if (!email || !message || !subject) {
     return res.status(400).json({ error: 'Faltan campos requeridos.' });
   }
   if (email.toLowerCase() === CORPORATE_EMAIL.toLowerCase()) {
     return res.status(400).json({ error: 'Email inválido.' });
   }
-
-  // 1. Respondemos "OK" al frontend INMEDIATAMENTE.
   res.status(200).json({ ok: true });
-
-  // 2. Llamamos a la función "lenta" SIN 'await'.
-  //    Esto es "fire-and-forget". El servidor
-  //    sigue trabajando en segundo plano.
   sendContactEmails(req.body);
 });
-// ===============================================
-// ===== FIN DE LA RUTA DE CONTACTO ==============
-// ===============================================
 
-
-// ===== Checkout one-off =====
+// 5. Create Checkout
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { items = [], success_url, cancel_url, metadata = {} } = req.body || {};
@@ -1169,7 +1192,6 @@ app.post('/create-checkout-session', async (req, res) => {
       const priceId = it.price || it.priceId;
       if (!priceId) continue;
       const price = await stripe.prices.retrieve(String(priceId), { expand: ['product'] });
-
       const imgAbs = toAbsoluteUrl(it.image);
       const product_data = { name: String(it.title || it.name || price.product?.name || 'Producto') };
       if (imgAbs) { try { new URL(imgAbs); product_data.images = [imgAbs]; } catch { } }
@@ -1204,8 +1226,7 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// ===== Checkout suscripción =====
-app.options('/create-subscription-session', cors());
+// 6. Create Subscription
 app.post('/create-subscription-session', async (req, res) => {
   try {
     const { grams, currency = 'eur', metadata = {}, success_url, cancel_url } = req.body || {};
@@ -1240,7 +1261,6 @@ app.post('/create-subscription-session', async (req, res) => {
   }
 });
 
-// ===== Portal de cliente =====
 app.get('/billing-portal/link', async (req, res) => {
   try {
     const { customer_id, return: ret } = req.query;
@@ -1257,116 +1277,6 @@ app.get('/billing-portal/link', async (req, res) => {
   }
 });
 
-
-// ===== Recuperar acceso a suscripción (Magic Link Filtrado) =====
-app.post('/api/recover-subscription', contactLimiter, async (req, res) => {
-  const { email } = req.body;
-  
-  if (!email) return res.status(400).json({ error: 'Email requerido' });
-
-  try {
-    // 1. Buscar TODOS los clientes expandiendo sus suscripciones
-    const customers = await stripe.customers.list({ 
-      email, 
-      limit: 5, 
-      expand: ['data.subscriptions'] // <--- CLAVE: Pedimos los datos de suscripción
-    });
-
-    // Si no hay clientes, respuesta genérica de seguridad
-    if (!customers.data.length) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      return res.json({ ok: true, message: 'Si el email existe, se ha enviado el enlace.' });
-    }
-
-    // 2. Generar enlaces SOLO para clientes con suscripciones VIVAS
-    const linksData = await Promise.all(customers.data.map(async (cust) => {
-      // Filtramos: ¿Tiene alguna suscripción que NO esté cancelada?
-      // Aceptamos: active, trialing (prueba), past_due (pago fallido pero recuperable)
-      const hasActiveSub = cust.subscriptions?.data?.some(sub => 
-        ['active', 'trialing', 'past_due'].includes(sub.status)
-      );
-
-      // Si todas sus suscripciones están canceladas o no tiene, lo saltamos
-      if (!hasActiveSub) return null;
-
-      try {
-        const session = await stripe.billingPortal.sessions.create({
-          customer: cust.id,
-          return_url: PORTAL_RETURN_URL,
-          ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {}),
-        });
-
-        // Formatear etiqueta
-        const date = new Date(cust.created * 1000).toLocaleDateString('es-ES');
-        const address = cust.shipping?.address || cust.address;
-        const addressStr = address 
-          ? `${address.line1 || ''} ${address.city ? `(${address.city})` : ''}`.trim() 
-          : 'Sin dirección';
-
-        // Buscamos el plan para mostrarlo (opcional, coge el primero activo)
-        const mainSub = cust.subscriptions.data.find(s => ['active', 'trialing', 'past_due'].includes(s.status));
-        const priceLabel = (mainSub?.plan?.amount / 100) + ' €';
-
-        return {
-          url: session.url,
-          label: `Suscripción activa (${priceLabel}) — ${addressStr}`
-        };
-      } catch (err) {
-        return null;
-      }
-    }));
-
-    const validLinks = linksData.filter(Boolean);
-
-    // Si el usuario existe pero SOLO tiene suscripciones canceladas,
-    // validLinks estará vacío. En ese caso, no mandamos nada (o mandamos aviso genérico).
-    if (!validLinks.length) {
-      // Opcional: podrías mandar un email diciendo "No tienes suscripciones activas".
-      // Por ahora devolvemos OK para no dar pistas a atacantes.
-      return res.json({ ok: true });
-    }
-
-    // 3. Construir HTML
-    const buttonsHtml = validLinks.map(link => `
-      <div style="margin-bottom: 16px; background: #f9fafb; padding: 12px; border-radius: 8px; border: 1px solid #e5e7eb;">
-        <p style="margin: 0 0 8px; font-size: 13px; color: #555; font-weight: 600;">
-          ${escapeHtml(link.label)}
-        </p>
-        <a href="${link.url}" style="display:block; text-decoration:none; color:#fff; background:${BRAND_PRIMARY}; padding:10px 16px; border-radius:6px; text-align:center; font-weight:bold; font-size:14px;">
-          Gestionar esta suscripción
-        </a>
-      </div>
-    `).join('');
-
-    // 4. Enviar email
-    const html = emailShell({
-      header: 'Acceso a tu suscripción',
-      body: `
-        <tr><td style="padding:0 24px 12px;">
-          <p style="margin:0 0 12px; font:15px system-ui; color:#111;">Hola,</p>
-          <p style="margin:0 0 16px; font:14px system-ui; color:#374151;">
-            Aquí tienes el acceso a tus suscripciones <b>activas</b>. Haz clic abajo para gestionar la que necesites:
-          </p>
-          ${buttonsHtml}
-        </td></tr>
-        <tr><td style="padding:0 24px 12px;">
-          <p style="margin:0; font:12px system-ui; color:#9ca3af;">Este enlace es temporal y seguro.</p>
-        </td></tr>
-      `,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}</p>`
-    });
-
-    await sendEmail({ to: email, subject: `Gestión de suscripciones — ${BRAND}`, html });
-
-    res.json({ ok: true });
-
-  } catch (e) {
-    console.error('[recover-subscription] error:', e);
-    res.status(500).json({ error: 'Error procesando la solicitud.' });
-  }
-});
-
-// ===== Test email =====
 app.get('/test-email', async (req, res) => {
   try {
     if (!CORPORATE_EMAIL) return res.status(400).json({ ok: false, error: 'CORPORATE_EMAIL no definido' });
@@ -1377,17 +1287,5 @@ app.get('/test-email', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.status(404).send('Not found'));
-
-
-// ===== Configuración pública =====
-app.get('/api/config/prices', (req, res) => {
-  // Devolvemos la tabla de precios (en céntimos, tal cual la tiene el backend)
-  // Esto permite que el frontend pueda consultarla si quisieras implementar
-  // una sincronización 100% dinámica en el futuro.
-  res.json({
-    subscription: SUB_PRICE_TABLE,
-    allowedGrams: ALLOWED_SUB_GRAMS
-  });
-});
 
 app.listen(PORT, () => { console.log(`API listening on :${PORT}`); });
