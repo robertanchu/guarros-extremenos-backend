@@ -1,4 +1,4 @@
-// server.js — Backend v3 (Final con corrección Proxy + Filtro Activas + Config dinámica)
+// server.js — Backend v3.1 (Final: Proxy + Filtro Activas + Renovaciones + Cobro Día 1)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -14,9 +14,8 @@ const { Pool } = pg;
 
 const app = express();
 
-// 🟢 1. CORRECCIÓN IMPORTANTE PARA RENDER:
-// Esto arregla el error "ERR_ERL_UNEXPECTED_X_FORWARDED_FOR" confiando en el proxy de Render
-app.set('trust proxy', 1);
+// 🟢 CRÍTICO PARA RENDER: Permite que el Rate Limit funcione tras el proxy
+app.set('trust proxy', 1); 
 
 const PORT = process.env.PORT || 10000;
 
@@ -55,7 +54,6 @@ const contactLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutos
   max: 5, // max 5 correos por IP
   message: { error: 'Demasiados intentos, por favor espera un poco.' },
-  // standardHeaders y legacyHeaders ayudan a que los proxies entiendan los limites
   standardHeaders: true, 
   legacyHeaders: false,
 });
@@ -79,107 +77,37 @@ const ALLOWED_SUB_GRAMS = Object.keys(SUB_PRICE_TABLE).map(Number);
 
 // ===== DB =====
 const pool = process.env.DATABASE_URL
-  ? new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { require: true, rejectUnauthorized: false },
-      max: 5
-    })
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { require: true, rejectUnauthorized: false }, max: 5 })
   : null;
 
-// Verificación crítica al iniciar el servidor
 if (!pool) {
-  console.error('\n🚨🚨🚨 [ERROR FATAL] NO SE DETECTÓ DATABASE_URL 🚨🚨🚨');
-  console.error('La aplicación NO guardará pedidos ni usuarios. Revisa tu archivo .env\n');
+  console.error('\n🚨 [ERROR FATAL] NO SE DETECTÓ DATABASE_URL 🚨\n');
 } else {
   console.log('✅ Conexión a Base de Datos configurada');
 }
 
 async function dbQuery(text, params) {
-  // 1. Si no hay pool, lanzamos error FATAL para que el proceso se entere
-  if (!pool) {
-    const errorMsg = 'Intento de consulta a DB sin conexión activa (DATABASE_URL faltante).';
-    console.error(`[DB CRITICAL] ${errorMsg}`);
-    throw new Error(errorMsg); 
-  }
-
-  try {
-    // 2. Ejecutamos la consulta real
-    return await pool.query(text, params);
-  } catch (e) {
-    // 3. Si la consulta falla (ej: error de sintaxis o conexión caída), lo logueamos y re-lanzamos
-    console.error('[DB QUERY ERROR]', e.message, '\nQuery:', text);
-    throw e; // Importante: Lanzar el error para que el Webhook de Stripe sepa que falló y reintente
-  }
+  if (!pool) throw new Error('DB query failed: No connection pool.');
+  try { return await pool.query(text, params); }
+  catch (e) { console.error('[DB QUERY ERROR]', e.message); throw e; }
 }
 
+// Inicialización de tablas
 (async () => {
   if (!pool) return;
-  await dbQuery(`CREATE TABLE IF NOT EXISTS processed_events(
-    event_id text PRIMARY KEY,
-    created_at timestamptz DEFAULT now()
-  )`);
-  await dbQuery(`CREATE TABLE IF NOT EXISTS mailed_invoices(
-    invoice_id text PRIMARY KEY,
-    sent_at timestamptz DEFAULT now()
-  )`);
-  await dbQuery(`CREATE TABLE IF NOT EXISTS orders(
-    session_id text PRIMARY KEY,
-    email text,
-    name text,
-    phone text,
-    total numeric,
-    currency text,
-    items jsonb,
-    metadata jsonb,
-    shipping jsonb,
-    status text,
-    customer_details jsonb,
-    address text,
-    city text,
-    postal text,
-    country text,
-    created_at timestamptz DEFAULT now()
-  )`);
-  await dbQuery(`CREATE TABLE IF NOT EXISTS order_items(
-    id SERIAL PRIMARY KEY,
-    session_id text REFERENCES orders(session_id),
-    description text,
-    product_id text,
-    price_id text,
-    quantity int,
-    unit_amount_cents int,
-    amount_total_cents int,
-    currency text,
-    raw jsonb
-  )`);
-  await dbQuery(`CREATE TABLE IF NOT EXISTS subscribers(
-    customer_id text PRIMARY KEY,
-    subscription_id text,
-    email text,
-    plan text,
-    status text,
-    name text,
-    phone text,
-    address text,
-    city text,
-    postal text,
-    country text,
-    meta jsonb,
-    created_at timestamptz DEFAULT now(),
-    updated_at timestamptz DEFAULT now(),
-    canceled_at timestamptz
-  )`);
+  await dbQuery(`CREATE TABLE IF NOT EXISTS processed_events(event_id text PRIMARY KEY, created_at timestamptz DEFAULT now())`);
+  await dbQuery(`CREATE TABLE IF NOT EXISTS mailed_invoices(invoice_id text PRIMARY KEY, sent_at timestamptz DEFAULT now())`);
+  await dbQuery(`CREATE TABLE IF NOT EXISTS orders(session_id text PRIMARY KEY, email text, name text, phone text, total numeric, currency text, items jsonb, metadata jsonb, shipping jsonb, status text, customer_details jsonb, address text, city text, postal text, country text, created_at timestamptz DEFAULT now())`);
+  await dbQuery(`CREATE TABLE IF NOT EXISTS order_items(id SERIAL PRIMARY KEY, session_id text REFERENCES orders(session_id), description text, product_id text, price_id text, quantity int, unit_amount_cents int, amount_total_cents int, currency text, raw jsonb)`);
+  await dbQuery(`CREATE TABLE IF NOT EXISTS subscribers(customer_id text PRIMARY KEY, subscription_id text, email text, plan text, status text, name text, phone text, address text, city text, postal text, country text, meta jsonb, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), canceled_at timestamptz)`);
 })();
 
 // ===== Utils =====
-const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-
+const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 const fmt = (amount = 0, currency = 'EUR') => {
   try { return new Intl.NumberFormat('es-ES', { style: 'currency', currency }).format(Number(amount)); }
   catch { return `${Number(amount).toFixed(2)} ${currency}`; }
 };
-
 const toAbsoluteUrl = (u) => {
   if (!u) return null;
   try {
@@ -188,172 +116,87 @@ const toAbsoluteUrl = (u) => {
     return `${FRONT_BASE}${clean}`;
   } catch { return null; }
 };
-
 const preferShippingThenBilling = (session) => {
   const billing = session?.customer_details || {};
   const shipping = session?.shipping_details || {};
-  const address = shipping?.address || billing?.address || null;
-  const name = shipping?.name || billing?.name || null;
-  const phone = billing?.phone || null;
-  const email = billing?.email || session?.customer_email || null;
-  return { name, email, phone, address };
+  return { 
+    name: shipping?.name || billing?.name || null,
+    email: billing?.email || session?.customer_email || null,
+    phone: billing?.phone || null,
+    address: shipping?.address || billing?.address || null
+  };
 };
-
 const fmtAddressHTML = (cust = {}, fallback = {}) => {
   const addr = cust?.address || fallback?.address || null;
-  const lines = [
-    cust?.name || fallback?.name,
-    cust?.email,
-    cust?.phone,
-    addr?.line1,
-    addr?.line2,
-    [addr?.postal_code, addr?.city].filter(Boolean).join(' '),
-    addr?.state,
-    addr?.country
-  ].filter(Boolean);
-  if (!lines.length) return '<em>-</em>';
-  return lines.map(escapeHtml).join('<br/>');
+  const lines = [cust?.name || fallback?.name, cust?.email, cust?.phone, addr?.line1, addr?.line2, [addr?.postal_code, addr?.city].filter(Boolean).join(' '), addr?.state, addr?.country].filter(Boolean);
+  return lines.length ? lines.map(escapeHtml).join('<br/>') : '<em>-</em>';
 };
-
-const extractInvoiceCustomer = (inv) => {
-  const name =
-    inv?.customer_details?.name ??
-    inv?.customer_name ??
-    inv?.customer_shipping?.name ??
-    null;
-
-  const email =
-    inv?.customer_details?.email ??
-    inv?.customer_email ??
-    null;
-
-  const phone =
-    inv?.customer_details?.phone ??
-    null;
-
-  const address =
-    inv?.customer_details?.address ??
-    inv?.customer_address ??
-    inv?.customer_shipping?.address ??
-    null;
-
-  return { name, email, phone, address };
-};
+const extractInvoiceCustomer = (inv) => ({
+  name: inv?.customer_details?.name ?? inv?.customer_name ?? inv?.customer_shipping?.name ?? null,
+  email: inv?.customer_details?.email ?? inv?.customer_email ?? null,
+  phone: inv?.customer_details?.phone ?? null,
+  address: inv?.customer_details?.address ?? inv?.customer_address ?? inv?.customer_shipping?.address ?? null
+});
 
 // ===== Email layout =====
 function emailShell({ header, body, footer }) {
-  return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-  <body style="margin:0;padding:0;background:#f3f4f6;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6; padding:24px 0;">
-    <tr><td>
-      <table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)">
-        <tr><td style="padding:24px;text-align:center;">
-          ${BRAND_LOGO_URL ? `<img src="${BRAND_LOGO_URL}" alt="${escapeHtml(BRAND)}" width="200" style="display:block;margin:0 auto 8px;max-width:200px;height:auto"/>` : `<div style="font-size:20px;font-weight:800;color:${BRAND_PRIMARY};text-align:center;margin-bottom:8px">${escapeHtml(BRAND)}</div>`}
-          <div style="font:800 20px system-ui; color:${BRAND_PRIMARY}; letter-spacing:.3px">${escapeHtml(header)}</div>
-        </td></tr>
-        ${body}
-        <tr><td style="padding:16px 24px 24px;"><div style="height:1px;background:#e5e7eb;margin-bottom:12px"></div>${footer}</td></tr>
-      </table>
-    </td></tr>
-  </table>
-  </body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head><body style="margin:0;padding:0;background:#f3f4f6;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6; padding:24px 0;"><tr><td><table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)"><tr><td style="padding:24px;text-align:center;">${BRAND_LOGO_URL ? `<img src="${BRAND_LOGO_URL}" alt="${escapeHtml(BRAND)}" width="200" style="display:block;margin:0 auto 8px;max-width:200px;height:auto"/>` : `<div style="font-size:20px;font-weight:800;color:${BRAND_PRIMARY};text-align:center;margin-bottom:8px">${escapeHtml(BRAND)}</div>`}<div style="font:800 20px system-ui; color:${BRAND_PRIMARY}; letter-spacing:.3px">${escapeHtml(header)}</div></td></tr>${body}<tr><td style="padding:16px 24px 24px;"><div style="height:1px;background:#e5e7eb;margin-bottom:12px"></div>${footer}</td></tr></table></td></tr></table></body></html>`;
 }
-
-const lineItemsHTML = (items = [], currency = 'EUR') =>
-  (items || []).length
-    ? items.map(li => {
-      const total = (li.amount_total ?? li.amount ?? 0) / 100;
-      const unit = li?.price?.unit_amount != null ? (li.price.unit_amount / 100) : null;
-      return `<tr>
-  <td style="padding:10px 0; font-size:14px; color:#111827;">${escapeHtml(li.description || '')}${unit ? `<div style="font-size:12px;color:#6b7280;margin-top:2px;">Precio unidad: ${unit.toLocaleString('es-ES', { style: 'currency', currency })}</div>` : ''}</td>
-  <td style="padding:10px 0; font-size:14px; text-align:center; white-space:nowrap;">x${li.quantity || 1}</td>
-  <td style="padding:10px 0; font-size:14px; text-align:right; white-space:nowrap;">${total.toLocaleString('es-ES', { style: 'currency', currency })}</td>
-</tr>`;
-    }).join('')
-    : `<tr><td colspan="3" style="padding:8px 0;color:#6b7280">Sin productos</td></tr>`;
+const lineItemsHTML = (items = [], currency = 'EUR') => (items || []).length ? items.map(li => {
+  const total = (li.amount_total ?? li.amount ?? 0) / 100;
+  const unit = li?.price?.unit_amount != null ? (li.price.unit_amount / 100) : null;
+  return `<tr><td style="padding:10px 0; font-size:14px; color:#111827;">${escapeHtml(li.description || '')}${unit ? `<div style="font-size:12px;color:#6b7280;margin-top:2px;">Precio unidad: ${unit.toLocaleString('es-ES', { style: 'currency', currency })}</div>` : ''}</td><td style="padding:10px 0; font-size:14px; text-align:center; white-space:nowrap;">x${li.quantity || 1}</td><td style="padding:10px 0; font-size:14px; text-align:right; white-space:nowrap;">${total.toLocaleString('es-ES', { style: 'currency', currency })}</td></tr>`;
+}).join('') : `<tr><td colspan="3" style="padding:8px 0;color:#6b7280">Sin productos</td></tr>`;
 
 // ===== PDF =====
 async function buildReceiptPDF({ invoiceNumber, total, currency = 'EUR', customer = {}, items = [], paidAt = new Date() }) {
   const doc = new PDFDocument({ size: 'A4', margins: { top: 56, bottom: 56, left: 56, right: 56 } });
   const bufs = [];
   const done = new Promise((res, rej) => { doc.on('data', b => bufs.push(b)); doc.on('end', () => res(Buffer.concat(bufs))); doc.on('error', rej); });
-
   try {
     if (BRAND_LOGO_URL) {
       const r = await fetch(BRAND_LOGO_URL);
       if (r.ok) { const buf = Buffer.from(await r.arrayBuffer()); doc.image(buf, 56, 56, { fit: [140, 60] }); }
-      else { doc.font('Helvetica-Bold').fontSize(20).text(BRAND, 56, 56); }
-    } else { doc.font('Helvetica-Bold').fontSize(20).text(BRAND, 56, 56); }
+      else doc.font('Helvetica-Bold').fontSize(20).text(BRAND, 56, 56);
+    } else doc.font('Helvetica-Bold').fontSize(20).text(BRAND, 56, 56);
   } catch { doc.font('Helvetica-Bold').fontSize(20).text(BRAND, 56, 56); }
 
   doc.font('Helvetica-Bold').fontSize(18).fillColor(BRAND_PRIMARY).text('RECIBO DE PAGO', 56, 56, { align: 'right' });
   doc.moveDown(3.2);
-
   doc.font('Helvetica').fontSize(10).fillColor('#111');
   const paidFmt = new Intl.DateTimeFormat('es-ES', { dateStyle: 'medium', timeStyle: 'short' }).format(paidAt);
-  const invText = [`Nº Recibo: ${invoiceNumber || 's/n'}`, `Fecha de pago: ${paidFmt}`, `Estado: PAGADO`].join('\n');
-  doc.text(invText, 56, 56 + 70, { width: 200 });
+  doc.text([`Nº Recibo: ${invoiceNumber || 's/n'}`, `Fecha de pago: ${paidFmt}`, `Estado: PAGADO`].join('\n'), 56, 56 + 70, { width: 200 });
 
   const addr = customer?.address || {};
-  const custLines = [
-    customer?.name,
-    customer?.email,
-    customer?.phone,
-    addr.line1,
-    addr.line2,
-    [addr.postal_code, addr.city].filter(Boolean).join(' '),
-    addr.state,
-    addr.country
-  ].filter(Boolean).join('\n');
+  const custLines = [customer?.name, customer?.email, customer?.phone, addr.line1, addr.line2, [addr.postal_code, addr.city].filter(Boolean).join(' '), addr.state, addr.country].filter(Boolean).join('\n');
   doc.font('Helvetica-Bold').fontSize(11).fillColor('#111').text('Cliente', 316, 146, { width: 220, align: 'right' });
   doc.moveDown(0.1);
   doc.font('Helvetica').fontSize(10).text(custLines || '-', 316, doc.y, { width: 220, align: 'right' });
 
-  doc.moveDown(1.2);
-  doc.rect(56, doc.y + 4, 480, 0.7).fill('#e5e7eb').fillColor('#111');
-  doc.moveDown(1.2);
-
+  doc.moveDown(1.2); doc.rect(56, doc.y + 4, 480, 0.7).fill('#e5e7eb').fillColor('#111'); doc.moveDown(1.2);
   doc.font('Helvetica-Bold').fontSize(10);
   const startY = doc.y;
-  doc.text('Concepto', 56, startY, { width: 280 });
-  doc.text('Cant.', 336, startY, { width: 60, align: 'right' });
-  doc.text('Total', 396, startY, { width: 140, align: 'right' });
-  doc.moveDown(0.3);
-  doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
-  doc.moveDown(0.6);
+  doc.text('Concepto', 56, startY, { width: 280 }); doc.text('Cant.', 336, startY, { width: 60, align: 'right' }); doc.text('Total', 396, startY, { width: 140, align: 'right' });
+  doc.moveDown(0.3); doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111'); doc.moveDown(0.6);
 
   doc.font('Helvetica').fontSize(10);
   let grand = 0;
   for (const li of (items || [])) {
-    const qty = li.quantity || 1;
-    const desc = li.description || '';
     const lineTotal = (li.amount_total ?? li.amount ?? 0) / 100;
     grand += lineTotal;
     const y = doc.y;
-    doc.text(desc, 56, y, { width: 280 });
-    doc.text(String(qty), 336, y, { width: 60, align: 'right' });
-    doc.text(fmt(lineTotal, currency), 396, y, { width: 140, align: 'right' });
+    doc.text(li.description || '', 56, y, { width: 280 }); doc.text(String(li.quantity || 1), 336, y, { width: 60, align: 'right' }); doc.text(fmt(lineTotal, currency), 396, y, { width: 140, align: 'right' });
     doc.moveDown(0.4);
   }
-
-  doc.moveDown(0.4);
-  doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111');
-  doc.moveDown(0.6);
-  doc.font('Helvetica-Bold');
-  doc.text('Total', 56, doc.y, { width: 280 });
-  doc.text(fmt(grand || total || 0, currency), 396, doc.y, { width: 140, align: 'right' });
+  doc.moveDown(0.4); doc.rect(56, doc.y, 480, 0.7).fill('#e5e7eb').fillColor('#111'); doc.moveDown(0.6);
+  doc.font('Helvetica-Bold'); doc.text('Total', 56, doc.y, { width: 280 }); doc.text(fmt(grand || total || 0, currency), 396, doc.y, { width: 140, align: 'right' });
   doc.moveDown(1.2);
-
-  doc.font('Helvetica').fontSize(9).fillColor('#6b7280').text(
-    'Este documento sirve como justificación de pago. Para información fiscal consulte la factura de Stripe adjunta (si procede).',
-    56, doc.y, { width: 480, align: 'right' }
-  );
-
+  doc.font('Helvetica').fontSize(9).fillColor('#6b7280').text('Documento justificativo de pago.', 56, doc.y, { width: 480, align: 'right' });
   doc.end();
   return await done;
 }
 
-// ===== Email =====
+// ===== Email Sending =====
 async function sendSMTP({ from, to, subject, html, attachments, bcc = [] }) {
   const transporter = nodemailer.createTransport({ host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, auth: { user: SMTP_USER, pass: SMTP_PASS } });
   await transporter.verify();
@@ -365,51 +208,13 @@ async function sendEmail({ to, subject, html, attachments, bcc = [] }) {
     await resend.emails.send({ from: CUSTOMER_FROM, to, subject, html, attachments, ...(bcc.length ? { bcc } : {}) });
     return;
   }
-  if (SMTP_HOST && SMTP_USER && SMTP_PASS) { await sendSMTP({ from: CUSTOMER_FROM, to, subject, html, attachments, bcc }); return; }
+  if (SMTP_HOST && SMTP_USER) { await sendSMTP({ from: CUSTOMER_FROM, to, subject, html, attachments, bcc }); return; }
   console.warn('[email] No provider configured');
 }
-
-async function sendAdminEmail({ session, items = [], customerEmail, name, phone, amountTotal, currency, customer_details, shipping }) {
+async function sendAdminEmail({ session, items, customerEmail, name, phone, amountTotal, currency, customer_details, shipping }) {
   if (!CORPORATE_EMAIL) return;
-  const subject = (session?.mode === 'subscription' ? 'Suscripción' : 'Pedido') + ' - ' + (session?.id || '');
-  const body = `
-<tr><td style="padding:0 24px 8px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111">Nuevo ${session?.mode === 'subscription' ? 'ALTA DE SUSCRIPCIÓN' : 'PEDIDO'}</p>
-  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
-    <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
-    <li><b>Email:</b> ${escapeHtml(customerEmail || '-')}</li>
-    <li><b>Teléfono:</b> ${escapeHtml(phone || '-')}</li>
-    <li><b>Sesión:</b> ${escapeHtml(session?.id || '-')}</li>
-    <li><b>Modo:</b> ${escapeHtml(session?.mode || '-')}</li>
-  </ul>
-</td></tr>
-<tr><td style="padding:8px 24px;">
-  <div style="height:1px;background:#e5e7eb;"></div>
-  <p style="margin:8px 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
-  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML(customer_details || {}, { address: shipping, name })}</div>
-</td></tr>
-<tr><td style="padding:8px 24px 0;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
-    <thead>
-      <tr>
-        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
-        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
-        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
-      </tr>
-    </thead>
-    <tbody>${lineItemsHTML(items, currency)}</tbody>
-    <tfoot>
-      <tr><td colspan="3"><div style="height:1px;background:#e5e7eb;"></div></td></tr>
-      <tr>
-        <td style="padding:12px 0; font-size:14px; color:#111; font-weight:700;">Total</td>
-        <td></td>
-        <td style="padding:12px 0; font-size:16px; color:#111; font-weight:800; text-align:right;">${fmt(Number(amountTotal || 0), currency)}</td>
-      </tr>
-    </tfoot>
-  </table>
-</td></tr>`;
-  const html = emailShell({ header: 'Nuevo pedido web', body, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>` });
-  await sendEmail({ to: CORPORATE_EMAIL, subject, html });
+  const body = `<tr><td style="padding:0 24px 8px;"><p style="margin:0 0 10px; font:15px system-ui; color:#111">Nuevo ${session?.mode === 'subscription' ? 'ALTA DE SUSCRIPCIÓN' : 'PEDIDO'}</p><ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui"><li><b>Nombre:</b> ${escapeHtml(name || '-')}</li><li><b>Email:</b> ${escapeHtml(customerEmail || '-')}</li><li><b>Teléfono:</b> ${escapeHtml(phone || '-')}</li><li><b>Sesión:</b> ${escapeHtml(session?.id || '-')}</li></ul></td></tr><tr><td style="padding:8px 24px;"><div style="height:1px;background:#e5e7eb;"></div><p style="margin:8px 0 6px; font:600 13px system-ui; color:#111">Dirección</p><div style="font:13px system-ui; color:#374151">${fmtAddressHTML(customer_details || {}, { address: shipping, name })}</div></td></tr><tr><td style="padding:8px 24px 0;"><table role="presentation" width="100%">${lineItemsHTML(items, currency)}<tfoot><tr><td colspan="3"><div style="height:1px;background:#e5e7eb;"></div></td></tr><tr><td>Total</td><td></td><td align="right">${fmt(Number(amountTotal || 0), currency)}</td></tr></tfoot></table></td></tr>`;
+  await sendEmail({ to: CORPORATE_EMAIL, subject: `Nuevo pedido - ${BRAND}`, html: emailShell({ header: 'Nuevo pedido web', body, footer: '' }) });
 }
 
 // 🟢 NUEVO: EMAIL AL ADMIN CUANDO SE RENUEVA (PAGO RECURRENTE)
@@ -436,45 +241,11 @@ async function sendAdminRenewalEmail({ customer, total, currency, subscriptionId
   await sendEmail({ to: CORPORATE_EMAIL, subject, html });
 }
 
-async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, items, orderId, isSubscription, customerId, customer_details, shipping }) {
+async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, items, isSubscription, customerId, customer_details, shipping }) {
   if (!to) return;
-  const subject = (isSubscription ? 'Confirmación suscripción' : 'Confirmación de pedido') + (orderId ? ' #' + orderId : '') + ' — ' + BRAND;
-  const intro = isSubscription ? `Gracias por suscribirte a ${BRAND}. Tu suscripción ha quedado activada correctamente.` : `Gracias por tu compra en ${BRAND}. Tu pago se ha recibido correctamente.`;
-  const body = `
-<tr><td style="padding:0 24px 8px;">
-  <p style="margin:0 0 12px; font:15px system-ui; color:#111;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
-  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">${escapeHtml(intro)}</p>
-</td></tr>
-<tr><td style="padding:8px 24px;">
-  <div style="height:1px;background:#e5e7eb;"></div>
-  <p style="margin:8px 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
-  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML(customer_details || {}, { address: shipping, name })}</div>
-</td></tr>
-<tr><td style="padding:0 24px 8px;"><div style="height:1px;background:#e5e7eb;"></div></td></tr>
-<tr><td style="padding:8px 24px 0;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
-    <thead>
-      <tr>
-        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
-        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
-        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
-      </tr>
-    </thead>
-    <tbody>${lineItemsHTML(items, currency)}</tbody>
-    <tfoot>
-      <tr><td colspan="3"><div style="height:1px;background:#e5e7eb;"></div></td></tr>
-      <tr>
-        <td style="padding:12px 0; font-size:14px; color:#111; font-weight:700;">Total ${isSubscription ? 'primer cargo' : ''}</td>
-        <td></td>
-        <td style="padding:12px 0; font-size:16px; color:#111; font-weight:800; text-align:right;">${fmt(Number(amountTotal || 0), currency)}</td>
-      </tr>
-    </tfoot>
-  </table>
-</td></tr>
-${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a href="${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId || '')}&return=${encodeURIComponent(PORTAL_RETURN_URL)}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripción</a></td></tr>` : ''}`;
-  const html = emailShell({ header: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido', body, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>` });
-  const bcc = CUSTOMER_BCC_CORPORATE && CORPORATE_EMAIL ? [CORPORATE_EMAIL] : [];
-  await sendEmail({ to, subject, html, bcc });
+  const intro = isSubscription ? `Suscripción activada correctamente.` : `Tu pago se ha recibido correctamente.`;
+  const body = `<tr><td style="padding:0 24px 8px;"><p>Hola ${escapeHtml(name || '')},</p><p>${escapeHtml(intro)}</p></td></tr><tr><td style="padding:8px 24px;"><div style="height:1px;background:#e5e7eb;"></div><div style="font:13px system-ui;">${fmtAddressHTML(customer_details || {}, { address: shipping, name })}</div></td></tr><tr><td style="padding:8px 24px 0;"><table role="presentation" width="100%">${lineItemsHTML(items, currency)}<tfoot><tr><td>Total</td><td></td><td align="right">${fmt(Number(amountTotal || 0), currency)}</td></tr></tfoot></table></td></tr>${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a href="${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId || '')}&return=${encodeURIComponent(PORTAL_RETURN_URL)}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;padding:10px 16px;border-radius:10px;">Gestionar suscripción</a></td></tr>` : ''}`;
+  await sendEmail({ to, subject: 'Confirmación de pedido', html: emailShell({ header: 'Pedido confirmado', body, footer: '' }) });
 }
 
 // 🟢 MODIFICADO: Recibe flag `isRenewal` para cambiar el texto
@@ -510,551 +281,156 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
 
   await sendEmail({ to, subject, html: emailShell({ header, body, footer: '' }), attachments });
 }
-// ===== Emails cancelación =====
-async function sendCancelEmails({ customerEmail, name, subId, customerAddress }) {
-  const subject = `🛑 Suscripción cancelada — ${BRAND}`;
-  const bodyCustomer = `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
-  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">Hemos procesado la cancelación de tu suscripción.</p>
-  <p style="margin:0 0 10px; font:13px system-ui; color:#6b7280;">ID suscripción: <b>${escapeHtml(subId || '-')}</b></p>
-  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tus datos</p>
-  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ address: customerAddress, name, email: customerEmail })}</div>
-</td></tr>`.trim();
 
-  const htmlCustomer = emailShell({
-    header: 'Suscripción cancelada',
-    body: bodyCustomer,
-    footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">Si no reconoces esta acción, responde a este correo o escríbenos a ${escapeHtml(SUPPORT_EMAIL)}.</p>`
-  });
-
-  if (customerEmail) await sendEmail({ to: customerEmail, subject, html: htmlCustomer });
-
-  if (CORPORATE_EMAIL) {
-    const bodyAdmin = `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">Se ha cancelado una suscripción.</p>
-  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
-    <li><b>ID suscripción:</b> ${escapeHtml(subId || '-')}</li>
-    <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
-    <li><b>Email:</b> ${escapeHtml(customerEmail || '-')}</li>
-  </ul>
-  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
-  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ address: customerAddress, name, email: customerEmail })}</div>
-</td></tr>`.trim();
-
-    const htmlAdmin = emailShell({
-      header: 'Suscripción cancelada',
-      body: bodyAdmin,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
-    });
-
-    await sendEmail({ to: CORPORATE_EMAIL, subject: `Cancelación suscripción — ${BRAND}`, html: htmlAdmin });
-  }
+async function sendCancelEmails({ customerEmail, name, subId }) {
+  if (customerEmail) await sendEmail({ to: customerEmail, subject: 'Suscripción cancelada', html: emailShell({ header: 'Suscripción cancelada', body: `<tr><td style="padding:0 24px;"><p>Hola ${escapeHtml(name)}, tu suscripción ${escapeHtml(subId)} ha sido cancelada.</p></td></tr>`, footer: '' }) });
 }
-
-// ===== Emails actualización de cliente =====
-function summarizeCustomerChanges(prev = {}, cust = {}) {
-  const lines = [];
-  if ('name' in prev)        lines.push(`• Nombre: ${escapeHtml(prev.name ?? '-')} → ${escapeHtml(cust.name ?? '-')} `);
-  if ('email' in prev)       lines.push(`• Email: ${escapeHtml(prev.email ?? '-')} → ${escapeHtml(cust.email ?? '-')} `);
-  if ('phone' in prev)       lines.push(`• Teléfono: ${escapeHtml(prev.phone ?? '-')} → ${escapeHtml(cust.phone ?? '-')} `);
-  if ('address' in prev) {
-    const before = prev.address || {};
-    const after  = cust.address || {};
-    const addrStr = (a) => [a.line1, a.line2, [a.postal_code, a.city].filter(Boolean).join(' '), a.state, a.country].filter(Boolean).join(', ');
-    lines.push(`• Dirección: ${escapeHtml(addrStr(before) || '-')} → ${escapeHtml(addrStr(after) || '-')}`);
-  }
-  if (prev?.invoice_settings?.default_payment_method !== undefined) {
-    lines.push('• Método de pago por defecto actualizado.');
-  }
-  if (!lines.length) return 'Se han actualizado tus datos de cliente.';
-  return lines.join('<br/>');
-}
-
-async function subscriberExists(customer_id) {
-  if (!pool) return false;
-  const { rows } = await dbQuery(`SELECT 1 FROM subscribers WHERE customer_id = $1 LIMIT 1`, [customer_id]);
-  return rows?.length > 0;
-}
-
 async function sendCustomerUpdatedEmails({ cust, summaryHtml }) {
-  const name = cust?.name || '';
-  const email = cust?.email || '';
-  const address = cust?.address || null;
-
-  if (email) {
-    const htmlCustomer = emailShell({
-      header: 'Datos de cliente actualizados',
-      body: `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
-  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">${summaryHtml}</p>
-  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tus datos actuales</p>
-  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ name, email, address })}</div>
-</td></tr>`,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">Si no reconoces esta acción, respóndenos o escribe a ${escapeHtml(SUPPORT_EMAIL)}.</p>`
-    });
-    await sendEmail({ to: email, subject: `✅ Datos actualizados — ${BRAND}`, html: htmlCustomer });
-  }
-
-  if (CORPORATE_EMAIL) {
-    const htmlAdmin = emailShell({
-      header: 'Cliente actualizado',
-      body: `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 8px; font:15px system-ui; color:#111;">Un cliente ha actualizado sus datos.</p>
-  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
-    <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
-    <li><b>Email:</b> ${escapeHtml(email || '-')}</li>
-    <li><b>ID cliente:</b> ${escapeHtml(cust?.id || '-')}</li>
-  </ul>
-  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Resumen de cambios</p>
-  <div style="font:13px system-ui; color:#374151">${summaryHtml}</div>
-  <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Datos actuales</p>
-  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ name, email, address })}</div>
-</td></tr>`,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
-    });
-    await sendEmail({ to: CORPORATE_EMAIL, subject: `Cliente actualizado — ${BRAND}`, html: htmlAdmin });
-  }
+  if (cust.email) await sendEmail({ to: cust.email, subject: 'Datos actualizados', html: emailShell({ header: 'Datos actualizados', body: `<tr><td style="padding:0 24px;"><p>${summaryHtml}</p></td></tr>`, footer: '' }) });
 }
-
 async function sendContactEmails(payload) {
-  const { name, email, subject, message } = payload;
-  
-  try {
-    const subjectAdmin = `Mensaje de Contacto: ${escapeHtml(subject)}`;
-    const bodyAdmin = `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">Has recibido un nuevo mensaje desde el formulario de contacto:</p>
-  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui; list-style-type: none; padding-left: 0;">
-    <li><b>Nombre:</b> ${escapeHtml(name || '-')}</li>
-    <li><b>Email:</b> ${escapeHtml(email)}</li>
-    <li><b>Asunto:</b> ${escapeHtml(subject)}</li>
-  </ul>
-  <div style="height:1px;background:#e5e7eb;margin:12px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Mensaje:</p>
-  <div style="font:14px system-ui; color:#374151; white-space: pre-wrap; line-height: 1.6;">${escapeHtml(message)}</div>
-</td></tr>`.trim();
-    const htmlAdmin = emailShell({
-      header: 'Nuevo Mensaje de Contacto',
-      body: bodyAdmin,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
-    });
-    
-    const subjectUser = `Hemos recibido tu mensaje — ${escapeHtml(BRAND)}`;
-    const bodyUser = `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111;">¡Hola ${escapeHtml(name || '')}!</p>
-  <p style="margin:0 0 10px; font:14px system-ui; color:#374151;">Hemos recibido tu mensaje y te responderemos lo antes posible.</p>
-  <div style="height:1px;background:#e5e7eb;margin:12px 0;"></div>
-  <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Tu consulta:</p>
-  <div style="font:14px system-ui; color:#6b7280; border-left: 3px solid #e5e7eb; padding-left: 12px; font-style: italic;">
-    <strong>Asunto:</strong> ${escapeHtml(subject)}<br/>
-    <strong>Mensaje:</strong> ${escapeHtml(message).substring(0, 150)}...
-  </div>
-</td></tr>`.trim();
-    const htmlUser = emailShell({
-      header: 'Mensaje Recibido',
-      body: bodyUser,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>`
-    });
-
-    await Promise.allSettled([
-      sendEmail({ to: CORPORATE_EMAIL, from: CUSTOMER_FROM, replyTo: email, subject: subjectAdmin, html: htmlAdmin }),
-      sendEmail({ to: email, from: CUSTOMER_FROM, subject: subjectUser, html: htmlUser })
-    ]);
-    
-    console.log(`[api/contact] Correos de contacto enviados con éxito para ${email}`);
-
-  } catch (e) {
-    console.error('[api/contact] Error fatal enviando correos en segundo plano:', e);
-  }
+  const { email, subject, message } = payload;
+  const bodyAdmin = `<tr><td style="padding:0 24px;"><p>Contacto de: ${escapeHtml(email)}</p><p>${escapeHtml(message)}</p></td></tr>`;
+  await sendEmail({ to: CORPORATE_EMAIL, replyTo: email, subject: `Contacto: ${subject}`, html: emailShell({ header: 'Nuevo mensaje', body: bodyAdmin, footer: '' }) });
+  const bodyUser = `<tr><td style="padding:0 24px;"><p>Hemos recibido tu mensaje sobre "${escapeHtml(subject)}". Te contestaremos pronto.</p></td></tr>`;
+  await sendEmail({ to: email, subject: 'Mensaje recibido', html: emailShell({ header: 'Mensaje recibido', body: bodyUser, footer: '' }) });
 }
 
-// ===== CORS / logging =====
+// ===== Express Config =====
 const allowOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-const allowDomains = (process.env.ALLOWED_DOMAINS || 'guarrosextremenos.com,vercel.app').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-const originOk = (origin) => {
-  if (!origin) return true;
-  if (allowOrigins.includes(origin)) return true;
-  try { const h = new URL(origin).hostname.toLowerCase(); return allowDomains.some(d => h === d || h.endsWith('.' + d)); } catch { return false; }
-};
 app.use(cors({
-  origin: (origin, cb) => (originOk(origin) ? cb(null, true) : cb(new Error('Not allowed by CORS: ' + origin))),
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Stripe-Signature'],
-  maxAge: 600,
+  origin: (origin, cb) => (!origin || allowOrigins.includes(origin) || origin.includes('guarrosextremenos.com') || origin.includes('vercel.app')) ? cb(null, true) : cb(new Error('CORS')),
+  allowedHeaders: ['Content-Type', 'Authorization', 'Stripe-Signature']
 }));
 app.use(morgan('tiny'));
 
-app.use('/webhook', express.raw({ type: '*/*' }));
-app.get('/health', (req, res) => res.json({ ok: true, service: 'api', ts: new Date().toISOString() }));
-
-// ===== Webhook =====
-app.post('/webhook', async (req, res) => {
+// Webhook (raw body)
+app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('[webhook] signature error:', err?.message || err);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
+  try { event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET); }
+  catch (err) { console.error('Webhook Error:', err.message); return res.status(400).send(`Webhook Error: ${err.message}`); }
 
   const seen = async (id) => {
     if (!pool) return true;
     const r = await dbQuery(`INSERT INTO processed_events(event_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING event_id`, [id]);
-    if (r?.error) return true;
     return r.rowCount === 1;
   };
-  try { const fresh = await seen(event.id); if (!fresh) return res.status(200).json({ ok: true, dedup: true }); }
-  catch (e) { console.error('[webhook] dedup error:', e?.message || e); }
-
-  console.log('[webhook] EVENT', { id: event.id, type: event.type, livemode: event.livemode, created: event.created });
-
-  const markInvoiceMailedOnce = async (invoiceId) => {
-    if (!pool || !invoiceId) return true;
-    const r = await dbQuery(`INSERT INTO mailed_invoices(invoice_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING invoice_id`, [invoiceId]);
-    return r?.rowCount === 1;
-  };
-
-  const logOrder = async (o) => {
-    if (!pool) return;
-    const text = `
-      INSERT INTO orders (
-        session_id, email, name, phone, total, currency, items, metadata, shipping, status, customer_details,
-        address, city, postal, country, created_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, NOW())
-      ON CONFLICT (session_id) DO UPDATE SET
-        email=EXCLUDED.email, name=EXCLUDED.name, phone=EXCLUDED.phone,
-        total=EXCLUDED.total, currency=EXCLUDED.currency, items=EXCLUDED.items,
-        metadata=EXCLUDED.metadata, shipping=EXCLUDED.shipping, status=EXCLUDED.status,
-        customer_details=EXCLUDED.customer_details,
-        address=EXCLUDED.address, city=EXCLUDED.city, postal=EXCLUDED.postal, country=EXCLUDED.country
-    `;
-    const vals = [
-      o.sessionId, o.email || null, o.name || null, o.phone || null,
-      o.amountTotal || 0, o.currency || 'EUR',
-      JSON.stringify(o.items || []), JSON.stringify(o.metadata || {}),
-      JSON.stringify(o.shipping || {}), o.status || 'paid',
-      JSON.stringify(o.customer_details || {}),
-      o.address || null, o.city || null, o.postal || null, o.country || null
-    ];
-    await dbQuery(text, vals);
-  };
-
-  const logOrderItems = async (sessionId, items, currency) => {
-    if (!pool || !Array.isArray(items)) return;
-    const text = `
-      INSERT INTO order_items
-        (session_id, description, product_id, price_id, quantity, unit_amount_cents, amount_total_cents, currency, raw)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      ON CONFLICT DO NOTHING
-    `;
-    for (const li of items) {
-      const vals = [
-        sessionId, li.description || null, li.price?.product || null, li.price?.id || null,
-        li.quantity || 1, li.price?.unit_amount ?? null, li.amount_total ?? li.amount ?? 0,
-        (li.currency || currency || 'eur').toUpperCase(), JSON.stringify(li),
-      ];
-      await dbQuery(text, vals);
-    }
-  };
-
-  const upsertSubscriber = async ({ customer_id, subscription_id = null, email, plan, status, name = null, phone = null, address = null, city = null, postal = null, country = null, meta = null }) => {
-    if (!pool) return null;
-    const text = `
-      INSERT INTO subscribers (customer_id, subscription_id, email, plan, status, name, phone, address, city, postal, country, meta, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), NOW())
-      ON CONFLICT (customer_id) DO UPDATE SET
-        subscription_id = COALESCE(EXCLUDED.subscription_id, subscribers.subscription_id),
-        email  = COALESCE(EXCLUDED.email,  subscribers.email),
-        plan   = COALESCE(EXCLUDED.plan,   subscribers.plan),
-        status = COALESCE(EXCLUDED.status, subscribers.status),
-        name   = COALESCE(EXCLUDED.name,   subscribers.name),
-        phone  = COALESCE(EXCLUDED.phone,  subscribers.phone),
-        address= COALESCE(EXCLUDED.address,subscribers.address),
-        city   = COALESCE(EXCLUDED.city,   subscribers.city),
-        postal = COALESCE(EXCLUDED.postal, subscribers.postal),
-        country= COALESCE(EXCLUDED.country,subscribers.country),
-        meta   = COALESCE(EXCLUDED.meta,   subscribers.meta),
-        updated_at = NOW()
-      RETURNING *;
-    `;
-    const values = [customer_id, subscription_id, email, plan, status, name, phone, address, city, postal, country, meta ? JSON.stringify(meta) : null];
-    const { rows } = await dbQuery(text, values);
-    return rows?.[0] || null;
-  };
-
-  const markCanceled = async (subscription_id) => { if (!pool) return; await dbQuery(`UPDATE subscribers SET status='canceled', canceled_at=NOW() WHERE subscription_id=$1`, [subscription_id]); };
+  if (!(await seen(event.id))) return res.json({ received: true, dedup: true });
 
   try {
-    switch (event.type) {
-      case 'checkout.session.completed': {
-        const session = event.data.object;
-        const isSub = session.mode === 'subscription' || !!session.subscription;
-        const person = preferShippingThenBilling(session);
-        const currency = (session.currency || 'eur').toUpperCase();
-        const amountTotal = (session.amount_total ?? 0) / 100;
-        const email = person.email || null;
-        const name = person.name || null;
-        const phone = person.phone || null;
-        const metadata = session.metadata || {};
-        const shipping = session.shipping_details?.address
-          ? { name: session.shipping_details?.name || null, ...session.shipping_details.address }
-          : null;
-
-        let items = [];
-        try {
-          const li = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] });
-          items = li?.data || [];
-        } catch (e) { console.warn('[listLineItems warn]', e?.message || e); }
-
-        await logOrder({
+    if (event.type === 'checkout.session.completed') {
+       const session = event.data.object;
+       const isSub = session.mode === 'subscription';
+       const person = preferShippingThenBilling(session);
+       const currency = (session.currency || 'eur').toUpperCase();
+       const amountTotal = (session.amount_total ?? 0) / 100;
+       let items = []; 
+       try { items = (await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 })).data; } catch {}
+       
+       await logOrder({
           sessionId: session.id,
-          email, name, phone, amountTotal, currency, items, metadata, shipping,
-          status: session.payment_status || session.status || 'unknown',
-          customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
-          address: person.address?.line1 || null,
-          city: person.address?.city || null,
-          postal: person.address?.postal_code || null,
-          country: person.address?.country || null
-        });
-        await logOrderItems(session.id, items, currency);
+          email: person.email, name: person.name, phone: person.phone,
+          amountTotal, currency, items, metadata: session.metadata, shipping: session.shipping_details,
+          status: session.payment_status,
+          customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address },
+          address: person.address?.line1, city: person.address?.city, postal: person.address?.postal_code, country: person.address?.country
+       });
+       await logOrderItems(session.id, items, currency);
 
-        if (isSub && session.subscription) {
-          try {
-            const sub = await stripe.subscriptions.retrieve(session.subscription);
-            const cust = session.customer ? await stripe.customers.retrieve(session.customer) : null;
-            await upsertSubscriber({
-              customer_id: sub.customer,
-              subscription_id: sub.id,
-              email: cust?.email || email || null,
-              name: cust?.name || name || null,
-              phone: cust?.phone || phone || null, 
-              plan: sub.items?.data?.[0]?.price?.id || (sub.metadata?.subscription_grams ? `g${sub.metadata.subscription_grams}` : null),
-              status: sub.status,
-              meta: { ...sub.metadata },
-              address: (cust?.address?.line1 || person?.address?.line1 || null),
-              city: (cust?.address?.city || person?.address?.city || null),
-              postal: (cust?.address?.postal_code || person?.address?.postal_code || null),
-              country: (cust?.address?.country || person?.address?.country || null),
-            });
-          } catch (e) { console.error('[suscripción alta ERROR]', e); }
-        }
-
-        if (!isSub) {
-          try {
-            await sendAdminEmail({
-              session, items, customerEmail: email, name, phone,
-              amountTotal, currency,
-              customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
-              shipping: session.shipping_details || {},
-            });
-          } catch (e) { console.error('Email admin ERROR:', e); }
-        }
-
-        if (!isSub) {
-          try {
-            if (COMBINE_CONFIRMATION_AND_INVOICE) {
-              await sendCustomerCombined({
-                to: email, name,
-                invoiceNumber: session.id, total: amountTotal, currency,
-                items,
-                customer: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
-                pdfUrl: null,
-                isSubscription: false,
-                customerId: session.customer,
-              });
-            } else {
-              await sendCustomerConfirmationOnly({
-                to: email, name, amountTotal, currency, items, orderId: session.id,
-                isSubscription: false, customerId: session.customer,
-                customer_details: { name: person.name, email: person.email, phone: person.phone, address: person.address || null },
-                shipping: session.shipping_details || {},
-              });
-            }
-          } catch (e) { console.error('Email cliente ONE-OFF ERROR:', e); }
-        }
-        res.status(200).json({ received: true });
-        return;
-      }
-
-      case 'customer.subscription.created': {
-        const sub = event.data.object;
-        try {
-          const cust = await stripe.customers.retrieve(sub.customer);
-          const name = cust?.name || null;
-          const email = cust?.email || null;
-          const address = cust?.address || null;
-          const phone = cust?.phone || null; 
-
-          try {
-            await upsertSubscriber({
-              customer_id: sub.customer,
-              subscription_id: sub.id,
-              email, name, phone,
-              plan: sub.items?.data?.[0]?.price?.id || (sub.metadata?.subscription_grams ? `g${sub.metadata.subscription_grams}` : null),
-              status: sub.status,
-              meta: { ...sub.metadata },
-              address: address?.line1 || null,
-              city: address?.city || null,
-              postal: address?.postal_code || null,
-              country: address?.country || null,
-            });
-          } catch (e) { console.error('[suscripción upsert ERROR]', e?.message || e); }
-
-          if (CORPORATE_EMAIL) {
-            const html = emailShell({
-              header: 'Alta de suscripción',
-              body: `<tr><td style="padding:0 24px 12px;">
-                <p style="margin:0 0 8px; font:15px system-ui; color:#111;">Nueva suscripción creada.</p>
-                <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
-                  <li><b>ID suscripción:</b> ${escapeHtml(sub.id)}</li>
-                  <li><b>Cliente:</b> ${escapeHtml(name || '-')} — ${escapeHtml(email || '-')}</li>
-                  <li><b>Teléfono:</b> ${escapeHtml(phone || '-')}</li> <li><b>Estado:</b> ${escapeHtml(sub.status)}</li>
-                </ul>
-                <div style="height:1px;background:#e5e7eb;margin:10px 0;"></div>
-                <p style="margin:0 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
-                <div style="font:13px system-ui; color:#374151">${fmtAddressHTML({ name, email, phone, address })}</div>
-              </td></tr>`,
-              footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
-            });
-            await sendEmail({ to: CORPORATE_EMAIL, subject: `Alta suscripción — ${BRAND}`, html });
-          }
-
-          if (!COMBINE_CONFIRMATION_AND_INVOICE && email) {
-              await sendCustomerConfirmationOnly({
-                to: email, name, amountTotal: null, currency: 'EUR',
-                items: [], orderId: sub.id, isSubscription: true,
-                customerId: sub.customer,
-                customer_details: { name, email, phone, address },
-                shipping: {},
-              });
-          }
-        } catch (e) { console.error('[created email ERROR]', e?.message || e); }
-
-        res.status(200).json({ received: true });
-        return;
-      }
-
-      case 'customer.subscription.updated': {
-        return res.status(200).json({ received: true, note: 'subscription.updated ignored' });
-      }
-
-      case 'customer.subscription.deleted': {
-        const sub = event.data.object;
-        try { await markCanceled(sub.id); } catch (e) { console.error('[cancel mark ERROR]', e?.message || e); }
-        try {
-          const cust = await stripe.customers.retrieve(sub.customer);
-          await sendCancelEmails({
-            customerEmail: cust?.email || null,
-            name: cust?.name || null,
-            subId: sub.id,
-            customerAddress: cust?.address || null,
+       if (isSub && session.subscription) {
+          const sub = await stripe.subscriptions.retrieve(session.subscription);
+          const cust = session.customer ? await stripe.customers.retrieve(session.customer) : null;
+          await upsertSubscriber({
+            customer_id: sub.customer,
+            subscription_id: sub.id,
+            email: cust?.email || person.email,
+            name: cust?.name || person.name,
+            phone: cust?.phone || person.phone,
+            plan: sub.items?.data?.[0]?.price?.id,
+            status: sub.status,
+            meta: { ...sub.metadata },
+            address: person.address?.line1, city: person.address?.city, postal: person.address?.postal_code, country: person.address?.country
           });
-        } catch (e) { console.error('[cancel email ERROR]', e?.message || e); }
-        res.status(200).json({ received: true });
-        return;
-      }
+       }
 
-      case 'customer.updated': {
-        const cust = event.data.object;
-        if (SEND_CUSTOMER_UPDATED_ONLY_IF_KNOWN) {
-          try {
-            const known = await subscriberExists(cust.id);
-            if (!known) {
-              return res.status(200).json({ received: true, skipped: 'customer.updated ignored (no subscriber yet)' });
-            }
-          } catch (e) { console.error('[customer.updated check ERROR]', e?.message || e); }
-        }
-        const prev = event.data.previous_attributes || {};
-        try {
-          const summaryHtml = summarizeCustomerChanges(prev, cust);
-          await sendCustomerUpdatedEmails({ cust, summaryHtml });
-        } catch (e) {
-          console.error('[customer.updated email ERROR]', e?.message || e);
-        }
-        return res.status(200).json({ received: true });
-      }
+       if (!isSub) {
+         await sendAdminEmail({ session, items, customerEmail: person.email, name: person.name, amountTotal, currency, customer_details: session.customer_details, shipping: session.shipping_details });
+         if (COMBINE_CONFIRMATION_AND_INVOICE) {
+            await sendCustomerCombined({ to: person.email, name: person.name, invoiceNumber: session.id, total: amountTotal, currency, items, customer: person });
+         } else {
+            await sendCustomerConfirmationOnly({ to: person.email, name: person.name, amountTotal, currency, items, orderId: session.id });
+         }
+       }
+    } else if (event.type === 'customer.subscription.created') {
+       const sub = event.data.object;
+       const cust = await stripe.customers.retrieve(sub.customer);
+       await upsertSubscriber({
+         customer_id: sub.customer, subscription_id: sub.id,
+         email: cust.email, name: cust.name, phone: cust.phone,
+         plan: sub.items?.data?.[0]?.price?.id, status: sub.status,
+         meta: sub.metadata, address: cust.address?.line1, city: cust.address?.city, postal: cust.address?.postal_code, country: cust.address?.country
+       });
 
-case 'invoice.payment_succeeded': {
-        const inv = event.data.object;
-        const firstTime = await markInvoiceMailedOnce(inv.id);
-        if (!firstTime) { return res.status(200).json({ received: true, mailed: 'skipped-duplicate' }); }
+       if (CORPORATE_EMAIL) await sendEmail({ to: CORPORATE_EMAIL, subject: 'Nueva suscripción', html: emailShell({ header: 'Nueva suscripción', body: `<tr><td>${cust.email}</td></tr>`, footer: '' }) });
+       if (!COMBINE_CONFIRMATION_AND_INVOICE && cust.email) {
+         await sendCustomerConfirmationOnly({ to: cust.email, name: cust.name, isSubscription: true, customerId: sub.customer, items: [] });
+       }
+    } else if (event.type === 'invoice.payment_succeeded') {
+       const inv = event.data.object;
+       
+       // 🟢 DETECTAR RENOVACIÓN
+       const isSubscription = !!inv.subscription;
+       const billingReason = inv.billing_reason; // 'subscription_cycle' significa renovación automática
+       const isRenewal = isSubscription && billingReason === 'subscription_cycle';
 
-        const customerForPdf = extractInvoiceCustomer(inv);
-        let to = customerForPdf.email;
-        if (!to && inv.customer) {
-          try { const cust = await stripe.customers.retrieve(inv.customer); to = cust?.email || to; } catch {}
-        }
-        const name = customerForPdf.name || '';
+       const cust = extractInvoiceCustomer(inv);
 
-        let pdfUrl = inv.invoice_pdf;
-        if (!pdfUrl) {
-          for (let i = 0; i < 3 && !pdfUrl; i++) {
-            await new Promise(r => setTimeout(r, 3000));
-            try { const inv2 = await stripe.invoices.retrieve(inv.id); pdfUrl = inv2.invoice_pdf || null; } catch { }
-          }
-        }
+       // 1. AVISAR AL ADMIN (Solo si es renovación)
+       if (isRenewal) {
+          await sendAdminRenewalEmail({ 
+            customer: cust, 
+            total: inv.amount_paid / 100, 
+            currency: (inv.currency || 'eur').toUpperCase(), 
+            subscriptionId: inv.subscription, 
+            invoiceId: inv.number || inv.id 
+          });
+       }
 
-        let items = [];
-        try { const li = await stripe.invoices.listLineItems(inv.id, { limit: 100, expand: ['data.price.product'] }); items = li?.data || []; }
-        catch (e) { console.warn('[invoice listLineItems warn]', e?.message || e); }
-
-        // 🟢 DETECTAR RENOVACIÓN
-        const isSubscription = !!inv.subscription;
-        const billingReason = inv.billing_reason; // 'subscription_cycle' significa renovación automática
-        const isRenewal = isSubscription && billingReason === 'subscription_cycle';
-
-        // 1. AVISAR AL ADMIN (Solo si es renovación)
-        if (isRenewal) {
-           await sendAdminRenewalEmail({ 
-             customer: customerForPdf, 
-             total: (inv.amount_paid ?? inv.amount_due ?? 0) / 100,
-             currency: (inv.currency || 'eur').toUpperCase(), 
-             subscriptionId: inv.subscription, 
-             invoiceId: inv.number || inv.id 
-           });
-        }
-
-        // 2. EMAIL AL CLIENTE
-        if (COMBINE_CONFIRMATION_AND_INVOICE) {
-          try {
-            await sendCustomerCombined({
-              to,
-              name,
-              invoiceNumber: inv.number || inv.id,
-              total: (inv.amount_paid ?? inv.amount_due ?? 0) / 100,
-              currency: (inv.currency || 'eur').toUpperCase(),
-              items,
-              customer: customerForPdf,
-              pdfUrl,
-              isSubscription,
-              isRenewal, // <--- Pasamos el flag aquí
-              customerId: inv.customer,
-            });
-          } catch (e) { console.error('Combinado ERROR:', e); }
-        }
-
-        res.status(200).json({ received: true });
-        return;
-      }
-      default:
-        return res.status(200).json({ received: true });
+       // 2. EMAIL AL CLIENTE (Si es combinado o renovación)
+       if (COMBINE_CONFIRMATION_AND_INVOICE) {
+          let items = [];
+          try { items = (await stripe.invoices.listLineItems(inv.id)).data; } catch {}
+          
+          await sendCustomerCombined({ 
+             to: cust.email, 
+             name: cust.name, 
+             invoiceNumber: inv.number, 
+             total: inv.amount_paid/100, 
+             currency: inv.currency.toUpperCase(), 
+             items, 
+             customer: cust, 
+             pdfUrl: inv.invoice_pdf, 
+             isSubscription, 
+             isRenewal, // Flag para cambiar texto
+             customerId: inv.customer 
+          });
+       }
+    } else if (event.type === 'customer.subscription.deleted') {
+       const sub = event.data.object;
+       await markCanceled(sub.id);
+       const cust = await stripe.customers.retrieve(sub.customer);
+       await sendCancelEmails({ customerEmail: cust.email, name: cust.name, subId: sub.id });
+    } else if (event.type === 'customer.updated') {
+       const cust = event.data.object;
+       if (await subscriberExists(cust.id)) {
+          const summary = summarizeCustomerChanges(event.data.previous_attributes, cust);
+          await sendCustomerUpdatedEmails({ cust, summaryHtml: summary });
+       }
     }
-  } catch (e) {
-    console.error('[webhook handler FATAL]', e);
-    res.status(200).json({ received: true, soft_error: true });
-  }
+  } catch (e) { console.error('Webhook Logic Error:', e); }
+
+  res.json({ received: true });
 });
 
 app.use(express.json());
@@ -1069,253 +445,154 @@ app.get('/api/config', (req, res) => {
   });
 });
 
-// 2. Resolver Precios (Carrito)
+// 2. Resolver Precios
 app.post('/prices/resolve', async (req, res) => {
   const { ids } = req.body;
-  if (!Array.isArray(ids) || !ids.length) {
-    return res.status(400).json({ error: 'Se requiere un array de ids.' });
-  }
+  if (!Array.isArray(ids)) return res.status(400).json({ error: 'Ids required' });
   try {
-    const results = await Promise.allSettled(
-      ids.map(id => stripe.prices.retrieve(String(id), { expand: ['product'] }))
-    );
-    const pricesMap = {};
-    results.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        const price = result.value;
-        pricesMap[price.id] = {
-          id: price.id,
-          unit_amount: price.unit_amount,
-          currency: price.currency,
-          product_name: price.product?.name || null, 
-        };
-      } else {
-        console.warn(`[prices/resolve] No se pudo encontrar el price: ${ids[index]}`, result.reason?.message);
-      }
-    });
-    res.json({ prices: pricesMap });
-  } catch (e) {
-    console.error('[prices/resolve] Error fatal:', e);
-    res.status(500).json({ error: e.message || 'Error resolviendo precios' });
-  }
+    const results = await Promise.allSettled(ids.map(id => stripe.prices.retrieve(id, { expand: ['product'] })));
+    const prices = {};
+    results.forEach(r => { if(r.status === 'fulfilled') prices[r.value.id] = { id: r.value.id, unit_amount: r.value.unit_amount, currency: r.value.currency }; });
+    res.json({ prices });
+  } catch { res.status(500).json({ error: 'Error resolving prices' }); }
 });
 
-// 3. Recuperar Suscripción (Magic Link Filtrado: Solo Activas)
+// 3. Recuperar Suscripción (Magic Link: Solo Activas)
 app.post('/api/recover-subscription', contactLimiter, async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email requerido' });
 
   try {
-    // Buscar clientes expandiendo suscripciones
-    const customers = await stripe.customers.list({ 
-      email, 
-      limit: 5, 
-      expand: ['data.subscriptions'] 
-    });
+    const customers = await stripe.customers.list({ email, limit: 5, expand: ['data.subscriptions'] });
 
     if (!customers.data.length) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      return res.json({ ok: true, message: 'Si el email existe...' });
+      await new Promise(r => setTimeout(r, 1000));
+      return res.json({ ok: true });
     }
 
-    // Generar enlaces SOLO para clientes con suscripciones VIVAS
-    const linksData = await Promise.all(customers.data.map(async (cust) => {
-      // Filtramos: ¿Tiene alguna suscripción que NO esté cancelada?
-      const hasActiveSub = cust.subscriptions?.data?.some(sub => 
-        ['active', 'trialing', 'past_due'].includes(sub.status)
-      );
+    const linksData = await Promise.all(customers.data.map(async (c) => {
+       const hasActive = c.subscriptions?.data?.some(s => ['active', 'trialing', 'past_due'].includes(s.status));
+       if (!hasActive) return null;
 
-      // Si todas sus suscripciones están canceladas o no tiene, lo saltamos
-      if (!hasActiveSub) return null;
+       try {
+         const session = await stripe.billingPortal.sessions.create({ customer: c.id, return_url: PORTAL_RETURN_URL });
+         const addr = c.shipping?.address || c.address;
+         const label = addr ? `${addr.line1} (${addr.city || ''})` : 'Sin dirección';
+         
+         const sub = c.subscriptions.data.find(s => ['active', 'trialing', 'past_due'].includes(s.status));
+         const price = sub ? (sub.plan.amount/100) + '€' : '';
 
-      try {
-        const session = await stripe.billingPortal.sessions.create({
-          customer: cust.id,
-          return_url: PORTAL_RETURN_URL,
-          ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {}),
-        });
-
-        const date = new Date(cust.created * 1000).toLocaleDateString('es-ES');
-        const address = cust.shipping?.address || cust.address;
-        const addressStr = address 
-          ? `${address.line1 || ''} ${address.city ? `(${address.city})` : ''}`.trim() 
-          : 'Sin dirección';
-
-        const mainSub = cust.subscriptions.data.find(s => ['active', 'trialing', 'past_due'].includes(s.status));
-        const priceLabel = (mainSub?.plan?.amount / 100) + ' €';
-
-        return {
-          url: session.url,
-          label: `Suscripción activa (${priceLabel}) — ${addressStr}`
-        };
-      } catch (err) {
-        return null;
-      }
+         return { url: session.url, label: `Suscripción activa ${price ? `(${price})` : ''} — ${label}` };
+       } catch { return null; }
     }));
 
     const validLinks = linksData.filter(Boolean);
 
-    if (!validLinks.length) {
-      return res.json({ ok: true });
+    if (validLinks.length) {
+      const btns = validLinks.map(l => `
+        <div style="margin:16px 0; background:#f9fafb; padding:12px; border-radius:8px; border:1px solid #e5e7eb;">
+          <p style="margin:0 0 8px; font-weight:bold; color:#333;">${escapeHtml(l.label)}</p>
+          <a href="${l.url}" style="display:inline-block; background:${BRAND_PRIMARY}; color:#fff; padding:10px 16px; text-decoration:none; border-radius:6px; font-weight:bold;">Gestionar</a>
+        </div>`).join('');
+      
+      const html = emailShell({ 
+        header: 'Tus suscripciones', 
+        body: `<tr><td style="padding:0 24px 12px;">
+          <p style="margin:0 0 16px;">Aquí tienes el acceso a tus suscripciones <b>activas</b>:</p>
+          ${btns}
+        </td></tr>`, 
+        footer: '' 
+      });
+      
+      await sendEmail({ to: email, subject: 'Gestión de suscripciones', html });
     }
-
-    // Construir HTML
-    const buttonsHtml = validLinks.map(link => `
-      <div style="margin-bottom: 16px; background: #f9fafb; padding: 12px; border-radius: 8px; border: 1px solid #e5e7eb;">
-        <p style="margin: 0 0 8px; font-size: 13px; color: #555; font-weight: 600;">
-          ${escapeHtml(link.label)}
-        </p>
-        <a href="${link.url}" style="display:block; text-decoration:none; color:#fff; background:${BRAND_PRIMARY}; padding:10px 16px; border-radius:6px; text-align:center; font-weight:bold; font-size:14px;">
-          Gestionar esta suscripción
-        </a>
-      </div>
-    `).join('');
-
-    // Enviar email
-    const html = emailShell({
-      header: 'Acceso a tu suscripción',
-      body: `
-        <tr><td style="padding:0 24px 12px;">
-          <p style="margin:0 0 12px; font:15px system-ui; color:#111;">Hola,</p>
-          <p style="margin:0 0 16px; font:14px system-ui; color:#374151;">
-            Aquí tienes el acceso a tus suscripciones <b>activas</b>. Haz clic abajo para gestionar la que necesites:
-          </p>
-          ${buttonsHtml}
-        </td></tr>
-        <tr><td style="padding:0 24px 12px;">
-          <p style="margin:0; font:12px system-ui; color:#9ca3af;">Este enlace es temporal y seguro.</p>
-        </td></tr>
-      `,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}</p>`
-    });
-
-    await sendEmail({ to: email, subject: `Gestión de suscripciones — ${BRAND}`, html });
     res.json({ ok: true });
 
-  } catch (e) {
-    console.error('[recover-subscription] error:', e);
-    res.status(500).json({ error: 'Error procesando la solicitud.' });
+  } catch (e) { 
+    console.error(e); 
+    res.status(500).json({ error: 'Error' }); 
   }
 });
 
 // 4. Contacto
 app.post('/api/contact', contactLimiter, (req, res) => {
   const { email, subject, message } = req.body;
-  if (!email || !message || !subject) {
-    return res.status(400).json({ error: 'Faltan campos requeridos.' });
-  }
-  if (email.toLowerCase() === CORPORATE_EMAIL.toLowerCase()) {
-    return res.status(400).json({ error: 'Email inválido.' });
-  }
-  res.status(200).json({ ok: true });
+  if (!email || !message) return res.status(400).json({ error: 'Faltan datos' });
+  res.json({ ok: true });
   sendContactEmails(req.body);
 });
 
 // 5. Create Checkout
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const { items = [], success_url, cancel_url, metadata = {} } = req.body || {};
-    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items vacíos' });
-
+    const { items, success_url, cancel_url, metadata } = req.body;
     const line_items = [];
     for (const it of items) {
-      const priceId = it.price || it.priceId;
-      if (!priceId) continue;
-      const price = await stripe.prices.retrieve(String(priceId), { expand: ['product'] });
-      const imgAbs = toAbsoluteUrl(it.image);
-      const product_data = { name: String(it.title || it.name || price.product?.name || 'Producto') };
-      if (imgAbs) { try { new URL(imgAbs); product_data.images = [imgAbs]; } catch { } }
-
-      line_items.push({
-        quantity: it.quantity || 1,
-        price_data: {
-          currency: (price.currency || 'eur').toLowerCase(),
-          unit_amount: price.unit_amount,
-          product_data,
-        },
-      });
+       const price = await stripe.prices.retrieve(it.price);
+       line_items.push({ price: it.price, quantity: it.quantity });
     }
-    if (!line_items.length) return res.status(400).json({ error: 'Sin price válidos' });
-
     const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      line_items,
-      success_url: success_url || `${FRONT_BASE}/success`,
-      cancel_url: cancel_url || `${FRONT_BASE}/cancel`,
-      allow_promotion_codes: true,
-      billing_address_collection: 'required',
-      shipping_address_collection: { allowed_countries: ['ES', 'FR', 'DE', 'IT', 'PT', 'BE', 'NL', 'IE', 'GB'] },
-      phone_number_collection: { enabled: true },
-      metadata: { source: 'guarros-front', ...metadata },
+      mode: 'payment', line_items, success_url, cancel_url,
+      allow_promotion_codes: true, billing_address_collection: 'required',
+      shipping_address_collection: { allowed_countries: ['ES', 'FR', 'PT', 'DE', 'IT', 'BE', 'NL'] },
+      metadata: { source: 'front', ...metadata }
     });
-
     res.json({ url: session.url, id: session.id });
-  } catch (e) {
-    console.error('create-checkout-session error:', e);
-    res.status(500).json({ error: e.message || 'Error' });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 6. Create Subscription
+// 6. Create Subscription (COBRO EL DÍA 1)
 app.post('/create-subscription-session', async (req, res) => {
   try {
-    const { grams, currency = 'eur', metadata = {}, success_url, cancel_url } = req.body || {};
+    const { grams, success_url, cancel_url, metadata } = req.body;
     const g = Number(grams);
-    if (!g || !ALLOWED_SUB_GRAMS.includes(g)) return res.status(400).json({ error: 'Cantidad inválida. Debe ser una de: ' + ALLOWED_SUB_GRAMS.join(', ') });
-    const amount = SUB_PRICE_TABLE[g];
+    if (!ALLOWED_SUB_GRAMS.includes(g)) return res.status(400).json({ error: 'Gramos inválidos' });
+    
+    // --- CÁLCULO FECHA COBRO (DÍA 1 SIGUIENTE MES) ---
+    const now = new Date();
+    const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    nextMonth.setHours(12, 0, 0, 0); // Evitar problemas de zona horaria
+    const anchorTimestamp = Math.floor(nextMonth.getTime() / 1000);
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      line_items: [{
+      line_items: [{ 
         quantity: 1,
-        price_data: {
-          currency,
-          unit_amount: amount,
-          recurring: { interval: 'month' },
-          product_data: { name: `Suscripción Jamón Canalla — ${g} g/mes` },
-        },
+        price_data: { 
+          currency: 'eur', 
+          unit_amount: SUB_PRICE_TABLE[g], 
+          recurring: { interval: 'month' }, 
+          product_data: { name: `Suscripción Jamón Canalla — ${g} g/mes` } 
+        } 
       }],
       allow_promotion_codes: true,
       billing_address_collection: 'required',
-      shipping_address_collection: { allowed_countries: ['ES', 'FR', 'DE', 'IT', 'PT', 'BE', 'NL', 'IE', 'GB'] },
-      phone_number_collection: { enabled: true },
-      success_url: success_url || `${FRONT_BASE}/success`,
-      cancel_url: cancel_url || `${FRONT_BASE}/cancel`,
-      metadata: { ...metadata, source: 'guarros-front', subscription_grams: String(g), pricing_model: 'fixed_table_g' },
+      shipping_address_collection: { allowed_countries: ['ES', 'FR', 'PT', 'DE', 'IT', 'BE', 'NL'] },
+      metadata: { subscription_grams: String(g), ...metadata },
+      // 🟢 ANCLAJE DE FACTURACIÓN AL DÍA 1
+      subscription_data: {
+        billing_cycle_anchor: anchorTimestamp,
+      },
+      success_url, cancel_url
     });
-
-    return res.json({ url: session.url, id: session.id });
-  } catch (e) {
-    console.error('create-subscription-session error:', e);
-    res.status(500).json({ error: e.message || 'Error' });
-  }
+    res.json({ url: session.url, id: session.id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/billing-portal/link', async (req, res) => {
   try {
     const { customer_id, return: ret } = req.query;
-    if (!customer_id) return res.status(400).send('customer_id requerido');
-    const portalSession = await stripe.billingPortal.sessions.create({
-      customer: customer_id,
-      return_url: ret || PORTAL_RETURN_URL,
-      ...(BILLING_PORTAL_CONFIG ? { configuration: BILLING_PORTAL_CONFIG } : {}),
-    });
-    res.redirect(portalSession.url);
-  } catch (e) {
-    console.error('billing-portal/link error:', e);
-    res.status(500).send('Error creating portal session.');
-  }
+    if (!customer_id) return res.status(400).send('Missing customer_id');
+    const session = await stripe.billingPortal.sessions.create({ customer: customer_id, return_url: ret || PORTAL_RETURN_URL });
+    res.redirect(session.url);
+  } catch { res.status(500).send('Error'); }
 });
 
 app.get('/test-email', async (req, res) => {
-  try {
-    if (!CORPORATE_EMAIL) return res.status(400).json({ ok: false, error: 'CORPORATE_EMAIL no definido' });
-    const html = emailShell({ header: 'Prueba de correo', body: `<tr><td style="padding:0 24px 12px;">Esto es un test de ${escapeHtml(BRAND)}</td></tr>`, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)}</p>` });
-    await sendEmail({ to: CORPORATE_EMAIL, subject: 'Test ' + BRAND, html });
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message || 'error' }); }
+  if (!CORPORATE_EMAIL) return res.status(400).json({ error: 'No corporate email' });
+  await sendEmail({ to: CORPORATE_EMAIL, subject: 'Test', html: 'Test OK' });
+  res.json({ ok: true });
 });
 
 app.get('/', (req, res) => res.status(404).send('Not found'));
-
-app.listen(PORT, () => { console.log(`API listening on :${PORT}`); });
+app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
