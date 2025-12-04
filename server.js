@@ -1,4 +1,4 @@
-// server.js — Backend v3.2 (Final: Proxy + Filtro Activas + Renovaciones + Cobro Día 1 SIN Prorrateo + Emails Mejorados)
+// server.js — Backend v3.3 (Final: Proxy + Filtro Activas + Renovaciones + Cobro Día 1 + DB Helpers FIXED)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -90,6 +90,91 @@ async function dbQuery(text, params) {
   await dbQuery(`CREATE TABLE IF NOT EXISTS subscribers(customer_id text PRIMARY KEY, subscription_id text, email text, plan text, status text, name text, phone text, address text, city text, postal text, country text, meta jsonb, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), canceled_at timestamptz)`);
 })();
 
+// ===== DB Helpers (Estas son las funciones que faltaban) =====
+
+const markInvoiceMailedOnce = async (invoiceId) => {
+  if (!pool || !invoiceId) return true;
+  const r = await dbQuery(`INSERT INTO mailed_invoices(invoice_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING invoice_id`, [invoiceId]);
+  return r?.rowCount === 1;
+};
+
+const logOrder = async (o) => {
+  if (!pool) return;
+  const text = `
+    INSERT INTO orders (
+      session_id, email, name, phone, total, currency, items, metadata, shipping, status, customer_details,
+      address, city, postal, country, created_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, NOW())
+    ON CONFLICT (session_id) DO UPDATE SET
+      email=EXCLUDED.email, name=EXCLUDED.name, phone=EXCLUDED.phone,
+      total=EXCLUDED.total, currency=EXCLUDED.currency, items=EXCLUDED.items,
+      metadata=EXCLUDED.metadata, shipping=EXCLUDED.shipping, status=EXCLUDED.status,
+      customer_details=EXCLUDED.customer_details,
+      address=EXCLUDED.address, city=EXCLUDED.city, postal=EXCLUDED.postal, country=EXCLUDED.country
+  `;
+  const vals = [
+    o.sessionId, o.email || null, o.name || null, o.phone || null,
+    o.amountTotal || 0, o.currency || 'EUR',
+    JSON.stringify(o.items || []), JSON.stringify(o.metadata || {}),
+    JSON.stringify(o.shipping || {}), o.status || 'paid',
+    JSON.stringify(o.customer_details || {}),
+    o.address || null, o.city || null, o.postal || null, o.country || null
+  ];
+  await dbQuery(text, vals);
+};
+
+const logOrderItems = async (sessionId, items, currency) => {
+  if (!pool || !Array.isArray(items)) return;
+  const text = `
+    INSERT INTO order_items
+      (session_id, description, product_id, price_id, quantity, unit_amount_cents, amount_total_cents, currency, raw)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    ON CONFLICT DO NOTHING
+  `;
+  for (const li of items) {
+    const vals = [
+      sessionId, li.description || null, li.price?.product || null, li.price?.id || null,
+      li.quantity || 1, li.price?.unit_amount ?? null, li.amount_total ?? li.amount ?? 0,
+      (li.currency || currency || 'eur').toUpperCase(), JSON.stringify(li),
+    ];
+    await dbQuery(text, vals);
+  }
+};
+
+const upsertSubscriber = async ({ customer_id, subscription_id = null, email, plan, status, name = null, phone = null, address = null, city = null, postal = null, country = null, meta = null }) => {
+  if (!pool) return null;
+  const text = `
+    INSERT INTO subscribers (customer_id, subscription_id, email, plan, status, name, phone, address, city, postal, country, meta, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), NOW())
+    ON CONFLICT (customer_id) DO UPDATE SET
+      subscription_id = COALESCE(EXCLUDED.subscription_id, subscribers.subscription_id),
+      email  = COALESCE(EXCLUDED.email,  subscribers.email),
+      plan   = COALESCE(EXCLUDED.plan,   subscribers.plan),
+      status = COALESCE(EXCLUDED.status, subscribers.status),
+      name   = COALESCE(EXCLUDED.name,   subscribers.name),
+      phone  = COALESCE(EXCLUDED.phone,  subscribers.phone),
+      address= COALESCE(EXCLUDED.address,subscribers.address),
+      city   = COALESCE(EXCLUDED.city,   subscribers.city),
+      postal = COALESCE(EXCLUDED.postal, subscribers.postal),
+      country= COALESCE(EXCLUDED.country,subscribers.country),
+      meta   = COALESCE(EXCLUDED.meta,   subscribers.meta),
+      updated_at = NOW()
+    RETURNING *;
+  `;
+  const values = [customer_id, subscription_id, email, plan, status, name, phone, address, city, postal, country, meta ? JSON.stringify(meta) : null];
+  const { rows } = await dbQuery(text, values);
+  return rows?.[0] || null;
+};
+
+const markCanceled = async (subscription_id) => { if (!pool) return; await dbQuery(`UPDATE subscribers SET status='canceled', canceled_at=NOW() WHERE subscription_id=$1`, [subscription_id]); };
+
+const subscriberExists = async (customer_id) => {
+  if (!pool) return false;
+  const { rows } = await dbQuery(`SELECT 1 FROM subscribers WHERE customer_id = $1 LIMIT 1`, [customer_id]);
+  return rows?.length > 0;
+};
+
 // ===== Utils =====
 const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 const fmt = (amount = 0, currency = 'EUR') => {
@@ -116,8 +201,18 @@ const preferShippingThenBilling = (session) => {
 };
 const fmtAddressHTML = (cust = {}, fallback = {}) => {
   const addr = cust?.address || fallback?.address || null;
-  const lines = [cust?.name || fallback?.name, cust?.email, cust?.phone, addr?.line1, addr?.line2, [addr?.postal_code, addr?.city].filter(Boolean).join(' '), addr?.state, addr?.country].filter(Boolean);
-  return lines.length ? lines.map(escapeHtml).join('<br/>') : '<em>-</em>';
+  const lines = [
+    cust?.name || fallback?.name,
+    cust?.email,
+    cust?.phone,
+    addr?.line1,
+    addr?.line2,
+    [addr?.postal_code, addr?.city].filter(Boolean).join(' '),
+    addr?.state,
+    addr?.country
+  ].filter(Boolean);
+  if (!lines.length) return '<em>-</em>';
+  return lines.map(escapeHtml).join('<br/>');
 };
 const extractInvoiceCustomer = (inv) => ({
   name: inv?.customer_details?.name ?? inv?.customer_name ?? inv?.customer_shipping?.name ?? null,
@@ -301,6 +396,24 @@ async function sendContactEmails(payload) {
   await sendEmail({ to: CORPORATE_EMAIL, replyTo: email, subject: `Contacto: ${subject}`, html: emailShell({ header: 'Nuevo mensaje', body: bodyAdmin, footer: '' }) });
   const bodyUser = `<tr><td style="padding:0 24px;"><p>Hemos recibido tu mensaje sobre "${escapeHtml(subject)}". Te contestaremos pronto.</p></td></tr>`;
   await sendEmail({ to: email, subject: 'Mensaje recibido', html: emailShell({ header: 'Mensaje recibido', body: bodyUser, footer: '' }) });
+}
+
+function summarizeCustomerChanges(prev = {}, cust = {}) {
+  const lines = [];
+  if ('name' in prev)        lines.push(`• Nombre: ${escapeHtml(prev.name ?? '-')} → ${escapeHtml(cust.name ?? '-')} `);
+  if ('email' in prev)       lines.push(`• Email: ${escapeHtml(prev.email ?? '-')} → ${escapeHtml(cust.email ?? '-')} `);
+  if ('phone' in prev)       lines.push(`• Teléfono: ${escapeHtml(prev.phone ?? '-')} → ${escapeHtml(cust.phone ?? '-')} `);
+  if ('address' in prev) {
+    const before = prev.address || {};
+    const after  = cust.address || {};
+    const addrStr = (a) => [a.line1, a.line2, [a.postal_code, a.city].filter(Boolean).join(' '), a.state, a.country].filter(Boolean).join(', ');
+    lines.push(`• Dirección: ${escapeHtml(addrStr(before) || '-')} → ${escapeHtml(addrStr(after) || '-')}`);
+  }
+  if (prev?.invoice_settings?.default_payment_method !== undefined) {
+    lines.push('• Método de pago por defecto actualizado.');
+  }
+  if (!lines.length) return 'Se han actualizado tus datos de cliente.';
+  return lines.join('<br/>');
 }
 
 // ===== Express Config =====
