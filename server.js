@@ -1,4 +1,4 @@
-// server.js — Backend v3.1 (Final: Proxy + Filtro Activas + Renovaciones + Cobro Día 1)
+// server.js — Backend v3.2 (Final: Proxy + Filtro Activas + Renovaciones + Cobro Día 1 SIN Prorrateo + Emails Mejorados)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -14,7 +14,7 @@ const { Pool } = pg;
 
 const app = express();
 
-// 🟢 CRÍTICO PARA RENDER: Permite que el Rate Limit funcione tras el proxy
+// 🟢 CRÍTICO PARA RENDER
 app.set('trust proxy', 1); 
 
 const PORT = process.env.PORT || 10000;
@@ -31,9 +31,7 @@ const FRONT_BASE = (process.env.FRONT_BASE || 'https://guarrosextremenos.com').r
 const PORTAL_RETURN_URL = process.env.CUSTOMER_PORTAL_RETURN_URL || `${FRONT_BASE}/account`;
 const BILLING_PORTAL_CONFIG = process.env.STRIPE_BILLING_PORTAL_CONFIG || null;
 
-// customer.updated solo si ya existe suscriptor en BD
 const SEND_CUSTOMER_UPDATED_ONLY_IF_KNOWN = true;
-
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
@@ -51,8 +49,8 @@ const CUSTOMER_BCC_CORPORATE = String(process.env.CUSTOMER_BCC_CORPORATE || 'fal
 
 // ===== Rate Limiter (Anti-Spam) =====
 const contactLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 5, // max 5 correos por IP
+  windowMs: 15 * 60 * 1000,
+  max: 5,
   message: { error: 'Demasiados intentos, por favor espera un poco.' },
   standardHeaders: true, 
   legacyHeaders: false,
@@ -60,18 +58,8 @@ const contactLimiter = rateLimit({
 
 // ===== Tabla de precios de suscripción (centimos) =====
 const SUB_PRICE_TABLE = Object.freeze({
-  100: 4600, 
-  200: 5800, 
-  300: 6900, 
-  400: 8000, 
-  500: 9100, 
-  600: 10300,
-  700: 11400, 
-  800: 12500, 
-  900: 13600, 
-  1000: 14800, 
-  1500: 20400, 
-  2000: 26000,
+  100: 4600, 200: 5800, 300: 6900, 400: 8000, 500: 9100, 600: 10300,
+  700: 11400, 800: 12500, 900: 13600, 1000: 14800, 1500: 20400, 2000: 26000,
 });
 const ALLOWED_SUB_GRAMS = Object.keys(SUB_PRICE_TABLE).map(Number);
 
@@ -211,34 +199,52 @@ async function sendEmail({ to, subject, html, attachments, bcc = [] }) {
   if (SMTP_HOST && SMTP_USER) { await sendSMTP({ from: CUSTOMER_FROM, to, subject, html, attachments, bcc }); return; }
   console.warn('[email] No provider configured');
 }
-async function sendAdminEmail({ session, items, customerEmail, name, phone, amountTotal, currency, customer_details, shipping }) {
-  if (!CORPORATE_EMAIL) return;
-  const body = `<tr><td style="padding:0 24px 8px;"><p style="margin:0 0 10px; font:15px system-ui; color:#111">Nuevo ${session?.mode === 'subscription' ? 'ALTA DE SUSCRIPCIÓN' : 'PEDIDO'}</p><ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui"><li><b>Nombre:</b> ${escapeHtml(name || '-')}</li><li><b>Email:</b> ${escapeHtml(customerEmail || '-')}</li><li><b>Teléfono:</b> ${escapeHtml(phone || '-')}</li><li><b>Sesión:</b> ${escapeHtml(session?.id || '-')}</li></ul></td></tr><tr><td style="padding:8px 24px;"><div style="height:1px;background:#e5e7eb;"></div><p style="margin:8px 0 6px; font:600 13px system-ui; color:#111">Dirección</p><div style="font:13px system-ui; color:#374151">${fmtAddressHTML(customer_details || {}, { address: shipping, name })}</div></td></tr><tr><td style="padding:8px 24px 0;"><table role="presentation" width="100%">${lineItemsHTML(items, currency)}<tfoot><tr><td colspan="3"><div style="height:1px;background:#e5e7eb;"></div></td></tr><tr><td>Total</td><td></td><td align="right">${fmt(Number(amountTotal || 0), currency)}</td></tr></tfoot></table></td></tr>`;
-  await sendEmail({ to: CORPORATE_EMAIL, subject: `Nuevo pedido - ${BRAND}`, html: emailShell({ header: 'Nuevo pedido web', body, footer: '' }) });
+
+// 🟢 NUEVO: EMAIL AL CLIENTE (BIENVENIDA SIN COBRO)
+async function sendCustomerSubscriptionWelcome({ to, name, grams, price, currency }) {
+  if (!to) return;
+  const subject = `Bienvenido al Club — ${BRAND}`;
+  const nextMonth = new Date(); 
+  nextMonth.setMonth(nextMonth.getMonth() + 1); 
+  nextMonth.setDate(1);
+  const dateStr = nextMonth.toLocaleDateString('es-ES', { day: 'numeric', month: 'long' });
+  
+  const body = `
+    <tr><td style="padding:0 24px 8px;">
+      <p style="margin:0 0 12px; font:15px system-ui; color:#111;">Hola ${escapeHtml(name || '')},</p>
+      <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
+        ¡Ya eres uno de los nuestros! Tu suscripción de <b>${grams}g/mes</b> está confirmada.
+      </p>
+      <div style="background:#ecfdf5; border:1px solid #a7f3d0; border-radius:8px; padding:16px; margin:16px 0;">
+        <p style="margin:0 0 8px; font-weight:bold; color:#065f46; font-size:14px;">Información de pago</p>
+        <p style="margin:0; font-size:13px; color:#064e3b;">
+          • <b>Hoy:</b> 0,00 € (No se te cobra nada).<br/>
+          • <b>Primer cobro:</b> El 1 de ${dateStr}.<br/>
+          • <b>Importe mensual:</b> ${fmt(price, currency)}/mes.
+        </p>
+      </div>
+      <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">
+        A partir del día 1, prepararemos tu sobre y te lo enviaremos cagando leches.
+      </p>
+    </td></tr>
+  `;
+  const html = emailShell({ header: '¡Bienvenido!', body, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)}</p>` });
+  await sendEmail({ to, subject, html });
 }
 
-// 🟢 NUEVO: EMAIL AL ADMIN CUANDO SE RENUEVA (PAGO RECURRENTE)
+// ADMIN: Email genérico para pedidos y altas (Se llamará siempre en checkout)
+async function sendAdminEmail({ session, items, customerEmail, name, phone, amountTotal, currency, customer_details, shipping, isSubscription }) {
+  if (!CORPORATE_EMAIL) return;
+  const title = isSubscription ? 'NUEVA SUSCRIPCIÓN (Alta)' : 'NUEVO PEDIDO';
+  const body = `<tr><td style="padding:0 24px 8px;"><p style="margin:0 0 10px; font:15px system-ui; color:#111">${title}</p><ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui"><li><b>Nombre:</b> ${escapeHtml(name || '-')}</li><li><b>Email:</b> ${escapeHtml(customerEmail || '-')}</li><li><b>Teléfono:</b> ${escapeHtml(phone || '-')}</li><li><b>Sesión:</b> ${escapeHtml(session?.id || '-')}</li></ul></td></tr><tr><td style="padding:8px 24px;"><div style="height:1px;background:#e5e7eb;"></div><p style="margin:8px 0 6px; font:600 13px system-ui; color:#111">Dirección</p><div style="font:13px system-ui; color:#374151">${fmtAddressHTML(customer_details || {}, { address: shipping, name })}</div></td></tr><tr><td style="padding:8px 24px 0;"><table role="presentation" width="100%">${lineItemsHTML(items, currency)}<tfoot><tr><td colspan="3"><div style="height:1px;background:#e5e7eb;"></div></td></tr><tr><td>Total</td><td></td><td align="right">${fmt(Number(amountTotal || 0), currency)}</td></tr></tfoot></table></td></tr>`;
+  await sendEmail({ to: CORPORATE_EMAIL, subject: `${title} - ${BRAND}`, html: emailShell({ header: title, body, footer: '' }) });
+}
+
+// ADMIN: Email Renovación
 async function sendAdminRenewalEmail({ customer, total, currency, subscriptionId, invoiceId }) {
   if (!CORPORATE_EMAIL) return;
-  const subject = `🔄 Renovación suscripción — ${escapeHtml(customer.name || customer.email)}`;
-  const body = `
-<tr><td style="padding:0 24px 12px;">
-  <p style="margin:0 0 10px; font:15px system-ui; color:#111">Se ha renovado una suscripción.</p>
-  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
-    <li><b>Cliente:</b> ${escapeHtml(customer.name || '-')}</li>
-    <li><b>Email:</b> ${escapeHtml(customer.email || '-')}</li>
-    <li><b>Importe:</b> ${fmt(Number(total || 0), currency)}</li>
-    <li><b>ID Suscripción:</b> ${escapeHtml(subscriptionId)}</li>
-    <li><b>ID Factura:</b> ${escapeHtml(invoiceId)}</li>
-  </ul>
-</td></tr>`;
-
-  const html = emailShell({
-      header: 'Suscripción Renovada',
-      body,
-      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
-  });
-  await sendEmail({ to: CORPORATE_EMAIL, subject, html });
+  const body = `<tr><td style="padding:0 24px 12px;"><p style="margin:0 0 10px; font:15px system-ui; color:#111">Se ha renovado una suscripción (Pago Recurrente).</p><ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui"><li><b>Cliente:</b> ${escapeHtml(customer.name || '-')}</li><li><b>Email:</b> ${escapeHtml(customer.email || '-')}</li><li><b>Importe:</b> ${fmt(Number(total || 0), currency)}</li><li><b>ID Suscripción:</b> ${escapeHtml(subscriptionId)}</li></ul></td></tr>`;
+  await sendEmail({ to: CORPORATE_EMAIL, subject: `🔄 Renovación suscripción - ${escapeHtml(customer.name)}`, html: emailShell({ header: 'Suscripción Renovada', body, footer: '' }) });
 }
 
 async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, items, isSubscription, customerId, customer_details, shipping }) {
@@ -248,7 +254,7 @@ async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, i
   await sendEmail({ to, subject: 'Confirmación de pedido', html: emailShell({ header: 'Pedido confirmado', body, footer: '' }) });
 }
 
-// 🟢 MODIFICADO: Recibe flag `isRenewal` para cambiar el texto
+// CLIENTE: Renovación / Recibo combinado
 async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, items, customer, pdfUrl, isSubscription, isRenewal, customerId }) {
   if (!to) return;
   const receiptBuf = await buildReceiptPDF({ invoiceNumber, total, currency, customer, items });
@@ -260,7 +266,6 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
     } catch {}
   }
 
-  // Lógica de texto dinámica
   let subject = 'Confirmación de pedido';
   let header = 'Pago recibido';
   let intro = 'Adjunto encontrarás el recibo de tu compra.';
@@ -271,6 +276,8 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
         header = 'Suscripción renovada';
         intro = 'Hemos procesado la renovación de tu suscripción correctamente. Adjunto tienes el recibo.';
       } else {
+        // Nota: Este caso (Alta normal con cobro inmediato) ya casi no debería darse si usamos anclaje día 1
+        // pero lo dejamos por seguridad para otros flujos.
         subject = 'Suscripción activada';
         header = 'Suscripción activada';
         intro = 'Gracias por suscribirte. Aquí tienes el recibo de tu primer pago.';
@@ -326,7 +333,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
        const currency = (session.currency || 'eur').toUpperCase();
        const amountTotal = (session.amount_total ?? 0) / 100;
        let items = []; 
-       try { items = (await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 })).data; } catch {}
+       try { items = (await stripe.checkout.sessions.listLineItems(session.id, { limit: 100, expand: ['data.price.product'] })).data; } catch {}
        
        await logOrder({
           sessionId: session.id,
@@ -354,14 +361,38 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           });
        }
 
-       if (!isSub) {
-         await sendAdminEmail({ session, items, customerEmail: person.email, name: person.name, amountTotal, currency, customer_details: session.customer_details, shipping: session.shipping_details });
+       // 🟢 EMAILS ALTA (PEDIDO O SUSCRIPCIÓN)
+       // 1. Admin (Siempre avisamos)
+       await sendAdminEmail({ 
+           session, items, 
+           customerEmail: person.email, name: person.name, phone: person.phone, 
+           amountTotal, currency, 
+           customer_details: session.customer_details, 
+           shipping: session.shipping_details, 
+           isSubscription: isSub 
+       });
+
+       // 2. Cliente
+       if (isSub) {
+         // SUSCRIPCIÓN: Email de "Bienvenida y cobro diferido"
+         const firstItem = items[0];
+         const recurringPrice = firstItem?.price?.unit_amount || 0;
+         await sendCustomerSubscriptionWelcome({
+             to: person.email,
+             name: person.name,
+             grams: session.metadata?.subscription_grams || '500',
+             price: recurringPrice / 100,
+             currency
+         });
+       } else {
+         // PEDIDO NORMAL: Confirmación estándar
          if (COMBINE_CONFIRMATION_AND_INVOICE) {
-            await sendCustomerCombined({ to: person.email, name: person.name, invoiceNumber: session.id, total: amountTotal, currency, items, customer: person });
+            await sendCustomerCombined({ to: person.email, name: person.name, invoiceNumber: session.id, total: amountTotal, currency, items, customer: person, isSubscription: false });
          } else {
-            await sendCustomerConfirmationOnly({ to: person.email, name: person.name, amountTotal, currency, items, orderId: session.id });
+            await sendCustomerConfirmationOnly({ to: person.email, name: person.name, amountTotal, currency, items, orderId: session.id, isSubscription: false });
          }
        }
+
     } else if (event.type === 'customer.subscription.created') {
        const sub = event.data.object;
        const cust = await stripe.customers.retrieve(sub.customer);
@@ -371,50 +402,45 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
          plan: sub.items?.data?.[0]?.price?.id, status: sub.status,
          meta: sub.metadata, address: cust.address?.line1, city: cust.address?.city, postal: cust.address?.postal_code, country: cust.address?.country
        });
-
-       if (CORPORATE_EMAIL) await sendEmail({ to: CORPORATE_EMAIL, subject: 'Nueva suscripción', html: emailShell({ header: 'Nueva suscripción', body: `<tr><td>${cust.email}</td></tr>`, footer: '' }) });
-       if (!COMBINE_CONFIRMATION_AND_INVOICE && cust.email) {
-         await sendCustomerConfirmationOnly({ to: cust.email, name: cust.name, isSubscription: true, customerId: sub.customer, items: [] });
-       }
+       // Nota: Ya no mandamos email aquí para evitar duplicados con checkout.session.completed
     } else if (event.type === 'invoice.payment_succeeded') {
        const inv = event.data.object;
-       
-       // 🟢 DETECTAR RENOVACIÓN
        const isSubscription = !!inv.subscription;
-       const billingReason = inv.billing_reason; // 'subscription_cycle' significa renovación automática
+       const billingReason = inv.billing_reason; 
        const isRenewal = isSubscription && billingReason === 'subscription_cycle';
 
        const cust = extractInvoiceCustomer(inv);
 
-       // 1. AVISAR AL ADMIN (Solo si es renovación)
+       // Solo actuamos si es una RENOVACIÓN (el alta ya la cubre checkout.session)
        if (isRenewal) {
-          await sendAdminRenewalEmail({ 
-            customer: cust, 
-            total: inv.amount_paid / 100, 
-            currency: (inv.currency || 'eur').toUpperCase(), 
-            subscriptionId: inv.subscription, 
-            invoiceId: inv.number || inv.id 
-          });
-       }
+           // 1. Admin
+           await sendAdminRenewalEmail({ 
+               customer: cust, 
+               total: inv.amount_paid / 100, 
+               currency: (inv.currency || 'eur').toUpperCase(), 
+               subscriptionId: inv.subscription, 
+               invoiceId: inv.number || inv.id 
+           });
 
-       // 2. EMAIL AL CLIENTE (Si es combinado o renovación)
-       if (COMBINE_CONFIRMATION_AND_INVOICE) {
-          let items = [];
-          try { items = (await stripe.invoices.listLineItems(inv.id)).data; } catch {}
-          
-          await sendCustomerCombined({ 
-             to: cust.email, 
-             name: cust.name, 
-             invoiceNumber: inv.number, 
-             total: inv.amount_paid/100, 
-             currency: inv.currency.toUpperCase(), 
-             items, 
-             customer: cust, 
-             pdfUrl: inv.invoice_pdf, 
-             isSubscription, 
-             isRenewal, // Flag para cambiar texto
-             customerId: inv.customer 
-          });
+           // 2. Cliente (Recibo del mes)
+           if (COMBINE_CONFIRMATION_AND_INVOICE) {
+              let items = [];
+              try { items = (await stripe.invoices.listLineItems(inv.id)).data; } catch {}
+              
+              await sendCustomerCombined({ 
+                 to: cust.email, 
+                 name: cust.name, 
+                 invoiceNumber: inv.number, 
+                 total: inv.amount_paid/100, 
+                 currency: inv.currency.toUpperCase(), 
+                 items, 
+                 customer: cust, 
+                 pdfUrl: inv.invoice_pdf, 
+                 isSubscription: true, 
+                 isRenewal: true, 
+                 customerId: inv.customer 
+              });
+           }
        }
     } else if (event.type === 'customer.subscription.deleted') {
        const sub = event.data.object;
@@ -436,8 +462,6 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
 app.use(express.json());
 
 // ===== RUTAS PÚBLICAS =====
-
-// 1. Configuración (Precios dinámicos)
 app.get('/api/config', (req, res) => {
   res.json({
     subscriptionTable: SUB_PRICE_TABLE, 
@@ -445,7 +469,6 @@ app.get('/api/config', (req, res) => {
   });
 });
 
-// 2. Resolver Precios
 app.post('/prices/resolve', async (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids)) return res.status(400).json({ error: 'Ids required' });
@@ -457,7 +480,6 @@ app.post('/prices/resolve', async (req, res) => {
   } catch { res.status(500).json({ error: 'Error resolving prices' }); }
 });
 
-// 3. Recuperar Suscripción (Magic Link: Solo Activas)
 app.post('/api/recover-subscription', contactLimiter, async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email requerido' });
@@ -514,7 +536,6 @@ app.post('/api/recover-subscription', contactLimiter, async (req, res) => {
   }
 });
 
-// 4. Contacto
 app.post('/api/contact', contactLimiter, (req, res) => {
   const { email, subject, message } = req.body;
   if (!email || !message) return res.status(400).json({ error: 'Faltan datos' });
@@ -522,7 +543,6 @@ app.post('/api/contact', contactLimiter, (req, res) => {
   sendContactEmails(req.body);
 });
 
-// 5. Create Checkout
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { items, success_url, cancel_url, metadata } = req.body;
@@ -541,17 +561,17 @@ app.post('/create-checkout-session', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 6. Create Subscription (COBRO EL DÍA 1)
+// 6. Create Subscription (COBRO EL DÍA 1 SIN PRORRATEO)
 app.post('/create-subscription-session', async (req, res) => {
   try {
     const { grams, success_url, cancel_url, metadata } = req.body;
     const g = Number(grams);
     if (!ALLOWED_SUB_GRAMS.includes(g)) return res.status(400).json({ error: 'Gramos inválidos' });
     
-    // --- CÁLCULO FECHA COBRO (DÍA 1 SIGUIENTE MES) ---
+    // Cálculo Fecha Cobro (Día 1 mes siguiente)
     const now = new Date();
     const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-    nextMonth.setHours(12, 0, 0, 0); // Evitar problemas de zona horaria
+    nextMonth.setHours(12, 0, 0, 0);
     const anchorTimestamp = Math.floor(nextMonth.getTime() / 1000);
 
     const session = await stripe.checkout.sessions.create({
@@ -569,9 +589,10 @@ app.post('/create-subscription-session', async (req, res) => {
       billing_address_collection: 'required',
       shipping_address_collection: { allowed_countries: ['ES', 'FR', 'PT', 'DE', 'IT', 'BE', 'NL'] },
       metadata: { subscription_grams: String(g), ...metadata },
-      // 🟢 ANCLAJE DE FACTURACIÓN AL DÍA 1
+      // 🟢 CLAVE: Ancla al día 1 + proration_behavior='none' (no cobra los días sueltos)
       subscription_data: {
         billing_cycle_anchor: anchorTimestamp,
+        proration_behavior: 'none',
       },
       success_url, cancel_url
     });
