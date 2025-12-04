@@ -412,6 +412,30 @@ async function sendAdminEmail({ session, items = [], customerEmail, name, phone,
   await sendEmail({ to: CORPORATE_EMAIL, subject, html });
 }
 
+// 🟢 NUEVO: EMAIL AL ADMIN CUANDO SE RENUEVA (PAGO RECURRENTE)
+async function sendAdminRenewalEmail({ customer, total, currency, subscriptionId, invoiceId }) {
+  if (!CORPORATE_EMAIL) return;
+  const subject = `🔄 Renovación suscripción — ${escapeHtml(customer.name || customer.email)}`;
+  const body = `
+<tr><td style="padding:0 24px 12px;">
+  <p style="margin:0 0 10px; font:15px system-ui; color:#111">Se ha renovado una suscripción.</p>
+  <ul style="margin:0;padding-left:16px;color:#111;font:14px system-ui">
+    <li><b>Cliente:</b> ${escapeHtml(customer.name || '-')}</li>
+    <li><b>Email:</b> ${escapeHtml(customer.email || '-')}</li>
+    <li><b>Importe:</b> ${fmt(Number(total || 0), currency)}</li>
+    <li><b>ID Suscripción:</b> ${escapeHtml(subscriptionId)}</li>
+    <li><b>ID Factura:</b> ${escapeHtml(invoiceId)}</li>
+  </ul>
+</td></tr>`;
+
+  const html = emailShell({
+      header: 'Suscripción Renovada',
+      body,
+      footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">${escapeHtml(BRAND)} — ${new Date().toLocaleString('es-ES')}</p>`
+  });
+  await sendEmail({ to: CORPORATE_EMAIL, subject, html });
+}
+
 async function sendCustomerConfirmationOnly({ to, name, amountTotal, currency, items, orderId, isSubscription, customerId, customer_details, shipping }) {
   if (!to) return;
   const subject = (isSubscription ? 'Confirmación suscripción' : 'Confirmación de pedido') + (orderId ? ' #' + orderId : '') + ' — ' + BRAND;
@@ -453,54 +477,39 @@ ${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a h
   await sendEmail({ to, subject, html, bcc });
 }
 
-async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, items, customer, pdfUrl, isSubscription, customerId }) {
+// 🟢 MODIFICADO: Recibe flag `isRenewal` para cambiar el texto
+async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, items, customer, pdfUrl, isSubscription, isRenewal, customerId }) {
   if (!to) return;
-  const receiptBuf = await buildReceiptPDF({ invoiceNumber, total, currency, customer, items, paidAt: new Date() });
+  const receiptBuf = await buildReceiptPDF({ invoiceNumber, total, currency, customer, items });
   const attachments = [{ filename: `recibo-${invoiceNumber || 'pago'}.pdf`, content: receiptBuf, contentType: 'application/pdf' }];
   if (ATTACH_STRIPE_INVOICE && pdfUrl) {
     try {
       const r = await fetch(pdfUrl);
-      if (r.ok) { const b = Buffer.from(await r.arrayBuffer()); attachments.push({ filename: `stripe-invoice-${invoiceNumber || 'pago'}.pdf`, content: b, contentType: 'application/pdf' }); }
+      if (r.ok) attachments.push({ filename: `factura-${invoiceNumber}.pdf`, content: Buffer.from(await r.arrayBuffer()), contentType: 'application/pdf' });
     } catch {}
   }
-  const subject = (isSubscription ? 'Confirmación suscripción' : 'Confirmación de pedido') + ' — ' + BRAND;
-  const intro = isSubscription ? `Gracias por suscribirte a ${BRAND}. Tu suscripción ha quedado activada correctamente.` : `Gracias por tu compra en ${BRAND}. Tu pago se ha recibido correctamente.`;
-  const body = `
-<tr><td style="padding:0 24px 8px;">
-  <p style="margin:0 0 12px; font:15px system-ui; color:#111;">${name ? `Hola ${escapeHtml(name)},` : 'Hola,'}</p>
-  <p style="margin:0 0 12px; font:14px system-ui; color:#374151;">${escapeHtml(intro)}</p>
-</td></tr>
-<tr><td style="padding:8px 24px;">
-  <div style="height:1px;background:#e5e7eb;"></div>
-  <p style="margin:8px 0 6px; font:600 13px system-ui; color:#111">Dirección</p>
-  <div style="font:13px system-ui; color:#374151">${fmtAddressHTML(customer)}</div>
-</td></tr>
-<tr><td style="padding:0 24px 8px;"><div style="height:1px;background:#e5e7eb;"></div></td></tr>
-<tr><td style="padding:8px 24px 0;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;">
-    <thead>
-      <tr>
-        <th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th>
-        <th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th>
-        <th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th>
-      </tr>
-    </thead>
-    <tbody>${lineItemsHTML(items, currency)}</tbody>
-    <tfoot>
-      <tr><td colspan="3"><div style="height:1px;background:#e5e7eb;"></div></td></tr>
-      <tr>
-        <td style="padding:12px 0; font-size:14px; color:#111; font-weight:700;">Total ${isSubscription ? 'primer cargo' : ''}</td>
-        <td></td>
-        <td style="padding:12px 0; font-size:16px; color:#111; font-weight:800; text-align:right;">${fmt(Number(total || 0), currency)}</td>
-      </tr>
-    </tfoot>
-  </table>
-</td></tr>
-${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a href="${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId || '')}&return=${encodeURIComponent(PORTAL_RETURN_URL)}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripción</a></td></tr>` : ''}`;
-  const html = emailShell({ header: isSubscription ? 'Suscripción activada' : 'Confirmación de pedido', body, footer: `<p style="margin:0; font:11px system-ui; color:#9ca3af;">© ${new Date().getFullYear()} ${escapeHtml(BRAND)}. Todos los derechos reservados.</p>` });
-  await sendEmail({ to, subject, html, attachments });
-}
 
+  // Lógica de texto dinámica
+  let subject = 'Confirmación de pedido';
+  let header = 'Pago recibido';
+  let intro = 'Adjunto encontrarás el recibo de tu compra.';
+
+  if (isSubscription) {
+      if (isRenewal) {
+        subject = '✅ Suscripción renovada';
+        header = 'Suscripción renovada';
+        intro = 'Hemos procesado la renovación de tu suscripción correctamente. Adjunto tienes el recibo.';
+      } else {
+        subject = 'Suscripción activada';
+        header = 'Suscripción activada';
+        intro = 'Gracias por suscribirte. Aquí tienes el recibo de tu primer pago.';
+      }
+  }
+
+  const body = `<tr><td style="padding:0 24px 8px;"><p>Hola ${escapeHtml(name || '')},</p><p>${escapeHtml(intro)}</p></td></tr><tr><td style="padding:8px 24px;"><div style="height:1px;background:#e5e7eb;"></div><p style="margin:8px 0 6px; font:600 13px system-ui; color:#111">Dirección</p><div style="font:13px system-ui; color:#374151">${fmtAddressHTML(customer)}</div></td></tr><tr><td style="padding:0 24px 8px;"><div style="height:1px;background:#e5e7eb;"></div></td></tr><tr><td style="padding:8px 24px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:system-ui;"><thead><tr><th align="left"  style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Producto</th><th align="center"style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Cant.</th><th align="right" style="padding:10px 0; font-size:12px; color:#6b7280; text-transform:uppercase;">Total</th></tr></thead><tbody>${lineItemsHTML(items, currency)}</tbody><tfoot><tr><td colspan="3"><div style="height:1px;background:#e5e7eb;"></div></td></tr><tr><td style="padding:12px 0; font-size:14px; color:#111; font-weight:700;">Total ${isSubscription ? 'cuota' : ''}</td><td></td><td style="padding:12px 0; font-size:16px; color:#111; font-weight:800; text-align:right;">${fmt(Number(total || 0), currency)}</td></tr></tfoot></table></td></tr>${isSubscription ? `<tr><td style="padding:0 24px 12px; text-align:center;"><a href="${API_PUBLIC_BASE}/billing-portal/link?customer_id=${encodeURIComponent(customerId || '')}&return=${encodeURIComponent(PORTAL_RETURN_URL)}" style="display:inline-block;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:10px;letter-spacing:.2px">Gestionar suscripción</a></td></tr>` : ''}`;
+
+  await sendEmail({ to, subject, html: emailShell({ header, body, footer: '' }), attachments });
+}
 // ===== Emails cancelación =====
 async function sendCancelEmails({ customerEmail, name, subId, customerAddress }) {
   const subject = `🛑 Suscripción cancelada — ${BRAND}`;
@@ -977,7 +986,7 @@ app.post('/webhook', async (req, res) => {
         return res.status(200).json({ received: true });
       }
 
-      case 'invoice.payment_succeeded': {
+case 'invoice.payment_succeeded': {
         const inv = event.data.object;
         const firstTime = await markInvoiceMailedOnce(inv.id);
         if (!firstTime) { return res.status(200).json({ received: true, mailed: 'skipped-duplicate' }); }
@@ -1001,23 +1010,44 @@ app.post('/webhook', async (req, res) => {
         try { const li = await stripe.invoices.listLineItems(inv.id, { limit: 100, expand: ['data.price.product'] }); items = li?.data || []; }
         catch (e) { console.warn('[invoice listLineItems warn]', e?.message || e); }
 
+        // 🟢 DETECTAR RENOVACIÓN
+        const isSubscription = !!inv.subscription;
+        const billingReason = inv.billing_reason; // 'subscription_cycle' significa renovación automática
+        const isRenewal = isSubscription && billingReason === 'subscription_cycle';
+
+        // 1. AVISAR AL ADMIN (Solo si es renovación)
+        if (isRenewal) {
+           await sendAdminRenewalEmail({ 
+             customer: customerForPdf, 
+             total: (inv.amount_paid ?? inv.amount_due ?? 0) / 100,
+             currency: (inv.currency || 'eur').toUpperCase(), 
+             subscriptionId: inv.subscription, 
+             invoiceId: inv.number || inv.id 
+           });
+        }
+
+        // 2. EMAIL AL CLIENTE
         if (COMBINE_CONFIRMATION_AND_INVOICE) {
           try {
             await sendCustomerCombined({
-              to, name,
+              to,
+              name,
               invoiceNumber: inv.number || inv.id,
               total: (inv.amount_paid ?? inv.amount_due ?? 0) / 100,
               currency: (inv.currency || 'eur').toUpperCase(),
-              items, customer: customerForPdf, pdfUrl,
-              isSubscription: !!inv.subscription || items.some(x => x?.price?.recurring),
+              items,
+              customer: customerForPdf,
+              pdfUrl,
+              isSubscription,
+              isRenewal, // <--- Pasamos el flag aquí
               customerId: inv.customer,
             });
           } catch (e) { console.error('Combinado ERROR:', e); }
         }
+
         res.status(200).json({ received: true });
         return;
       }
-
       default:
         return res.status(200).json({ received: true });
     }
