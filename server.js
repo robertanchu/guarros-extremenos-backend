@@ -1,21 +1,73 @@
-// server.js — Backend v3.3 (Final: Proxy + Filtro Activas + Renovaciones + Cobro Día 1 + DB Helpers FIXED)
+// server.js — Backend v3.5 (Security Hardened: Proxy + Filtro + Renovaciones + DB + Security Layers)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
+import helmet from 'helmet'; // 🛡️ NUEVO
+import rateLimit from 'express-rate-limit';
 import Stripe from 'stripe';
 import { Resend } from 'resend';
 import nodemailer from 'nodemailer';
 import PDFDocument from 'pdfkit';
 import pg from 'pg';
-import rateLimit from 'express-rate-limit';
 
 const { Pool } = pg;
 
 const app = express();
 
 // 🟢 CRÍTICO PARA RENDER
-app.set('trust proxy', 1); 
+app.set('trust proxy', 1);
+
+// ==========================================
+// 🛡️ CAPA DE SEGURIDAD (SECURITY LAYER)
+// ==========================================
+
+// 1. HELMET: Protege cabeceras HTTP (XSS, Sniffing, ocultar Express)
+app.use(helmet());
+
+// 2. ANTI-ROBOTS: Evita que Google/Bing indexen la API
+app.use((req, res, next) => {
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  next();
+});
+
+// 3. CORS ESTRICTO: Solo permite peticiones desde tus dominios
+const allowedOrigins = [
+  'https://guarrosextremenos.com',
+  'https://www.guarrosextremenos.com',
+  'https://guarros-extremenos-api.onrender.com',
+  // Añade localhost solo si estás probando en local
+  // 'http://localhost:3000' 
+];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    // Permitir solicitudes sin origen (como webhooks de Stripe o Postman)
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(new Error('Bloqueado por CORS policy'));
+  },
+  allowedHeaders: ['Content-Type', 'Authorization', 'Stripe-Signature']
+}));
+
+// 4. RATE LIMIT GLOBAL: Protege toda la API contra DDoS/Fuerza bruta
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 300, // Máximo 300 peticiones por IP
+  message: { error: 'Demasiadas peticiones, por favor espera un poco.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(globalLimiter);
+
+// 5. LIMITAR PAYLOAD: Evita ataques de desbordamiento de memoria
+// Nota: Se aplica después del webhook porque este necesita raw body, 
+// pero definimos el límite aquí para el resto de rutas JSON.
+const jsonParser = express.json({ limit: '50kb' });
+
+// ==========================================
+// CONFIGURACIÓN ORIGINAL
+// ==========================================
 
 const PORT = process.env.PORT || 10000;
 
@@ -47,10 +99,10 @@ const COMBINE_CONFIRMATION_AND_INVOICE = String(process.env.COMBINE_CONFIRMATION
 const ATTACH_STRIPE_INVOICE = String(process.env.ATTACH_STRIPE_INVOICE || 'false') === 'true';
 const CUSTOMER_BCC_CORPORATE = String(process.env.CUSTOMER_BCC_CORPORATE || 'false') === 'true';
 
-// ===== Rate Limiter (Anti-Spam) =====
+// ===== Rate Limiter Específico (Contacto) =====
 const contactLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
+  max: 5, // Muy estricto para formularios
   message: { error: 'Demasiados intentos, por favor espera un poco.' },
   standardHeaders: true, 
   legacyHeaders: false,
@@ -90,7 +142,7 @@ async function dbQuery(text, params) {
   await dbQuery(`CREATE TABLE IF NOT EXISTS subscribers(customer_id text PRIMARY KEY, subscription_id text, email text, plan text, status text, name text, phone text, address text, city text, postal text, country text, meta jsonb, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), canceled_at timestamptz)`);
 })();
 
-// ===== DB Helpers (Estas son las funciones que faltaban) =====
+// ===== DB Helpers =====
 
 const markInvoiceMailedOnce = async (invoiceId) => {
   if (!pool || !invoiceId) return true;
@@ -371,8 +423,6 @@ async function sendCustomerCombined({ to, name, invoiceNumber, total, currency, 
         header = 'Suscripción renovada';
         intro = 'Hemos procesado la renovación de tu suscripción correctamente. Adjunto tienes el recibo.';
       } else {
-        // Nota: Este caso (Alta normal con cobro inmediato) ya casi no debería darse si usamos anclaje día 1
-        // pero lo dejamos por seguridad para otros flujos.
         subject = 'Suscripción activada';
         header = 'Suscripción activada';
         intro = 'Gracias por suscribirte. Aquí tienes el recibo de tu primer pago.';
@@ -416,15 +466,9 @@ function summarizeCustomerChanges(prev = {}, cust = {}) {
   return lines.join('<br/>');
 }
 
-// ===== Express Config =====
-const allowOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({
-  origin: (origin, cb) => (!origin || allowOrigins.includes(origin) || origin.includes('guarrosextremenos.com') || origin.includes('vercel.app')) ? cb(null, true) : cb(new Error('CORS')),
-  allowedHeaders: ['Content-Type', 'Authorization', 'Stripe-Signature']
-}));
 app.use(morgan('tiny'));
 
-// Webhook (raw body)
+// Webhook (raw body) - DEBE IR ANTES DE jsonParser
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -515,7 +559,6 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
          plan: sub.items?.data?.[0]?.price?.id, status: sub.status,
          meta: sub.metadata, address: cust.address?.line1, city: cust.address?.city, postal: cust.address?.postal_code, country: cust.address?.country
        });
-       // Nota: Ya no mandamos email aquí para evitar duplicados con checkout.session.completed
     } else if (event.type === 'invoice.payment_succeeded') {
        const inv = event.data.object;
        const isSubscription = !!inv.subscription;
@@ -526,7 +569,6 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
 
        // Solo actuamos si es una RENOVACIÓN (el alta ya la cubre checkout.session)
        if (isRenewal) {
-           // 1. Admin
            await sendAdminRenewalEmail({ 
                customer: cust, 
                total: inv.amount_paid / 100, 
@@ -535,7 +577,6 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
                invoiceId: inv.number || inv.id 
            });
 
-           // 2. Cliente (Recibo del mes)
            if (COMBINE_CONFIRMATION_AND_INVOICE) {
               let items = [];
               try { items = (await stripe.invoices.listLineItems(inv.id)).data; } catch {}
@@ -572,7 +613,8 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   res.json({ received: true });
 });
 
-app.use(express.json());
+// APLICAR PARSER JSON AHORA (Después del webhook, para que no interfiera)
+app.use(jsonParser);
 
 // ===== RUTAS PÚBLICAS =====
 app.get('/api/config', (req, res) => {
@@ -656,14 +698,25 @@ app.post('/api/contact', contactLimiter, (req, res) => {
   sendContactEmails(req.body);
 });
 
+// 🛡️ CHECKOUT SEGURO (Validación de entrada)
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { items, success_url, cancel_url, metadata } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Carrito inválido.' });
+    if (!success_url || !cancel_url) return res.status(400).json({ error: 'URLs de retorno requeridas.' });
+
     const line_items = [];
     for (const it of items) {
-       const price = await stripe.prices.retrieve(it.price);
-       line_items.push({ price: it.price, quantity: it.quantity });
+       if (!it.price || !it.quantity) return res.status(400).json({ error: 'Item incompleto.' });
+       const q = parseInt(it.quantity);
+       if (isNaN(q) || q <= 0) return res.status(400).json({ error: 'Cantidad inválida.' });
+
+       // Opcional: Validar existencia del precio si es crítico
+       // await stripe.prices.retrieve(it.price);
+       line_items.push({ price: it.price, quantity: q });
     }
+
     const session = await stripe.checkout.sessions.create({
       mode: 'payment', line_items, success_url, cancel_url,
       allow_promotion_codes: true, billing_address_collection: 'required',
@@ -671,7 +724,10 @@ app.post('/create-checkout-session', async (req, res) => {
       metadata: { source: 'front', ...metadata }
     });
     res.json({ url: session.url, id: session.id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { 
+    console.error('[ERROR] Checkout:', e);
+    res.status(500).json({ error: 'No se pudo iniciar el pago.' }); 
+  }
 });
 
 // 6. Create Subscription (COBRO EL DÍA 1 SIN PRORRATEO)
@@ -702,7 +758,6 @@ app.post('/create-subscription-session', async (req, res) => {
       billing_address_collection: 'required',
       shipping_address_collection: { allowed_countries: ['ES', 'FR', 'PT', 'DE', 'IT', 'BE', 'NL'] },
       metadata: { subscription_grams: String(g), ...metadata },
-      // 🟢 CLAVE: Ancla al día 1 + proration_behavior='none' (no cobra los días sueltos)
       subscription_data: {
         billing_cycle_anchor: anchorTimestamp,
         proration_behavior: 'none',
@@ -710,7 +765,10 @@ app.post('/create-subscription-session', async (req, res) => {
       success_url, cancel_url
     });
     res.json({ url: session.url, id: session.id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { 
+    console.error('[ERROR] Subscription:', e);
+    res.status(500).json({ error: 'Error al crear suscripción.' }); 
+  }
 });
 
 app.get('/billing-portal/link', async (req, res) => {
